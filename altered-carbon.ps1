@@ -1,5 +1,26 @@
 # altered-carbon.ps1 — Bootstrap a fresh Windows developer environment.
 # Compatible with Windows PowerShell 5.1+ (the default shell on a fresh install).
+#
+# Usage:
+#   .\altered-carbon.ps1                                       # run with defaults
+#   .\altered-carbon.ps1 -OmpTheme 'jandedobbeleer'            # different oh-my-posh theme
+#   .\altered-carbon.ps1 -NerdFont 'FiraCode'                  # different Nerd Font
+#   .\altered-carbon.ps1 -SkipPackages 'Spotify.Spotify'       # skip specific packages
+#   .\altered-carbon.ps1 -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})  # add packages
+
+param(
+    # oh-my-posh theme name (without .omp.json extension).
+    [string] $OmpTheme = 'night-owl',
+
+    # Nerd Font to install via oh-my-posh and set in Windows Terminal / VS Code.
+    [string] $NerdFont = 'CodeNewRoman',
+
+    # winget package IDs to skip from the default list.
+    [string[]] $SkipPackages = @(),
+
+    # Additional winget packages to install (array of @{Id='...'; Name='...'} hashtables).
+    [hashtable[]] $ExtraPackages = @()
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -25,6 +46,14 @@ $wingetPackages = @(
     @{ Id = 'Spotify.Spotify';                     Name = 'Spotify' }
 )
 
+# Apply SkipPackages filter and add any extras
+if ($SkipPackages.Count -gt 0) {
+    $wingetPackages = $wingetPackages | Where-Object { $_.Id -notin $SkipPackages }
+}
+if ($ExtraPackages.Count -gt 0) {
+    $wingetPackages += $ExtraPackages
+}
+
 foreach ($pkg in $wingetPackages) {
     Write-Host "Installing $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
     winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
@@ -45,10 +74,10 @@ $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';
 # oh-my-posh ships a CLI to install Nerd Fonts from the official releases
 # (https://github.com/ryanoasis/nerd-fonts). Installs per-user, no admin needed.
 
-Write-Host 'Installing NerdFont Code New Roman...' -ForegroundColor Cyan
+Write-Host "Installing NerdFont $NerdFont..." -ForegroundColor Cyan
 if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    oh-my-posh font install CodeNewRoman
-    Write-Host '  Done: CodeNewRoman Nerd Font' -ForegroundColor Green
+    oh-my-posh font install $NerdFont
+    Write-Host "  Done: $NerdFont Nerd Font" -ForegroundColor Green
 }
 else {
     Write-Warning '  oh-my-posh not found on PATH after install. Install the font manually.'
@@ -59,7 +88,7 @@ else {
 # 1. oh-my-posh night-owl theme in the PowerShell 7 profile
 #    We build the PS 7 profile path explicitly because this script may be
 #    running under Windows PowerShell 5.1 where $PROFILE points elsewhere.
-Write-Host 'Configuring oh-my-posh night-owl theme...' -ForegroundColor Cyan
+Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
 
 $documentsPath  = [Environment]::GetFolderPath('MyDocuments')
 $ps7ProfilePath = Join-Path $documentsPath 'PowerShell\Microsoft.PowerShell_profile.ps1'
@@ -69,7 +98,7 @@ if (-not (Test-Path $ps7ProfileDir)) {
     New-Item -ItemType Directory -Path $ps7ProfileDir -Force | Out-Null
 }
 
-$ompLine = 'oh-my-posh init pwsh --config "$env:POSH_THEMES_PATH\night-owl.omp.json" | Invoke-Expression'
+$ompLine = "oh-my-posh init pwsh --config `"\`$env:POSH_THEMES_PATH\$OmpTheme.omp.json`" | Invoke-Expression"
 
 if (Test-Path $ps7ProfilePath) {
     $profileContent = Get-Content $ps7ProfilePath -Raw
@@ -123,14 +152,14 @@ if ($wtPackageDir) {
         $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $pwshPreviewGuid -Force
     }
 
-    # Font → CodeNewRoman Nerd Font for all profiles
+    # Font → selected Nerd Font for all profiles
     if (-not $wt.profiles) {
         $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{ defaults = [PSCustomObject]@{} }) -Force
     }
     if (-not $wt.profiles.defaults) {
         $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
     }
-    $fontObj = [PSCustomObject]@{ face = 'CodeNewRoman Nerd Font' }
+    $fontObj = [PSCustomObject]@{ face = "$NerdFont Nerd Font" }
     if ($wt.profiles.defaults.PSObject.Properties['font']) {
         $wt.profiles.defaults.font = $fontObj
     }
@@ -183,7 +212,7 @@ foreach ($settingsPath in $vsCodeSettingsPaths) {
         $settings = [PSCustomObject]@{}
     }
 
-    $fontValue = "'CodeNewRoman Nerd Font Mono', Consolas, 'Courier New', monospace"
+    $fontValue = "'$NerdFont Nerd Font Mono', Consolas, 'Courier New', monospace"
     if ($settings.PSObject.Properties['editor.fontFamily']) {
         $settings.'editor.fontFamily' = $fontValue
     }

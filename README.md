@@ -15,11 +15,42 @@ This repo is PowerShell that reinstalls the following:
 1. Spotify
 
 It also sets the following defaults and settings:
-1. Windows Termianl Preview as default terminal
+1. Windows Terminal Preview as default terminal
 1. PowerShell Preview as the default shell
-1. night-owl theme for oh-my-posh
-1. Updates C:\Users\jospaid\AppData\Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json to use the CodeNewRoman NerdFont
-1. Updates Visual Sudio Code and Visual Studio Code Insiders to use the CodeNewRoman Mono NerdFont
+1. oh-my-posh theme (default: `night-owl`, configurable via `-OmpTheme`)
+1. Updates Windows Terminal Preview settings to use the selected Nerd Font (default: `CodeNewRoman`, configurable via `-NerdFont`)
+1. Updates Visual Studio Code and Visual Studio Code Insiders to use the selected Nerd Font Mono variant
+
+## Customization
+
+The script accepts parameters so each person can tailor it to their preferences:
+
+```powershell
+# Run with all defaults
+.\altered-carbon.ps1
+
+# Use a different oh-my-posh theme
+.\altered-carbon.ps1 -OmpTheme 'jandedobbeleer'
+
+# Use a different Nerd Font
+.\altered-carbon.ps1 -NerdFont 'FiraCode'
+
+# Skip specific packages
+.\altered-carbon.ps1 -SkipPackages 'Spotify.Spotify'
+
+# Add extra packages
+.\altered-carbon.ps1 -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})
+
+# Combine options
+.\altered-carbon.ps1 -OmpTheme 'catppuccin' -NerdFont 'JetBrainsMono' -SkipPackages 'Spotify.Spotify'
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-OmpTheme` | `night-owl` | oh-my-posh theme name (without `.omp.json`) |
+| `-NerdFont` | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
+| `-SkipPackages` | _(none)_ | winget package IDs to exclude from the default list |
+| `-ExtraPackages` | _(none)_ | Additional `@{Id='...'; Name='...'}` hashtables to install |
 
 If possible, it installs these tools from the following sources, in order of priority:
 1. Microsoft Store
