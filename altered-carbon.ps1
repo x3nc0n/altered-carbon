@@ -83,6 +83,37 @@ else {
     Write-Warning '  oh-my-posh not found on PATH after install. Install the font manually.'
 }
 
+# ── PowerShell Modules ─────────────────────────────────────────────────────────
+# Install commonly used modules into CurrentUser scope (no admin required).
+
+$psModules = @(
+    # Core
+    @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph' }
+    @{ Name = 'Az';                        Description = 'Azure PowerShell' }
+    # M365 workloads
+    @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management' }
+    @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams' }
+    @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }
+    @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management' }
+    @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
+)
+
+foreach ($mod in $psModules) {
+    Write-Host "Installing module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
+    if (Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue) {
+        Write-Host "  Skipped: $($mod.Name) already installed." -ForegroundColor Yellow
+    }
+    else {
+        try {
+            Install-Module -Name $mod.Name -Scope CurrentUser -Force -AllowClobber -AcceptLicense -ErrorAction Stop
+            Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "  Failed to install $($mod.Name): $_"
+        }
+    }
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # 1. oh-my-posh night-owl theme in the PowerShell 7 profile

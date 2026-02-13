@@ -13,6 +13,15 @@ This repo is PowerShell that reinstalls the following:
 1. PowerToys
 1. NerdFont Code New Roman
 1. Spotify
+1. PowerShell modules:
+    1. Microsoft.Graph
+    1. Az
+    1. ExchangeOnlineManagement
+    1. MicrosoftTeams
+    1. PnP.PowerShell
+    1. MicrosoftPowerBIMgmt
+    1. Microsoft365DSC
+1. Azure CLI
 
 It also sets the following defaults and settings:
 1. Windows Terminal Preview as default terminal
