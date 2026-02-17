@@ -55,13 +55,36 @@ if ($ExtraPackages.Count -gt 0) {
 }
 
 foreach ($pkg in $wingetPackages) {
-    Write-Host "Installing $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
+    Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
+
+    # Check if already installed via winget to avoid unnecessary downloads.
+    $listOutput = winget list --id $pkg.Id --exact --accept-source-agreements 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        # Installed — check if an upgrade is available.
+        $upgradeOutput = winget upgrade --id $pkg.Id --exact --accept-source-agreements 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Updating $($pkg.Name)..." -ForegroundColor Cyan
+            winget upgrade --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
+            }
+            else {
+                Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
+            }
+        }
+        else {
+            Write-Host "  Skipped: $($pkg.Name) already up to date." -ForegroundColor Yellow
+        }
+        continue
+    }
+
+    Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
     winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "  Done: $($pkg.Name)" -ForegroundColor Green
+        Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
     }
     else {
-        Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name) (may already be installed)"
+        Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
     }
 }
 

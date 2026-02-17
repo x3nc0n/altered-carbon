@@ -21,7 +21,7 @@ This repo is PowerShell that reinstalls the following:
     1. PnP.PowerShell
     1. MicrosoftPowerBIMgmt
     1. Microsoft365DSC
-1. Azure CLI
+1. Azure CLI (Az CLI)
 
 It also sets the following defaults and settings:
 1. Windows Terminal Preview as default terminal
