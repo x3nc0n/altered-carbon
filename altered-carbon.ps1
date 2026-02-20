@@ -61,7 +61,26 @@ if ($ExtraPackages.Count -gt 0) {
 foreach ($pkg in $wingetPackages) {
     Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
 
-    # Get installed version
+    # Special handling for Spotify: skip install/upgrade if present
+    if ($pkg.Id -eq 'Spotify.Spotify') {
+        $spotifyPresent = winget list --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
+        if ($spotifyPresent) {
+            Write-Host "  Skipped: $($pkg.Name) already installed." -ForegroundColor Yellow
+            continue
+        }
+        Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
+        winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
+        } elseif ($LASTEXITCODE -eq 29) {
+            Write-Host "  Skipped: $($pkg.Name) already installed (installer exit code 29)." -ForegroundColor Yellow
+        } else {
+            Write-Warning "  winget exited with code $LASTEXITCODE installing $($pkg.Name)"
+        }
+        continue
+    }
+
+    # Generic handling for other packages
     $installedVersion = $null
     $listOutput = winget list --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
     if ($listOutput) {
@@ -81,8 +100,8 @@ foreach ($pkg in $wingetPackages) {
         }
     }
 
-    if ($installedVersion -and $latestVersion) {
-        if ($installedVersion -ne $latestVersion) {
+    if ($installedVersion) {
+        if ($latestVersion -and $installedVersion -ne $latestVersion) {
             Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
             winget upgrade --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
             if ($LASTEXITCODE -eq 0) {
@@ -91,7 +110,7 @@ foreach ($pkg in $wingetPackages) {
                 Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
             }
         } else {
-            Write-Host "  Skipped: $($pkg.Name) already up to date ($installedVersion)." -ForegroundColor Yellow
+            Write-Host "  Skipped: $($pkg.Name) already installed ($installedVersion)." -ForegroundColor Yellow
         }
         continue
     }
