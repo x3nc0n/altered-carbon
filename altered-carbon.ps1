@@ -44,6 +44,8 @@ $wingetPackages = @(
     @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh' }
     @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys' }
     @{ Id = 'Spotify.Spotify';                     Name = 'Spotify' }
+    @{ Id = 'NerdFonts.CodeNewRoman';              Name = 'NerdFont Code New Roman' }
+    @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)' }
 )
 
 # Apply SkipPackages filter and add any extras
@@ -57,23 +59,37 @@ if ($ExtraPackages.Count -gt 0) {
 foreach ($pkg in $wingetPackages) {
     Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
 
-    # Check if already installed via winget to avoid unnecessary downloads.
-    $listOutput = winget list --id $pkg.Id --exact --accept-source-agreements 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        # Installed — check if an upgrade is available.
-        $upgradeOutput = winget upgrade --id $pkg.Id --exact --accept-source-agreements 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Updating $($pkg.Name)..." -ForegroundColor Cyan
+    # Get installed version
+    $installedVersion = $null
+    $listOutput = winget list --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
+    if ($listOutput) {
+        $fields = ($listOutput -split '\s+')
+        if ($fields.Length -ge 3) {
+            $installedVersion = $fields[2]
+        }
+    }
+
+    # Get latest available version
+    $latestVersion = $null
+    $searchOutput = winget search --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
+    if ($searchOutput) {
+        $fields = ($searchOutput -split '\s+')
+        if ($fields.Length -ge 3) {
+            $latestVersion = $fields[2]
+        }
+    }
+
+    if ($installedVersion -and $latestVersion) {
+        if ($installedVersion -ne $latestVersion) {
+            Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
             winget upgrade --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
-            }
-            else {
+            } else {
                 Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
             }
-        }
-        else {
-            Write-Host "  Skipped: $($pkg.Name) already up to date." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Skipped: $($pkg.Name) already up to date ($installedVersion)." -ForegroundColor Yellow
         }
         continue
     }
@@ -82,8 +98,7 @@ foreach ($pkg in $wingetPackages) {
     winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
-    }
-    else {
+    } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
     }
 }
@@ -278,4 +293,40 @@ foreach ($settingsPath in $vsCodeSettingsPaths) {
     Write-Host "  Done: $label font configured." -ForegroundColor Green
 }
 
-Write-Host "`nSetup complete. Restart your terminal to apply all changes." -ForegroundColor Green
+Write-Host "`nSetup complete. Some changes (default terminal delegation) require you to log out and back in for Windows to apply them." -ForegroundColor Green
+Write-Host "If you do not log out, Windows Terminal may be unable to launch until you do." -ForegroundColor Yellow
+Write-Host "Would you like to log out now? (Y/n) [Default: Y]" -ForegroundColor Cyan
+$logoutPrompt = Read-Host
+if ($logoutPrompt -eq '' -or $logoutPrompt -match '^(Y|y)$') {
+    Write-Host 'Logging out...' -ForegroundColor Yellow
+    shutdown.exe /l
+} else {
+    Write-Host 'Logout skipped. Please log out manually to apply terminal changes.' -ForegroundColor Yellow
+}
+
+# 5. Configure File Explorer options
+Write-Host 'Configuring File Explorer options...' -ForegroundColor Cyan
+try {
+    # Show file extensions
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Value 0
+    # Show hidden files
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'Hidden' -Value 1
+    # Show system files
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'ShowSuperHidden' -Value 1
+    # Show full path in title bar
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState' -Name 'FullPath' -Value 1
+    # Show "Run as different user" in Start (requires Group Policy or registry tweak)
+    $runAsKey = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
+    $runAsName = 'ShowRunAsDifferentUserInStart'
+    try {
+        Set-ItemProperty -Path $runAsKey -Name $runAsName -Value 1 -Force
+    } catch {
+        Write-Warning "  Could not enable 'Run as different user' in Start menu. This setting may require admin rights or Group Policy access."
+        Write-Host "  To enable manually, open Group Policy Editor (gpedit.msc) and go to: User Configuration > Administrative Templates > Start Menu and Taskbar > Show 'Run as different user' command on Start. Or, open System Settings: " -ForegroundColor Yellow
+        Write-Host "  ms-settings:personalization-start" -ForegroundColor Cyan
+        Write-Host "  (Copy and paste the above URI into the Run dialog [Win+R] or a browser address bar.)" -ForegroundColor Yellow
+    }
+    Write-Host '  Done: File Explorer options configured.' -ForegroundColor Green
+} catch {
+    Write-Warning "  Failed to configure File Explorer options: $_"
+}
