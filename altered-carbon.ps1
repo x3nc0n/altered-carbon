@@ -43,9 +43,11 @@ $wingetPackages = @(
     @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI' }
     @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh' }
     @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys' }
-    @{ Id = 'Spotify.Spotify';                     Name = 'Spotify' }
     @{ Id = 'NerdFonts.CodeNewRoman';              Name = 'NerdFont Code New Roman' }
+    @{ Id = 'Spotify.Spotify';                     Name = 'Spotify' }
     @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)' }
+    @{ Id = '7zip.7zip';                           Name = '7zip' }
+    @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP' }
 )
 
 # Apply SkipPackages filter and add any extras
@@ -128,7 +130,6 @@ $psModules = @(
     # Core
     @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph' }
     @{ Name = 'Az';                        Description = 'Azure PowerShell' }
-    # M365 workloads
     @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management' }
     @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams' }
     @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }

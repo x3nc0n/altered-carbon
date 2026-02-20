@@ -22,6 +22,8 @@ This repo is PowerShell that reinstalls the following:
     1. MicrosoftPowerBIMgmt
     1. Microsoft365DSC
 1. Azure CLI (Az CLI)
+1. 7zip
+1. WinSCP
 
 It also sets the following defaults and settings:
 1. Windows Terminal Preview as default terminal
@@ -29,6 +31,11 @@ It also sets the following defaults and settings:
 1. oh-my-posh theme (default: `night-owl`, configurable via `-OmpTheme`)
 1. Updates Windows Terminal Preview settings to use the selected Nerd Font (default: `CodeNewRoman`, configurable via `-NerdFont`)
 1. Updates Visual Studio Code and Visual Studio Code Insiders to use the selected Nerd Font Mono variant
+1. Enables the following System->Advanced->File Explorer options:
+  1. Show file extensions
+  1. Show hidden and system files
+  1. Show full path in title bar
+  1. Show option to run as different user in Start
 
 ## Customization
 
