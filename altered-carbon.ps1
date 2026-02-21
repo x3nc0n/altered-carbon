@@ -40,6 +40,9 @@ if (-not $Work -and -not $Personal) {
 
 $ErrorActionPreference = 'Stop'
 
+# Constants
+$WINGET_APP_IN_USE = -1978335135  # 0x8A150001 - APPINSTALLER_CLI_ERROR_INSTALL_PACKAGE_IN_USE
+
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 function Get-WingetVersionInfo {
@@ -76,20 +79,28 @@ function Get-WingetVersionInfo {
     # Extract version (from Version column to Available or Source column)
     $versionEnd = if ($availablePos -gt $versionPos) { $availablePos } elseif ($sourcePos -gt $versionPos) { $sourcePos } else { $dataLine.Length }
     $version = $null
-    if ($dataLine.Length -gt $versionPos) {
-        $version = $dataLine.Substring($versionPos, [Math]::Min($versionEnd - $versionPos, $dataLine.Length - $versionPos)).Trim()
+    if ($dataLine.Length -gt $versionPos -and $versionEnd -gt $versionPos) {
+        $extractLength = [Math]::Min($versionEnd - $versionPos, $dataLine.Length - $versionPos)
+        if ($extractLength -gt 0) {
+            $version = $dataLine.Substring($versionPos, $extractLength).Trim()
+        }
     }
 
     # Extract available version if present
     $available = $null
     if ($availablePos -gt 0 -and $dataLine.Length -gt $availablePos) {
         $availableEnd = if ($sourcePos -gt $availablePos) { $sourcePos } else { $dataLine.Length }
-        $available = $dataLine.Substring($availablePos, [Math]::Min($availableEnd - $availablePos, $dataLine.Length - $availablePos)).Trim()
+        if ($availableEnd -gt $availablePos) {
+            $extractLength = [Math]::Min($availableEnd - $availablePos, $dataLine.Length - $availablePos)
+            if ($extractLength -gt 0) {
+                $available = $dataLine.Substring($availablePos, $extractLength).Trim()
+            }
+        }
     }
 
     return @{
-        Version   = if ($version -and $version -ne '') { $version } else { $null }
-        Available = if ($available -and $available -ne '') { $available } else { $null }
+        Version   = if ($version) { $version } else { $null }
+        Available = if ($available) { $available } else { $null }
     }
 }
 
@@ -103,42 +114,41 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
 
 # Core packages — installed in both Work and Personal modes
 $corePackages = @(
-    @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code' }
-    @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders' }
-    @{ Id = 'Microsoft.WindowsTerminal.Preview';   Name = 'Windows Terminal Preview' }
-    @{ Id = 'Microsoft.PowerShell';                Name = 'PowerShell 7' }
-    @{ Id = 'Microsoft.PowerShell.Preview';        Name = 'PowerShell Preview' }
-    @{ Id = 'Git.Git';                             Name = 'git' }
-    @{ Id = 'GitHub.GitHubDesktop';                Name = 'GitHub Desktop' }
-    @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI' }
-    @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh' }
-    @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys' }
-    @{ Id = 'NerdFonts.CodeNewRoman';              Name = 'NerdFont Code New Roman' }
-    @{ Id = 'Spotify.Spotify';                     Name = 'Spotify' }
-    @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)' }
-    @{ Id = '7zip.7zip';                           Name = '7zip' }
-    @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP' }
-    @{ Id = 'Logitech.GHUB';                       Name = 'Logitech G Hub' }
-    @{ Id = 'Logitech.OptionsPlus';                Name = 'Logitech Options+' }
-    @{ Id = 'Yealink.YealinkUSBConnect';           Name = 'Yealink USB Connect' }
-    @{ Id = 'Elgato.StreamDeck';                   Name = 'Elgato StreamDeck' }
-    @{ Id = '9N1F85V9T8BN';                         Name = 'Windows App' }
+    @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
+    @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
+    @{ Id = 'Microsoft.WindowsTerminal.Preview';   Name = 'Windows Terminal Preview'; Source = 'winget' }
+    @{ Id = 'Microsoft.PowerShell';                Name = 'PowerShell 7';            Source = 'winget' }
+    @{ Id = 'Microsoft.PowerShell.Preview';        Name = 'PowerShell Preview';      Source = 'winget' }
+    @{ Id = 'Git.Git';                             Name = 'git';                     Source = 'winget' }
+    @{ Id = 'GitHub.GitHubDesktop';                Name = 'GitHub Desktop';          Source = 'winget' }
+    @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI';              Source = 'winget' }
+    @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh';              Source = 'winget' }
+    @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys';               Source = 'winget' }
+    @{ Id = 'Spotify.Spotify';                     Name = 'Spotify';                 Source = 'winget' }
+    @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)';      Source = 'winget' }
+    @{ Id = '7zip.7zip';                           Name = '7zip';                    Source = 'winget' }
+    @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP';                  Source = 'winget' }
+    @{ Id = 'Logitech.GHUB';                       Name = 'Logitech G Hub';          Source = 'winget' }
+    @{ Id = 'Logitech.OptionsPlus';                Name = 'Logitech Options+';       Source = 'winget' }
+    @{ Id = 'Yealink.YealinkUSBConnect';           Name = 'Yealink USB Connect';     Source = 'winget' }
+    @{ Id = 'Elgato.StreamDeck';                   Name = 'Elgato StreamDeck';       Source = 'winget' }
+    @{ Id = '9N1F85V9T8BN';                         Name = 'Windows App';             Source = 'msstore' }
 )
 
 # Personal-only packages
 $personalPackages = @(
-    @{ Id = 'Valve.Steam';                                  Name = 'Steam' }
-    @{ Id = 'Discord.Discord';                              Name = 'Discord' }
-    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net' }
-    @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal' }
-    @{ Id = 'Google.Chrome';                                Name = 'Google Chrome' }
-    @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser' }
-    @{ Id = 'PrivateInternetAccess.PrivateInternetAccessVPN'; Name = 'PIA VPN Client' }
-    @{ Id = 'Anysphere.Cursor';                             Name = 'Cursor IDE' }
-    @{ Id = 'LMStudio.LMStudio';                            Name = 'LM Studio' }
-    @{ Id = 'Adobe.CreativeCloud';                          Name = 'Adobe Creative Cloud' }
-    @{ Id = 'Adobe.Lightroom';                              Name = 'Adobe Lightroom' }
-    @{ Id = 'Microsoft.GamingApp';                          Name = 'Xbox' }
+    @{ Id = 'Valve.Steam';                                  Name = 'Steam';                  Source = 'winget' }
+    @{ Id = 'Discord.Discord';                              Name = 'Discord';                Source = 'winget' }
+    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net';             Source = 'winget' }
+    @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal';                 Source = 'winget' }
+    @{ Id = 'Google.Chrome';                                Name = 'Google Chrome';          Source = 'winget' }
+    @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser';          Source = 'winget' }
+    @{ Id = 'PrivateInternetAccess.PrivateInternetAccessVPN'; Name = 'PIA VPN Client';         Source = 'winget' }
+    @{ Id = 'Anysphere.Cursor';                             Name = 'Cursor IDE';             Source = 'winget' }
+    @{ Id = 'LMStudio.LMStudio';                            Name = 'LM Studio';              Source = 'winget' }
+    @{ Id = 'Adobe.CreativeCloud';                          Name = 'Adobe Creative Cloud';   Source = 'winget' }
+    @{ Id = 'Adobe.Lightroom';                              Name = 'Adobe Lightroom';        Source = 'winget' }
+    @{ Id = 'Microsoft.GamingApp';                          Name = 'Xbox';                   Source = 'msstore' }
 )
 
 # Build the final package list based on mode
@@ -158,31 +168,15 @@ if ($ExtraPackages.Count -gt 0) {
 foreach ($pkg in $wingetPackages) {
     Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
 
-    # Special handling for Spotify: skip install/upgrade if present
-    if ($pkg.Id -eq 'Spotify.Spotify') {
-        $spotifyPresent = winget list --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
-        if ($spotifyPresent) {
-            Write-Host "  Skipped: $($pkg.Name) already installed." -ForegroundColor Yellow
-            continue
-        }
-        Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
-        winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
-        } elseif ($LASTEXITCODE -eq 29) {
-            Write-Host "  Skipped: $($pkg.Name) already installed (installer exit code 29)." -ForegroundColor Yellow
-        } else {
-            Write-Warning "  winget exited with code $LASTEXITCODE installing $($pkg.Name)"
-        }
-        continue
-    }
+    # Determine source (default to 'winget' if not specified)
+    $source = if ($pkg.Source) { $pkg.Source } else { 'winget' }
 
-    # Generic handling for other packages
+    # Generic handling for all packages
     $installedVersion = $null
     $availableVersion = $null
 
     # Get installed version using column-position parsing
-    $listLines = winget list --id $pkg.Id --exact --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+    $listLines = winget list --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
     $versionInfo = Get-WingetVersionInfo -Lines $listLines -PackageId $pkg.Id
     if ($versionInfo) {
         $installedVersion = $versionInfo.Version
@@ -192,7 +186,7 @@ foreach ($pkg in $wingetPackages) {
     # If no available version in list output, check search output
     $latestVersion = $availableVersion
     if (-not $latestVersion) {
-        $searchLines = winget search --id $pkg.Id --exact --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+        $searchLines = winget search --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
         $searchInfo = Get-WingetVersionInfo -Lines $searchLines -PackageId $pkg.Id
         if ($searchInfo -and $searchInfo.Version) {
             $latestVersion = $searchInfo.Version
@@ -202,9 +196,11 @@ foreach ($pkg in $wingetPackages) {
     if ($installedVersion) {
         if ($latestVersion -and $installedVersion -ne $latestVersion) {
             Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
-            winget upgrade --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
+            winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
+            } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+                Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
             } else {
                 Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
             }
@@ -215,9 +211,11 @@ foreach ($pkg in $wingetPackages) {
     }
 
     Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
-    winget install --id $pkg.Id --exact --accept-source-agreements --accept-package-agreements --silent
+    winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
+    } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+        Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
     } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
     }
@@ -275,13 +273,15 @@ if ($nvidiaGpu) {
     Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
     Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
     
-    $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
+    $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
     if ($nvidiaInstalled) {
         Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
     } else {
-        winget install --id 'Nvidia.NvidiaApp' --exact --accept-source-agreements --accept-package-agreements --silent
+        winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
         if ($LASTEXITCODE -eq 0) {
             Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
+        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+            Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
         } else {
             Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
         }
@@ -359,7 +359,8 @@ $ompLine = "oh-my-posh init pwsh --config `"\`$env:POSH_THEMES_PATH\$OmpTheme.om
 
 if (Test-Path $ps7ProfilePath) {
     $profileContent = Get-Content $ps7ProfilePath -Raw
-    if ($profileContent -notmatch 'oh-my-posh init') {
+    # Check if oh-my-posh init line already exists (match pwsh or powershell)
+    if ($profileContent -notmatch 'oh\-my\-posh\s+init\s+(pwsh|powershell)') {
         Add-Content -Path $ps7ProfilePath -Value "`n$ompLine"
         Write-Host '  Done: oh-my-posh line appended to profile.' -ForegroundColor Green
     }

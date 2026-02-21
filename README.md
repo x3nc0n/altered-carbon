@@ -17,8 +17,8 @@ The following are installed in both `-Work` and `-Personal` modes:
 1. GitHub CLI
 1. oh-my-posh
 1. PowerToys
-1. NerdFont Code New Roman
-1. Spotify (install only; Spotify manages its own updates)
+1. NerdFont (installed via oh-my-posh CLI, configurable with `-NerdFont` parameter)
+1. Spotify
 1. Azure CLI (Az CLI)
 1. 7zip
 1. WinSCP
