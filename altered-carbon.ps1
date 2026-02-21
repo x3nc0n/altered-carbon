@@ -2,13 +2,23 @@
 # Compatible with Windows PowerShell 5.1+ (the default shell on a fresh install).
 #
 # Usage:
-#   .\altered-carbon.ps1                                       # run with defaults
-#   .\altered-carbon.ps1 -OmpTheme 'jandedobbeleer'            # different oh-my-posh theme
-#   .\altered-carbon.ps1 -NerdFont 'FiraCode'                  # different Nerd Font
-#   .\altered-carbon.ps1 -SkipPackages 'Spotify.Spotify'       # skip specific packages
-#   .\altered-carbon.ps1 -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})  # add packages
+#   .\altered-carbon.ps1 -Work                                 # work mode (core + work apps)
+#   .\altered-carbon.ps1 -Personal                             # personal mode (core + personal apps)
+#   .\altered-carbon.ps1 -Work -OmpTheme 'jandedobbeleer'      # different oh-my-posh theme
+#   .\altered-carbon.ps1 -Personal -NerdFont 'FiraCode'        # different Nerd Font
+#   .\altered-carbon.ps1 -Work -SkipPackages 'Spotify.Spotify' # skip specific packages
+#   .\altered-carbon.ps1 -Personal -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})
 
+[CmdletBinding(DefaultParameterSetName = 'None')]
 param(
+    # Install for work environment (core + work-specific apps).
+    [Parameter(Mandatory, ParameterSetName = 'Work')]
+    [switch] $Work,
+
+    # Install for personal environment (core + personal-specific apps).
+    [Parameter(Mandatory, ParameterSetName = 'Personal')]
+    [switch] $Personal,
+
     # oh-my-posh theme name (without .omp.json extension).
     [string] $OmpTheme = 'night-owl',
 
@@ -21,6 +31,12 @@ param(
     # Additional winget packages to install (array of @{Id='...'; Name='...'} hashtables).
     [hashtable[]] $ExtraPackages = @()
 )
+
+# Require -Work or -Personal
+if (-not $Work -and -not $Personal) {
+    Write-Error 'You must specify either -Work or -Personal mode.'
+    exit 1
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -85,7 +101,8 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
 
 # ── Installations ─────────────────────────────────────────────────────────────
 
-$wingetPackages = @(
+# Core packages — installed in both Work and Personal modes
+$corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders' }
     @{ Id = 'Microsoft.WindowsTerminal.Preview';   Name = 'Windows Terminal Preview' }
@@ -101,7 +118,34 @@ $wingetPackages = @(
     @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)' }
     @{ Id = '7zip.7zip';                           Name = '7zip' }
     @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP' }
+    @{ Id = 'Logitech.GHUB';                       Name = 'Logitech G Hub' }
+    @{ Id = 'Logitech.OptionsPlus';                Name = 'Logitech Options+' }
+    @{ Id = 'Yealink.YealinkUSBConnect';           Name = 'Yealink USB Connect' }
+    @{ Id = 'Elgato.StreamDeck';                   Name = 'Elgato StreamDeck' }
+    @{ Id = '9N1F85V9T8BN';                         Name = 'Windows App' }
 )
+
+# Personal-only packages
+$personalPackages = @(
+    @{ Id = 'Valve.Steam';                                  Name = 'Steam' }
+    @{ Id = 'Discord.Discord';                              Name = 'Discord' }
+    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net' }
+    @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal' }
+    @{ Id = 'Google.Chrome';                                Name = 'Google Chrome' }
+    @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser' }
+    @{ Id = 'PrivateInternetAccess.PrivateInternetAccessVPN'; Name = 'PIA VPN Client' }
+    @{ Id = 'Anysphere.Cursor';                             Name = 'Cursor IDE' }
+    @{ Id = 'LMStudio.LMStudio';                            Name = 'LM Studio' }
+    @{ Id = 'Adobe.CreativeCloud';                          Name = 'Adobe Creative Cloud' }
+    @{ Id = 'Adobe.Lightroom';                              Name = 'Adobe Lightroom' }
+    @{ Id = 'Microsoft.GamingApp';                          Name = 'Xbox' }
+)
+
+# Build the final package list based on mode
+$wingetPackages = $corePackages
+if ($Personal) {
+    $wingetPackages += $personalPackages
+}
 
 # Apply SkipPackages filter and add any extras
 if ($SkipPackages.Count -gt 0) {
@@ -177,6 +221,73 @@ foreach ($pkg in $wingetPackages) {
     } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
     }
+}
+
+# ── Windows Features ──────────────────────────────────────────────────────────
+# Enable Hyper-V and WSL 2 (both modes). Requires admin privileges.
+
+Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
+
+# Check if running as admin
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if ($isAdmin) {
+    # Enable Hyper-V
+    $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+    if ($hypervState -and $hypervState.State -eq 'Enabled') {
+        Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
+    } else {
+        try {
+            Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop | Out-Null
+            Write-Host '  Done: Hyper-V enabled (reboot required).' -ForegroundColor Green
+        } catch {
+            Write-Warning "  Failed to enable Hyper-V: $_"
+        }
+    }
+
+    # Enable WSL 2
+    $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+    $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
+    
+    if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
+        Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
+    } else {
+        try {
+            Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -All -NoRestart -ErrorAction Stop | Out-Null
+            Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop | Out-Null
+            Write-Host '  Done: WSL 2 features enabled (reboot required). Run "wsl --install" after reboot to complete setup.' -ForegroundColor Green
+        } catch {
+            Write-Warning "  Failed to enable WSL 2: $_"
+        }
+    }
+} else {
+    Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
+}
+
+# ── Nvidia App (if Nvidia GPU present) ────────────────────────────────────────
+
+Write-Host 'Checking for Nvidia GPU...' -ForegroundColor Cyan
+
+$nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'NVIDIA' }
+
+if ($nvidiaGpu) {
+    Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
+    Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
+    
+    $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
+    if ($nvidiaInstalled) {
+        Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
+    } else {
+        winget install --id 'Nvidia.NvidiaApp' --exact --accept-source-agreements --accept-package-agreements --silent
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
+        } else {
+            Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
+        }
+    }
+} else {
+    Write-Host '  Skipped: No Nvidia GPU detected.' -ForegroundColor Yellow
 }
 
 # Refresh PATH so newly installed tools (oh-my-posh, git, etc.) are available
