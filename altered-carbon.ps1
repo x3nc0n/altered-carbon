@@ -24,6 +24,59 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+function Get-WingetVersionInfo {
+    <#
+    .SYNOPSIS
+        Parses winget output and extracts Version and Available columns using header positions.
+    .PARAMETER Lines
+        Array of output lines from winget list or winget search command.
+    .PARAMETER PackageId
+        The exact package ID to find in the output.
+    .RETURNS
+        Hashtable with Version and Available keys, or $null if not found.
+    #>
+    param(
+        [string[]] $Lines,
+        [string] $PackageId
+    )
+
+    # Find header line containing column names
+    $headerLine = $Lines | Where-Object { $_ -match '^\s*Name\s+' -and $_ -match 'Version' } | Select-Object -First 1
+    if (-not $headerLine) { return $null }
+
+    # Find the data line containing the package ID
+    $dataLine = $Lines | Where-Object { $_ -match [regex]::Escape($PackageId) } | Select-Object -First 1
+    if (-not $dataLine) { return $null }
+
+    # Get column positions from header
+    $versionPos = $headerLine.IndexOf('Version')
+    $availablePos = $headerLine.IndexOf('Available')
+    $sourcePos = $headerLine.IndexOf('Source')
+
+    if ($versionPos -lt 0) { return $null }
+
+    # Extract version (from Version column to Available or Source column)
+    $versionEnd = if ($availablePos -gt $versionPos) { $availablePos } elseif ($sourcePos -gt $versionPos) { $sourcePos } else { $dataLine.Length }
+    $version = $null
+    if ($dataLine.Length -gt $versionPos) {
+        $version = $dataLine.Substring($versionPos, [Math]::Min($versionEnd - $versionPos, $dataLine.Length - $versionPos)).Trim()
+    }
+
+    # Extract available version if present
+    $available = $null
+    if ($availablePos -gt 0 -and $dataLine.Length -gt $availablePos) {
+        $availableEnd = if ($sourcePos -gt $availablePos) { $sourcePos } else { $dataLine.Length }
+        $available = $dataLine.Substring($availablePos, [Math]::Min($availableEnd - $availablePos, $dataLine.Length - $availablePos)).Trim()
+    }
+
+    return @{
+        Version   = if ($version -and $version -ne '') { $version } else { $null }
+        Available = if ($available -and $available -ne '') { $available } else { $null }
+    }
+}
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -82,21 +135,23 @@ foreach ($pkg in $wingetPackages) {
 
     # Generic handling for other packages
     $installedVersion = $null
-    $listOutput = winget list --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
-    if ($listOutput) {
-        $fields = ($listOutput -split '\s+')
-        if ($fields.Length -ge 3) {
-            $installedVersion = $fields[2]
-        }
+    $availableVersion = $null
+
+    # Get installed version using column-position parsing
+    $listLines = winget list --id $pkg.Id --exact --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+    $versionInfo = Get-WingetVersionInfo -Lines $listLines -PackageId $pkg.Id
+    if ($versionInfo) {
+        $installedVersion = $versionInfo.Version
+        $availableVersion = $versionInfo.Available
     }
 
-    # Get latest available version
-    $latestVersion = $null
-    $searchOutput = winget search --id $pkg.Id --exact --accept-source-agreements | Select-String $pkg.Id
-    if ($searchOutput) {
-        $fields = ($searchOutput -split '\s+')
-        if ($fields.Length -ge 3) {
-            $latestVersion = $fields[2]
+    # If no available version in list output, check search output
+    $latestVersion = $availableVersion
+    if (-not $latestVersion) {
+        $searchLines = winget search --id $pkg.Id --exact --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+        $searchInfo = Get-WingetVersionInfo -Lines $searchLines -PackageId $pkg.Id
+        if ($searchInfo -and $searchInfo.Version) {
+            $latestVersion = $searchInfo.Version
         }
     }
 
