@@ -154,6 +154,8 @@ $psModules = @(
     @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }
     @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management' }
     @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
+    @{ Name = 'ActiveDirectory';           Description = 'Active Directory' }
+    @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune' }
 )
 
 foreach ($mod in $psModules) {

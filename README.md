@@ -1,6 +1,6 @@
 # altered-carbon
 
-This repo is PowerShell that reinstalls the following:
+This repo is PowerShell that (re)installs and/or updates the following:
 1. Visual Studio Code
 1. Visual Studio Code Insiders
 1. Windows Terminal Preview
@@ -12,7 +12,7 @@ This repo is PowerShell that reinstalls the following:
 1. oh-my-posh
 1. PowerToys
 1. NerdFont Code New Roman
-1. Spotify
+1. Spotify (install only; Spotify manages its own updates)
 1. PowerShell modules:
     1. Microsoft.Graph
     1. Az
@@ -21,6 +21,8 @@ This repo is PowerShell that reinstalls the following:
     1. PnP.PowerShell
     1. MicrosoftPowerBIMgmt
     1. Microsoft365DSC
+    1. ActiveDirectory
+    1. Microsoft.Graph.Intune
 1. Azure CLI (Az CLI)
 1. 7zip
 1. WinSCP
