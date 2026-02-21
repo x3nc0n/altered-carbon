@@ -360,7 +360,7 @@ $ompLine = "oh-my-posh init pwsh --config `"\`$env:POSH_THEMES_PATH\$OmpTheme.om
 if (Test-Path $ps7ProfilePath) {
     $profileContent = Get-Content $ps7ProfilePath -Raw
     # Check if oh-my-posh init line already exists (match pwsh or powershell)
-    if ($profileContent -notmatch 'oh-my-posh\s+init\s+(pwsh|powershell)') {
+    if ($profileContent -notmatch 'oh\-my\-posh\s+init\s+(pwsh|powershell)') {
         Add-Content -Path $ps7ProfilePath -Value "`n$ompLine"
         Write-Host '  Done: oh-my-posh line appended to profile.' -ForegroundColor Green
     }
