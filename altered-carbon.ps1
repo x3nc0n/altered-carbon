@@ -40,6 +40,9 @@ if (-not $Work -and -not $Personal) {
 
 $ErrorActionPreference = 'Stop'
 
+# Constants
+$WINGET_APP_IN_USE = -1978335135  # 0x8A150001 - APPINSTALLER_CLI_ERROR_INSTALL_PACKAGE_IN_USE
+
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 function Get-WingetVersionInfo {
@@ -196,7 +199,7 @@ foreach ($pkg in $wingetPackages) {
             winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
-            } elseif ($LASTEXITCODE -eq -1978335135) {
+            } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
                 Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
             } else {
                 Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
@@ -211,7 +214,7 @@ foreach ($pkg in $wingetPackages) {
     winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
-    } elseif ($LASTEXITCODE -eq -1978335135) {
+    } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
         Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
     } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
@@ -277,7 +280,7 @@ if ($nvidiaGpu) {
         winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
         if ($LASTEXITCODE -eq 0) {
             Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
-        } elseif ($LASTEXITCODE -eq -1978335135) {
+        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
             Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
         } else {
             Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
@@ -352,7 +355,7 @@ if (-not (Test-Path $ps7ProfileDir)) {
     New-Item -ItemType Directory -Path $ps7ProfileDir -Force | Out-Null
 }
 
-$ompLine = "oh-my-posh init pwsh --config `"`$env:POSH_THEMES_PATH\$OmpTheme.omp.json`" | Invoke-Expression"
+$ompLine = "oh-my-posh init pwsh --config `"\`$env:POSH_THEMES_PATH\$OmpTheme.omp.json`" | Invoke-Expression"
 
 if (Test-Path $ps7ProfilePath) {
     $profileContent = Get-Content $ps7ProfilePath -Raw
