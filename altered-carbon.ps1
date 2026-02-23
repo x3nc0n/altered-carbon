@@ -32,31 +32,29 @@ param(
     [hashtable[]] $ExtraPackages = @()
 )
 
-# Require -Work or -Personal
-if (-not $Work -and -not $Personal) {
-    Write-Error 'You must specify either -Work or -Personal mode.'
-    exit 1
+ $ErrorActionPreference = 'Stop'
+
+# ── Custom PSModulePath Setup ───────────────────────────────────────────────
+# Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
+$psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
+if (-not (Test-Path $psModuleDir)) {
+    New-Item -Path $psModuleDir -ItemType Directory | Out-Null
+    # Set hidden attribute
+    (Get-Item $psModuleDir).Attributes += 'Hidden'
+    Write-Host "Created hidden module folder: $psModuleDir" -ForegroundColor Green
+} else {
+    Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
 }
 
-$ErrorActionPreference = 'Stop'
+# Set PSModulePath for this session and persist for user
+$env:PSModulePath = $psModuleDir
+[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
+Write-Host "Set PSModulePath to $psModuleDir (user environment)" -ForegroundColor Cyan
 
-# Constants
-$WINGET_APP_IN_USE = -1978335135  # 0x8A150001 - APPINSTALLER_CLI_ERROR_INSTALL_PACKAGE_IN_USE
-
-# ── Helper Functions ──────────────────────────────────────────────────────────
-
-function Get-WingetVersionInfo {
-    <#
-    .SYNOPSIS
-        Parses winget output and extracts Version and Available columns using header positions.
-    .PARAMETER Lines
-        Array of output lines from winget list or winget search command.
-    .PARAMETER PackageId
-        The exact package ID to find in the output.
-    .RETURNS
-        Hashtable with Version and Available keys, or $null if not found.
-    #>
-    param(
+# Warn user if session restart may be needed for new PSModulePath to take effect everywhere
+if ($env:PSModulePath -ne $psModuleDir) {
+    Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
+}
         [string[]] $Lines,
         [string] $PackageId
     )
@@ -102,6 +100,31 @@ function Get-WingetVersionInfo {
         Version   = if ($version) { $version } else { $null }
         Available = if ($available) { $available } else { $null }
     }
+=======
+
+$ErrorActionPreference = 'Stop'
+
+# ── Custom PSModulePath Setup ───────────────────────────────────────────────
+# Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
+$psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
+if (-not (Test-Path $psModuleDir)) {
+    New-Item -Path $psModuleDir -ItemType Directory | Out-Null
+    # Set hidden attribute
+    (Get-Item $psModuleDir).Attributes += 'Hidden'
+    Write-Host "Created hidden module folder: $psModuleDir" -ForegroundColor Green
+} else {
+    Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
+}
+
+# Set PSModulePath for this session and persist for user
+$env:PSModulePath = $psModuleDir
+[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
+Write-Host "Set PSModulePath to $psModuleDir (user environment)" -ForegroundColor Cyan
+
+# Warn user if session restart may be needed for new PSModulePath to take effect everywhere
+if ($env:PSModulePath -ne $psModuleDir) {
+    Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
+>>>>>>> 5273012 (feat: use hidden .psmodule folder for PSModulePath to avoid OneDrive sync issues; update README)
 }
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────

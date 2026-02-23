@@ -1,4 +1,18 @@
+
 # altered-carbon
+## PowerShell Module Storage Location
+
+By default, PowerShell stores user modules in `$env:USERPROFILE\Documents\WindowsPowerShell\Modules` or `$env:USERPROFILE\Documents\PowerShell\Modules`, which are often synced by OneDrive. This can cause:
+
+- Unwanted space usage in OneDrive
+- Sync conflicts across machines
+- Security alerts (e.g., Purview) due to example secrets in default modules
+
+**This script creates a hidden `.psmodule` folder in your profile directory and sets the `PSModulePath` environment variable to use it.**
+
+This ensures PowerShell modules are not synced to OneDrive and avoids the issues above. The change is made before any modules are installed.
+
+> **Note:** You may need to restart your PowerShell session for the new `PSModulePath` to take effect everywhere.
 
 This repo is PowerShell that (re)installs and/or updates developer tools on a fresh Windows installation. It requires either `-Work` or `-Personal` mode to be specified.
 
