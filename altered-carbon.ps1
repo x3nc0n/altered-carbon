@@ -32,29 +32,11 @@ param(
     [hashtable[]] $ExtraPackages = @()
 )
 
- $ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
-# ── Custom PSModulePath Setup ───────────────────────────────────────────────
-# Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
-$psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
-if (-not (Test-Path $psModuleDir)) {
-    New-Item -Path $psModuleDir -ItemType Directory | Out-Null
-    # Set hidden attribute
-    (Get-Item $psModuleDir).Attributes += 'Hidden'
-    Write-Host "Created hidden module folder: $psModuleDir" -ForegroundColor Green
-} else {
-    Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
-}
-
-# Set PSModulePath for this session and persist for user
-$env:PSModulePath = $psModuleDir
-[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
-Write-Host "Set PSModulePath to $psModuleDir (user environment)" -ForegroundColor Cyan
-
-# Warn user if session restart may be needed for new PSModulePath to take effect everywhere
-if ($env:PSModulePath -ne $psModuleDir) {
-    Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
-}
+function Get-WingetVersionInfo {
+    [CmdletBinding()]
+    param(
         [string[]] $Lines,
         [string] $PackageId
     )
@@ -100,9 +82,7 @@ if ($env:PSModulePath -ne $psModuleDir) {
         Version   = if ($version) { $version } else { $null }
         Available = if ($available) { $available } else { $null }
     }
-=======
-
-$ErrorActionPreference = 'Stop'
+}
 
 # ── Custom PSModulePath Setup ───────────────────────────────────────────────
 # Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
@@ -124,7 +104,6 @@ Write-Host "Set PSModulePath to $psModuleDir (user environment)" -ForegroundColo
 # Warn user if session restart may be needed for new PSModulePath to take effect everywhere
 if ($env:PSModulePath -ne $psModuleDir) {
     Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
->>>>>>> 5273012 (feat: use hidden .psmodule folder for PSModulePath to avoid OneDrive sync issues; update README)
 }
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
