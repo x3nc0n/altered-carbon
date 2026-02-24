@@ -106,6 +106,22 @@ if ($env:PSModulePath -ne $psModuleDir) {
     Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
 }
 
+# ── Custom PowerShell Profile Directory ─────────────────────────────────────
+# Create a hidden .psprofile folder in the user's profile directory so the
+# real PowerShell profile lives outside the OneDrive-synced Documents folder.
+# A tiny stub at the default $PROFILE location dot-sources the real file.
+$psProfileDir = Join-Path $env:USERPROFILE '.psprofile'
+if (-not (Test-Path $psProfileDir)) {
+    New-Item -Path $psProfileDir -ItemType Directory | Out-Null
+    (Get-Item $psProfileDir).Attributes += 'Hidden'
+    Write-Host "Created hidden profile folder: $psProfileDir" -ForegroundColor Green
+} else {
+    Write-Host ".psprofile folder already exists: $psProfileDir" -ForegroundColor Yellow
+}
+
+# The actual profile file that will hold all config (oh-my-posh, etc.)
+$psProfileFile = Join-Path $psProfileDir 'profile.ps1'
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -344,35 +360,100 @@ foreach ($mod in $psModules) {
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# 1. oh-my-posh night-owl theme in the PowerShell 7 profile
-#    We build the PS 7 profile path explicitly because this script may be
-#    running under Windows PowerShell 5.1 where $PROFILE points elsewhere.
+# 1. oh-my-posh theme — PowerShell 7 / Preview profile
+#    The real profile lives in $env:USERPROFILE\.psprofile\profile.ps1 to
+#    avoid OneDrive syncing. A stub at the default $PROFILE dot-sources it.
 Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
 
-$documentsPath  = [Environment]::GetFolderPath('MyDocuments')
-$ps7ProfilePath = Join-Path $documentsPath 'PowerShell\Microsoft.PowerShell_profile.ps1'
-$ps7ProfileDir  = Split-Path $ps7ProfilePath -Parent
+# Robust init block: guards against oh-my-posh or POSH_THEMES_PATH being
+# missing and falls back gracefully so the rest of the profile still loads.
+$ompBlock = @"
+
+# ── oh-my-posh (managed by altered-carbon) ───────────────────────────────────
+if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
+    `$_ompTheme = '$OmpTheme'
+    `$_ompConfig = if (`$env:POSH_THEMES_PATH) {
+        Join-Path `$env:POSH_THEMES_PATH "`$_ompTheme.omp.json"
+    } else {
+        Join-Path "`$env:LOCALAPPDATA\Programs\oh-my-posh\themes" "`$_ompTheme.omp.json"
+    }
+    if (Test-Path `$_ompConfig) {
+        oh-my-posh init pwsh --config `$_ompConfig | Invoke-Expression
+    } else {
+        oh-my-posh init pwsh | Invoke-Expression
+    }
+}
+# ── end oh-my-posh ───────────────────────────────────────────────────────────
+"@
+
+# ── Write to the real profile in .psprofile ──────────────────────────────────
+if (Test-Path $psProfileFile) {
+    $profileContent = Get-Content $psProfileFile -Raw
+
+    # Remove any previous managed block (between sentinel comments).
+    $blockPattern = '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*'
+    $cleaned = $profileContent -replace $blockPattern, ''
+
+    # Also strip legacy bare oh-my-posh init lines from older versions of this script.
+    $cleaned = $cleaned -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+    $cleaned = $cleaned.TrimEnd()
+
+    Set-Content -Path $psProfileFile -Value ($cleaned + $ompBlock) -Encoding UTF8
+    Write-Host "  Done: oh-my-posh config written to $psProfileFile" -ForegroundColor Green
+}
+else {
+    Set-Content -Path $psProfileFile -Value $ompBlock.TrimStart() -Encoding UTF8
+    Write-Host "  Done: profile created at $psProfileFile with oh-my-posh config." -ForegroundColor Green
+}
+
+# ── Create stub at default $PROFILE that dot-sources the real profile ────────
+# Determine the default $PROFILE path for PowerShell 7 / Preview
+$ps7ProfilePath = $null
+if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+    $ps7ProfilePath = & pwsh -NoProfile -Command '$PROFILE' 2>$null
+}
+if (-not $ps7ProfilePath) {
+    # Fallback: build the path manually when pwsh is not yet on PATH.
+    $documentsPath  = [Environment]::GetFolderPath('MyDocuments')
+    $ps7ProfilePath = Join-Path $documentsPath 'PowerShell\Microsoft.PowerShell_profile.ps1'
+}
+$ps7ProfileDir = Split-Path $ps7ProfilePath -Parent
 
 if (-not (Test-Path $ps7ProfileDir)) {
     New-Item -ItemType Directory -Path $ps7ProfileDir -Force | Out-Null
 }
 
-$ompLine = "oh-my-posh init pwsh --config `"\`$env:POSH_THEMES_PATH\$OmpTheme.omp.json`" | Invoke-Expression"
+# The stub dot-sources the real profile from .psprofile.
+$stubContent = @"
+# Stub profile — managed by altered-carbon.
+# The real profile lives outside OneDrive in ~\.psprofile\profile.ps1.
+`$_realProfile = Join-Path `$env:USERPROFILE '.psprofile\profile.ps1'
+if (Test-Path `$_realProfile) { . `$_realProfile }
+"@
 
+# Only overwrite the stub if it is missing or already a stub we manage.
+$writeStub = $true
 if (Test-Path $ps7ProfilePath) {
-    $profileContent = Get-Content $ps7ProfilePath -Raw
-    # Check if oh-my-posh init line already exists (match pwsh or powershell)
-    if ($profileContent -notmatch 'oh\-my\-posh\s+init\s+(pwsh|powershell)') {
-        Add-Content -Path $ps7ProfilePath -Value "`n$ompLine"
-        Write-Host '  Done: oh-my-posh line appended to profile.' -ForegroundColor Green
-    }
-    else {
-        Write-Host '  Skipped: oh-my-posh already configured.' -ForegroundColor Yellow
+    $existing = Get-Content $ps7ProfilePath -Raw
+    if ($existing -notmatch 'managed by altered-carbon') {
+        # The user has a custom profile we don't own — migrate its content first.
+        Write-Host "  Migrating existing profile content to $psProfileFile" -ForegroundColor Cyan
+
+        # Strip any oh-my-posh blocks/lines already handled above, then prepend.
+        $migrated = $existing -replace '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*', ''
+        $migrated = $migrated -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+        $migrated = $migrated.Trim()
+
+        if ($migrated) {
+            $current = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
+            Set-Content -Path $psProfileFile -Value ($migrated + "`n" + $current) -Encoding UTF8
+        }
     }
 }
-else {
-    Set-Content -Path $ps7ProfilePath -Value $ompLine
-    Write-Host '  Done: PS 7 profile created with oh-my-posh config.' -ForegroundColor Green
+
+if ($writeStub) {
+    Set-Content -Path $ps7ProfilePath -Value $stubContent -Encoding UTF8
+    Write-Host "  Done: stub profile written to $ps7ProfilePath" -ForegroundColor Green
 }
 
 # 2. Windows Terminal Preview — default profile + font

@@ -1,16 +1,23 @@
 
 # altered-carbon
-## PowerShell Module Storage Location
+## OneDrive-Safe PowerShell Layout
 
-By default, PowerShell stores user modules in `$env:USERPROFILE\Documents\WindowsPowerShell\Modules` or `$env:USERPROFILE\Documents\PowerShell\Modules`, which are often synced by OneDrive. This can cause:
+By default, PowerShell stores user modules and the `$PROFILE` script inside the Documents folder, which OneDrive often syncs. This can cause:
 
 - Unwanted space usage in OneDrive
 - Sync conflicts across machines
 - Security alerts (e.g., Purview) due to example secrets in default modules
 
-**This script creates a hidden `.psmodule` folder in your profile directory and sets the `PSModulePath` environment variable to use it.**
+**This script creates two hidden folders under your user profile directory to keep PowerShell data out of OneDrive:**
 
-This ensures PowerShell modules are not synced to OneDrive and avoids the issues above. The change is made before any modules are installed.
+| Folder | Purpose |
+|---|---|
+| `~\.psmodule` | Module storage — `PSModulePath` is set to this location |
+| `~\.psprofile` | Profile config — oh-my-posh init and any other profile customizations live here |
+
+A tiny stub is placed at the default `$PROFILE` path (inside Documents) that dot-sources the real profile from `~\.psprofile\profile.ps1`. This way only a harmless one-liner syncs via OneDrive, while the actual config stays local.
+
+If you already have content in your existing `$PROFILE`, the script will migrate it into `~\.psprofile\profile.ps1` automatically before writing the stub.
 
 > **Note:** You may need to restart your PowerShell session for the new `PSModulePath` to take effect everywhere.
 
