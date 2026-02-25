@@ -326,6 +326,22 @@ else {
     Write-Warning '  oh-my-posh not found on PATH after install. Install the font manually.'
 }
 
+# ── PSGallery Trust ────────────────────────────────────────────────────────────
+# Ensure PSGallery is registered and trusted so module installs don't prompt.
+
+Write-Host 'Ensuring PSGallery is a trusted repository...' -ForegroundColor Cyan
+$psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+if (-not $psGallery) {
+    Register-PSRepository -Default -ErrorAction SilentlyContinue
+    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+    Write-Host '  Done: PSGallery registered and trusted.' -ForegroundColor Green
+} elseif ($psGallery.InstallationPolicy -ne 'Trusted') {
+    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+    Write-Host '  Done: PSGallery set to Trusted.' -ForegroundColor Green
+} else {
+    Write-Host '  Skipped: PSGallery already trusted.' -ForegroundColor Yellow
+}
+
 # ── PowerShell Modules ─────────────────────────────────────────────────────────
 # Install commonly used modules into CurrentUser scope (no admin required).
 
