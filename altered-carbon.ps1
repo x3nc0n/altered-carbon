@@ -22,7 +22,7 @@ param(
     # oh-my-posh theme name (without .omp.json extension).
     [string] $OmpTheme = 'night-owl',
 
-    # Nerd Font to install via oh-my-posh and set in Windows Terminal / VS Code.
+    # Nerd Font to install and set in Windows Terminal / VS Code.
     [string] $NerdFont = 'CodeNewRoman',
 
     # winget package IDs to skip from the default list.
@@ -33,6 +33,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── Admin Check ────────────────────────────────────────────────────────────────
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
 
 function Get-WingetVersionInfo {
     [CmdletBinding()]
@@ -127,9 +132,91 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Error 'winget is not available. Install "App Installer" from the Microsoft Store first.'
 }
 
+# ── Chocolatey ────────────────────────────────────────────────────────────────
+# Chocolatey provides more reliable PATH handling and version management for
+# developer tools like git. Used alongside winget, not as a full replacement.
+
+Write-Host 'Bootstrapping Chocolatey...' -ForegroundColor Cyan
+
+if (Get-Command choco -ErrorAction SilentlyContinue) {
+    Write-Host '  Skipped: Chocolatey already installed.' -ForegroundColor Yellow
+} elseif ($isAdmin) {
+    try {
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        # Refresh PATH so choco is available immediately
+        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                    [System.Environment]::GetEnvironmentVariable('Path', 'User')
+        Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "  Failed to install Chocolatey: $_"
+    }
+} else {
+    Write-Warning '  Chocolatey requires admin privileges. Re-run script as Administrator to install.'
+}
+
+# ── Chocolatey Packages ──────────────────────────────────────────────────────
+# Git and oh-my-posh benefit most from Chocolatey: tools are immediately on
+# PATH, POSH_THEMES_PATH is set correctly, and no session restart is needed.
+
+$chocoPackages = @(
+    @{ Id = 'git';        Name = 'git' }
+    @{ Id = 'oh-my-posh'; Name = 'oh-my-posh' }
+)
+
+if (Get-Command choco -ErrorAction SilentlyContinue) {
+    foreach ($pkg in $chocoPackages) {
+        Write-Host "Checking $($pkg.Name) ($($pkg.Id)) [choco]..." -ForegroundColor Cyan
+
+        $chocoList = choco list --exact $pkg.Id --limit-output 2>&1
+        if ($chocoList -match [regex]::Escape($pkg.Id)) {
+            Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
+            choco install $pkg.Id -y --no-progress
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Done: $($pkg.Name) installed via Chocolatey." -ForegroundColor Green
+            } else {
+                Write-Warning "  choco exited with code $LASTEXITCODE for $($pkg.Name)"
+            }
+        }
+    }
+
+    # Refresh PATH and POSH_THEMES_PATH after Chocolatey installs
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $chocoThemes = [System.Environment]::GetEnvironmentVariable('POSH_THEMES_PATH', 'Machine')
+    if (-not $chocoThemes) { $chocoThemes = [System.Environment]::GetEnvironmentVariable('POSH_THEMES_PATH', 'User') }
+    if ($chocoThemes) { $env:POSH_THEMES_PATH = $chocoThemes }
+
+    # Skip git and oh-my-posh in winget — Chocolatey already handled them
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $SkipPackages += 'Git.Git'
+    }
+    if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
+        $SkipPackages += 'JanDeDobbeleer.OhMyPosh'
+
+        # Remove the winget/Store version if present — its WindowsApps shim
+        # shadows the Chocolatey binary and has no themes bundled.
+        $wingetOmp = winget list --id 'JanDeDobbeleer.OhMyPosh' --exact --source winget --accept-source-agreements 2>&1 |
+            Select-String 'JanDeDobbeleer.OhMyPosh'
+        if ($wingetOmp) {
+            Write-Host '  Removing winget oh-my-posh to avoid conflict with Chocolatey version...' -ForegroundColor Cyan
+            winget uninstall --id 'JanDeDobbeleer.OhMyPosh' --exact --source winget --silent 2>&1 | Out-Null
+            Write-Host '  Done: winget oh-my-posh removed.' -ForegroundColor Green
+        }
+    }
+} else {
+    Write-Host 'Chocolatey not available — git and oh-my-posh will be installed via winget as fallback.' -ForegroundColor Yellow
+}
+
 # ── Installations ─────────────────────────────────────────────────────────────
 
-# Core packages — installed in both Work and Personal modes
+# Core packages — installed in both Work and Personal modes.
+# git and oh-my-posh are installed via Chocolatey above when available; they
+# remain here as winget fallbacks and are auto-skipped when choco handled them.
 $corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
@@ -254,9 +341,6 @@ foreach ($pkg in $wingetPackages) {
 
 Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
 
-# Check if running as admin
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
 if ($isAdmin) {
     # Enable Hyper-V
     $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
@@ -323,23 +407,75 @@ if ($nvidiaGpu) {
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
             [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
-# ── NerdFont: Code New Roman ─────────────────────────────────────────────────
-# oh-my-posh ships a CLI to install Nerd Fonts from the official releases
-# (https://github.com/ryanoasis/nerd-fonts). Installs per-user, no admin needed.
+# ── Nerd Font ────────────────────────────────────────────────────────────────
+# oh-my-posh (installed via Chocolatey above) ships a CLI to install Nerd Fonts
+# from the official nerd-fonts releases. Installs per-user when not admin.
 
-Write-Host "Installing NerdFont $NerdFont..." -ForegroundColor Cyan
-$fontInstalled = [System.Drawing.Text.InstalledFontCollection]::new().Families |
-    Where-Object { $_.Name -match [regex]::Escape($NerdFont) -and $_.Name -match 'Nerd Font' }
-if ($fontInstalled) {
-    Write-Host "  Skipped: $NerdFont Nerd Font already installed." -ForegroundColor Yellow
+Write-Host "Installing Nerd Font '$NerdFont'..." -ForegroundColor Cyan
+
+if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
+    # Check font registry to see if already installed.
+    $nfPattern = '(' + [regex]::Escape($NerdFont) + '|' + ($NerdFont -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
+    $fontInstalled = $false
+    foreach ($fontReg in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
+        'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+    )) {
+        if (Test-Path $fontReg) {
+            $match = (Get-ItemProperty -Path $fontReg).PSObject.Properties |
+                Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
+            if ($match) { $fontInstalled = $true; break }
+        }
+    }
+
+    if ($fontInstalled) {
+        Write-Host "  Skipped: $NerdFont Nerd Font already installed." -ForegroundColor Yellow
+    } else {
+        $fontArgs = @('font', 'install', $NerdFont)
+        if (-not $isAdmin) { $fontArgs += '--user' }
+        & oh-my-posh @fontArgs
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Done: $NerdFont Nerd Font installed." -ForegroundColor Green
+        } else {
+            Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $NerdFont"
+        }
+    }
+
+    # Resolve the actual font face name from the registry so Windows Terminal
+    # and VS Code settings use the exact family name.
+    $fontFace     = $null
+    $fontFaceMono = $null
+    foreach ($fontReg in @(
+        'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+    )) {
+        if (-not (Test-Path $fontReg)) { continue }
+        $entries = (Get-ItemProperty -Path $fontReg).PSObject.Properties |
+            Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
+        if ($entries) {
+            $baseEntry = $entries |
+                Where-Object { $_.Name -notmatch 'Nerd Font (Mono|Propo)' -and $_.Name -match 'Regular' } |
+                Select-Object -First 1
+            if ($baseEntry) {
+                $fontFace = ($baseEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
+            }
+            $monoEntry = $entries |
+                Where-Object { $_.Name -match 'Nerd Font Mono' -and $_.Name -match 'Regular' } |
+                Select-Object -First 1
+            if ($monoEntry) {
+                $fontFaceMono = ($monoEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
+            }
+            if ($fontFace) { break }
+        }
+    }
+} else {
+    Write-Warning '  oh-my-posh not found on PATH. Nerd Font installation skipped.'
 }
-elseif (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    oh-my-posh font install $NerdFont
-    Write-Host "  Done: $NerdFont Nerd Font" -ForegroundColor Green
-}
-else {
-    Write-Warning '  oh-my-posh not found on PATH after install. Install the font manually.'
-}
+
+# Fallback font names if registry lookup didn't resolve them.
+if (-not $fontFace)     { $fontFace     = "$NerdFont Nerd Font" }
+if (-not $fontFaceMono) { $fontFaceMono = "$fontFace Mono" }
+Write-Host "  Resolved font face: $fontFace | Mono: $fontFaceMono" -ForegroundColor Cyan
 
 # ── PSGallery Trust ────────────────────────────────────────────────────────────
 # Ensure PSGallery is registered and trusted so module installs don't prompt.
@@ -433,21 +569,33 @@ foreach ($editor in @('code', 'code-insiders')) {
 #    avoid OneDrive syncing. A stub at the default $PROFILE dot-sources it.
 Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
 
-# Robust init block: guards against oh-my-posh or POSH_THEMES_PATH being
-# missing and falls back gracefully so the rest of the profile still loads.
+# Chocolatey places oh-my-posh on the system PATH and sets POSH_THEMES_PATH.
+# However, the WindowsApps shim from a previous winget/Store install may still
+# shadow the Chocolatey binary. The profile block ensures the correct binary
+# is found by prepending the Chocolatey bin directory to PATH if it exists.
 $ompBlock = @"
 
 # ── oh-my-posh (managed by altered-carbon) ───────────────────────────────────
+# Prefer the Chocolatey oh-my-posh over any WindowsApps shim.
+`$_ompChocoBin = 'C:\Program Files (x86)\oh-my-posh\bin'
+if (Test-Path `$_ompChocoBin) {
+    `$env:Path = "`$_ompChocoBin;`$env:Path"
+}
+if (-not `$env:POSH_THEMES_PATH) {
+    `$_themesDir = 'C:\Program Files (x86)\oh-my-posh\themes'
+    if (Test-Path `$_themesDir) { `$env:POSH_THEMES_PATH = `$_themesDir }
+}
 if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    `$_ompTheme = '$OmpTheme'
-    `$_ompConfig = if (`$env:POSH_THEMES_PATH) {
-        Join-Path `$env:POSH_THEMES_PATH "`$_ompTheme.omp.json"
+    `$_customTheme = Join-Path `$env:USERPROFILE '.psprofile\$OmpTheme.omp.json'
+    if (Test-Path `$_customTheme) {
+        `$_ompConfig = `$_customTheme
     } else {
-        Join-Path "`$env:LOCALAPPDATA\Programs\oh-my-posh\themes" "`$_ompTheme.omp.json"
+        `$_ompConfig = Join-Path `$env:POSH_THEMES_PATH '$OmpTheme.omp.json'
     }
-    if (Test-Path `$_ompConfig) {
+    if (`$_ompConfig -and (Test-Path `$_ompConfig)) {
         oh-my-posh init pwsh --config `$_ompConfig | Invoke-Expression
     } else {
+        Write-Warning "oh-my-posh theme '$OmpTheme' not found - using default theme."
         oh-my-posh init pwsh | Invoke-Expression
     }
 }
@@ -524,13 +672,139 @@ if ($writeStub) {
     Write-Host "  Done: stub profile written to $ps7ProfilePath" -ForegroundColor Green
 }
 
-# 2. Windows Terminal Preview — default profile + font
-Write-Host 'Configuring Windows Terminal Preview...' -ForegroundColor Cyan
+# Also create the stub for Windows PowerShell 5.1 so opening any PS edition
+# picks up oh-my-posh.  The oh-my-posh block already uses "pwsh" init which
+# still works under 5.1; it just skips PS 7-only features gracefully.
+$ps51ProfilePath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'
+$ps51ProfileDir  = Split-Path $ps51ProfilePath -Parent
+if (-not (Test-Path $ps51ProfileDir)) {
+    New-Item -ItemType Directory -Path $ps51ProfileDir -Force | Out-Null
+}
+$writePs51Stub = $true
+if (Test-Path $ps51ProfilePath) {
+    $existingPs51 = Get-Content $ps51ProfilePath -Raw
+    if ($existingPs51 -notmatch 'managed by altered-carbon') {
+        # Migrate existing PS 5.1 profile content into .psprofile
+        Write-Host "  Migrating existing PS 5.1 profile content to $psProfileFile" -ForegroundColor Cyan
+        $migratedPs51 = $existingPs51 -replace '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*', ''
+        $migratedPs51 = $migratedPs51 -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+        $migratedPs51 = $migratedPs51.Trim()
+        if ($migratedPs51) {
+            $currentContent = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
+            if ($currentContent -notmatch [regex]::Escape($migratedPs51)) {
+                Set-Content -Path $psProfileFile -Value ($migratedPs51 + "`n" + $currentContent) -Encoding UTF8
+            }
+        }
+    }
+}
+if ($writePs51Stub) {
+    Set-Content -Path $ps51ProfilePath -Value $stubContent -Encoding UTF8
+    Write-Host "  Done: stub profile written to $ps51ProfilePath" -ForegroundColor Green
+}
 
-$wtPackageDir = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminalPreview_*' -ErrorAction SilentlyContinue |
-    Select-Object -First 1 -ExpandProperty FullName
+# ── Validate oh-my-posh theme file ──────────────────────────────────────────
+# Warn early if the selected theme file doesn't exist so the user knows to fix it.
+if ($env:POSH_THEMES_PATH -and (Test-Path (Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"))) {
+    Write-Host "  Verified: $OmpTheme theme found at $(Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json")" -ForegroundColor Green
+} else {
+    Write-Warning "  Theme file '$OmpTheme.omp.json' not found in `$env:POSH_THEMES_PATH ($env:POSH_THEMES_PATH). oh-my-posh will fall back to the default theme."
+    Write-Host '  Run ''Get-PoshThemes'' in PowerShell 7 to browse available themes.' -ForegroundColor Yellow
+}
 
-if ($wtPackageDir) {
+# ── Battery Detection — Custom Theme ─────────────────────────────────────────
+# If the device has a battery (laptop/tablet), create a custom theme that adds
+# a battery widget to the right prompt between the RAM and time segments.
+$hasBattery = $false
+try {
+    $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+    if ($battery) { $hasBattery = $true }
+} catch {
+    # CIM may not be available; skip battery detection.
+}
+
+$customThemePath = Join-Path $psProfileDir "$OmpTheme.omp.json"
+
+if ($hasBattery) {
+    Write-Host 'Battery detected — adding battery widget to oh-my-posh theme...' -ForegroundColor Cyan
+    $sourceThemePath = Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"
+
+    if (Test-Path $sourceThemePath) {
+        $theme = Get-Content $sourceThemePath -Raw | ConvertFrom-Json
+
+        # Find the right-aligned prompt block
+        $rightBlock = $theme.blocks | Where-Object { $_.alignment -eq 'right' }
+        if ($rightBlock) {
+            $segments = [System.Collections.ArrayList]@($rightBlock.segments)
+
+            # Locate the sysinfo (RAM) segment
+            $sysinfoIdx = -1
+            for ($i = 0; $i -lt $segments.Count; $i++) {
+                if ($segments[$i].type -eq 'sysinfo') { $sysinfoIdx = $i; break }
+            }
+
+            # Build the battery segment with the same diamond/arrow style
+            $battSeg = [PSCustomObject]@{
+                background           = '#22da6e'
+                background_templates = @(
+                    '{{ if eq "Charging" .State.String }}#40c4ff{{ end }}'
+                    '{{ if eq "Discharging" .State.String }}{{ if lt .Percentage 20 }}#ef5350{{ else if lt .Percentage 50 }}#e4cf6a{{ else }}#22da6e{{ end }}{{ end }}'
+                    '{{ if eq "Full" .State.String }}#4caf50{{ end }}'
+                )
+                foreground           = '#011627'
+                leading_diamond      = "$([char]0xe0b2)"
+                properties           = [PSCustomObject]@{
+                    charged_icon     = "$([char]0xf240) "
+                    charging_icon    = "$([char]0xf0e7) "
+                    discharging_icon = "$([char]0xf242) "
+                }
+                style                = 'diamond'
+                template             = ' {{ if not .Error }}{{ .Icon }}{{ .Percentage }}%{{ end }} '
+                trailing_diamond     = "$([char]0xe0d6)"
+                type                 = 'battery'
+            }
+
+            if ($sysinfoIdx -ge 0) {
+                $segments.Insert($sysinfoIdx + 1, $battSeg)
+            } else {
+                # No sysinfo found; insert before the last segment (time)
+                $segments.Insert([Math]::Max(0, $segments.Count - 1), $battSeg)
+            }
+
+            $rightBlock | Add-Member -NotePropertyName 'segments' -NotePropertyValue @($segments) -Force
+        }
+
+        $theme | ConvertTo-Json -Depth 20 | Set-Content $customThemePath -Encoding UTF8
+        Write-Host "  Done: custom theme saved to $customThemePath" -ForegroundColor Green
+    } else {
+        Write-Warning "  Source theme not found at $sourceThemePath — skipping battery widget."
+    }
+} else {
+    # No battery — remove any stale custom theme so the profile falls back to the original.
+    if (Test-Path $customThemePath) {
+        Remove-Item $customThemePath -Force
+        Write-Host 'No battery detected — removed custom theme (using original).' -ForegroundColor Cyan
+    } else {
+        Write-Host 'No battery detected — using original oh-my-posh theme.' -ForegroundColor Cyan
+    }
+}
+
+# 2. Windows Terminal — default profile + font
+#    Handles both Windows Terminal Preview and the stable release.
+Write-Host 'Configuring Windows Terminal...' -ForegroundColor Cyan
+
+$wtPackageDirs = @(
+    (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminalPreview_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName),
+    (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminal_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName)
+) | Where-Object { $_ }
+
+if ($wtPackageDirs.Count -eq 0) {
+    Write-Warning '  No Windows Terminal package folder found. Launch it once, then re-run this script.'
+}
+
+foreach ($wtPackageDir in $wtPackageDirs) {
+    $wtLabel = if ($wtPackageDir -match 'Preview') { 'Windows Terminal Preview' } else { 'Windows Terminal' }
+    Write-Host "  Configuring $wtLabel..." -ForegroundColor Cyan
+
     $wtLocalState   = Join-Path $wtPackageDir 'LocalState'
     $wtSettingsPath = Join-Path $wtLocalState 'settings.json'
 
@@ -542,7 +816,6 @@ if ($wtPackageDir) {
         $wt = Get-Content $wtSettingsPath -Raw | ConvertFrom-Json
     }
     else {
-        # Minimal settings — WT merges with its built-in defaults on launch.
         $wt = [PSCustomObject]@{
             '$help'   = 'https://aka.ms/terminal-documentation'
             '$schema' = 'https://aka.ms/terminal-profiles-schema'
@@ -552,13 +825,33 @@ if ($wtPackageDir) {
         }
     }
 
-    # Default profile → PowerShell Preview
-    $pwshPreviewGuid = '{2595cd9c-8f05-55ff-a1d4-93f3041ca67f}'
-    if ($wt.PSObject.Properties['defaultProfile']) {
-        $wt.defaultProfile = $pwshPreviewGuid
+    # Default profile → PowerShell Preview (GUID is auto-generated by WT, so
+    # we discover it from the profiles list rather than hardcoding).
+    $pwshPreviewGuid = $null
+    if ($wt.profiles -and $wt.profiles.list) {
+        $pwshPreviewGuid = $wt.profiles.list |
+            Where-Object { $_.name -match 'Preview' -and $_.source -eq 'Windows.Terminal.PowershellCore' } |
+            Select-Object -First 1 -ExpandProperty guid
+    }
+    if (-not $pwshPreviewGuid) {
+        # Fallback: look for any PowerShell Core profile (pwsh 7 stable).
+        if ($wt.profiles -and $wt.profiles.list) {
+            $pwshPreviewGuid = $wt.profiles.list |
+                Where-Object { $_.source -eq 'Windows.Terminal.PowershellCore' } |
+                Select-Object -First 1 -ExpandProperty guid
+        }
+    }
+    if ($pwshPreviewGuid) {
+        if ($wt.PSObject.Properties['defaultProfile']) {
+            $wt.defaultProfile = $pwshPreviewGuid
+        }
+        else {
+            $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $pwshPreviewGuid -Force
+        }
+        Write-Host "    Default profile set to $pwshPreviewGuid" -ForegroundColor Green
     }
     else {
-        $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $pwshPreviewGuid -Force
+        Write-Warning "    Could not find PowerShell Preview/Core profile in $wtLabel — defaultProfile unchanged."
     }
 
     # Font → selected Nerd Font for all profiles
@@ -568,7 +861,7 @@ if ($wtPackageDir) {
     if (-not $wt.profiles.defaults) {
         $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
     }
-    $fontObj = [PSCustomObject]@{ face = "$NerdFont Nerd Font" }
+    $fontObj = [PSCustomObject]@{ face = $fontFace }
     if ($wt.profiles.defaults.PSObject.Properties['font']) {
         $wt.profiles.defaults.font = $fontObj
     }
@@ -577,10 +870,7 @@ if ($wtPackageDir) {
     }
 
     $wt | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsPath -Encoding UTF8
-    Write-Host "  Done: $wtSettingsPath" -ForegroundColor Green
-}
-else {
-    Write-Warning '  Windows Terminal Preview package folder not found. Launch it once, then re-run this script.'
+    Write-Host "    Done: $wtSettingsPath" -ForegroundColor Green
 }
 
 # 3. Set Windows Terminal Preview as the default terminal (Windows 11)
@@ -599,7 +889,7 @@ catch {
     Write-Warning "  Failed to set default terminal: $_"
 }
 
-# 4. VS Code & VS Code Insiders — CodeNewRoman Nerd Font Mono
+# 4. VS Code & VS Code Insiders — Nerd Font Mono for editor
 Write-Host 'Configuring VS Code editor font...' -ForegroundColor Cyan
 
 $vsCodeSettingsPaths = @(
@@ -621,7 +911,7 @@ foreach ($settingsPath in $vsCodeSettingsPaths) {
         $settings = [PSCustomObject]@{}
     }
 
-    $fontValue = "'$NerdFont Nerd Font Mono', Consolas, 'Courier New', monospace"
+    $fontValue = "'$fontFaceMono', Consolas, 'Courier New', monospace"
     if ($settings.PSObject.Properties['editor.fontFamily']) {
         $settings.'editor.fontFamily' = $fontValue
     }

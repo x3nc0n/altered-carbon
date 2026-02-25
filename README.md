@@ -23,6 +23,17 @@ If you already have content in your existing `$PROFILE`, the script will migrate
 
 This repo is PowerShell that (re)installs and/or updates developer tools on a fresh Windows installation. It requires either `-Work` or `-Personal` mode to be specified.
 
+## Package Managers
+
+The script uses **two** package managers, each for what it does best:
+
+| Manager | Used For | Why |
+|---|---|---|
+| **Chocolatey** | `git` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` immediately without a session restart |
+| **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
+
+Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git.
+
 ## Modes
 
 ### Core (Both Modes)
@@ -33,7 +44,7 @@ The following are installed in both `-Work` and `-Personal` modes:
 1. Windows Terminal Preview
 1. PowerShell (7)
 1. PowerShell Preview (7)
-1. git
+1. git *(via Chocolatey when admin, winget fallback)*
 1. GitHub Desktop
 1. GitHub CLI
 1. oh-my-posh
@@ -136,6 +147,7 @@ The script requires `-Work` or `-Personal` mode, plus accepts optional parameter
 
 \* One of `-Work` or `-Personal` must be specified.
 
-If possible, it installs these tools from the following sources, in order of priority:
-1. Microsoft Store
-1. Well-known Internet sources only - direct from publisher website, no third-party or download aggregation sites
+The script installs tools from the following sources, in order of priority:
+1. Chocolatey (for git and developer tools that need reliable PATH handling)
+1. winget / Microsoft Store
+1. Well-known Internet sources only — direct from publisher website, no third-party or download aggregation sites
