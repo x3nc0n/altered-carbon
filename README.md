@@ -65,10 +65,8 @@ The following are installed in both `-Work` and `-Personal` modes:
     1. MSAL.PS
     1. PSKusto
 1. VS Code / VS Code Insiders extensions:
-    1. Azure Account
     1. Azure Resources
     1. Bicep
-    1. Azure Resource Manager Tools
     1. GitHub Copilot
     1. Microsoft Sentinel KQL
 

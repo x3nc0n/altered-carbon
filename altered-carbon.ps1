@@ -400,10 +400,8 @@ foreach ($mod in $psModules) {
 # Install useful extensions into both VS Code and VS Code Insiders.
 
 $vsCodeExtensions = @(
-    @{ Id = 'ms-vscode.azure-account';                 Name = 'Azure Account' }
     @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
     @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
-    @{ Id = 'msazurermtools.azurerm-vscode-tools';      Name = 'Azure Resource Manager Tools' }
     @{ Id = 'GitHub.copilot';                           Name = 'GitHub Copilot' }
     @{ Id = 'ms-sentinel.azure-sentinel-tools';         Name = 'Microsoft Sentinel KQL' }
 )
