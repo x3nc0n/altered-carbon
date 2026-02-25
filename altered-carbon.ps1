@@ -409,33 +409,84 @@ $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';
 
 # ── Nerd Font ────────────────────────────────────────────────────────────────
 # oh-my-posh (installed via Chocolatey above) ships a CLI to install Nerd Fonts
-# from the official nerd-fonts releases. Installs per-user when not admin.
+# from the official nerd-fonts releases.
+# NOTE: Per-user font installs (--user) are NOT visible to Windows Terminal
+# (a packaged/UWP app). We always install system-wide first — if that fails
+# (non-admin), we fall back to --user and then promote the per-user fonts to
+# system scope via an elevated helper so WT can see them.
 
 Write-Host "Installing Nerd Font '$NerdFont'..." -ForegroundColor Cyan
 
 if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    # Check font registry to see if already installed.
+    # Check font registry to see if already installed (prefer HKLM for WT compat).
     $nfPattern = '(' + [regex]::Escape($NerdFont) + '|' + ($NerdFont -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
-    $fontInstalled = $false
-    foreach ($fontReg in @(
-        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
-        'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+    $fontInstalledScope = $null   # 'Machine' or 'User' or $null
+    foreach ($scope in @(
+        @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'Machine' },
+        @{ Key = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'User' }
     )) {
-        if (Test-Path $fontReg) {
-            $match = (Get-ItemProperty -Path $fontReg).PSObject.Properties |
+        if (Test-Path $scope.Key) {
+            $match = (Get-ItemProperty -Path $scope.Key).PSObject.Properties |
                 Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
-            if ($match) { $fontInstalled = $true; break }
+            if ($match) { $fontInstalledScope = $scope.Scope; break }
         }
     }
 
-    if ($fontInstalled) {
-        Write-Host "  Skipped: $NerdFont Nerd Font already installed." -ForegroundColor Yellow
+    if ($fontInstalledScope -eq 'Machine') {
+        Write-Host "  Skipped: $NerdFont Nerd Font already installed system-wide." -ForegroundColor Yellow
+    } elseif ($fontInstalledScope -eq 'User') {
+        Write-Host "  $NerdFont Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
+        # Promote per-user fonts to system scope via elevation
+        $promoteScript = @"
+`$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+`$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$($nfPattern -replace "'","''")' }
+foreach (`$e in `$entries) {
+    `$srcFile = `$e.Value
+    `$destName = Split-Path `$srcFile -Leaf
+    Copy-Item `$srcFile (Join-Path `$env:SystemRoot 'Fonts' `$destName) -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path `$hklmReg -Name `$e.Name -Value `$destName -Force
+}
+"@
+        try {
+            Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $promoteScript -Verb RunAs -Wait -ErrorAction Stop
+            Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
+        } catch {
+            Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
+            Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
+        }
     } else {
-        $fontArgs = @('font', 'install', $NerdFont)
-        if (-not $isAdmin) { $fontArgs += '--user' }
-        & oh-my-posh @fontArgs
+        # Not installed — install system-wide if admin, per-user + promote otherwise
+        if ($isAdmin) {
+            & oh-my-posh font install $NerdFont
+        } else {
+            & oh-my-posh font install $NerdFont --user
+        }
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Done: $NerdFont Nerd Font installed." -ForegroundColor Green
+
+            if (-not $isAdmin) {
+                # Promote the per-user install to system scope
+                Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
+                $promoteScript = @"
+`$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+`$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$($nfPattern -replace "'","''")' }
+foreach (`$e in `$entries) {
+    `$srcFile = `$e.Value
+    `$destName = Split-Path `$srcFile -Leaf
+    Copy-Item `$srcFile (Join-Path `$env:SystemRoot 'Fonts' `$destName) -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path `$hklmReg -Name `$e.Name -Value `$destName -Force
+}
+"@
+                try {
+                    Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $promoteScript -Verb RunAs -Wait -ErrorAction Stop
+                    Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
+                } catch {
+                    Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
+                    Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
+                }
+            }
         } else {
             Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $NerdFont"
         }
