@@ -96,15 +96,14 @@ if (-not (Test-Path $psModuleDir)) {
     Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
 }
 
-# Set PSModulePath for this session and persist for user
-$env:PSModulePath = $psModuleDir
-[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
-Write-Host "Set PSModulePath to $psModuleDir (user environment)" -ForegroundColor Cyan
-
-# Warn user if session restart may be needed for new PSModulePath to take effect everywhere
-if ($env:PSModulePath -ne $psModuleDir) {
-    Write-Warning "You may need to restart your PowerShell session for PSModulePath changes to take full effect."
+# Prepend the custom module folder to PSModulePath (keep system paths so built-in modules like PowerShellGet still load)
+if ($env:PSModulePath -notlike "*$psModuleDir*") {
+    $env:PSModulePath = "$psModuleDir;$env:PSModulePath"
 }
+# Persist only the custom folder as the User-level PSModulePath; machine/process
+# paths are inherited automatically by new sessions.
+[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
+Write-Host "PSModulePath includes $psModuleDir (user environment)" -ForegroundColor Cyan
 
 # ── Custom PowerShell Profile Directory ─────────────────────────────────────
 # Create a hidden .psprofile folder in the user's profile directory so the
@@ -199,6 +198,17 @@ foreach ($pkg in $wingetPackages) {
     if ($versionInfo) {
         $installedVersion = $versionInfo.Version
         $availableVersion = $versionInfo.Available
+    }
+
+    # Fallback: some packages (e.g. Spotify) install as MSIX with a different ID.
+    # If the exact-ID check found nothing, try a name-based lookup.
+    if (-not $installedVersion) {
+        $nameLines = winget list --name $pkg.Name --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+        $nameHeader = $nameLines | Where-Object { $_ -match '^\s*Name\s+' -and $_ -match 'Version' } | Select-Object -First 1
+        if ($nameHeader) {
+            # At least one installed entry matched by name — treat as installed.
+            $installedVersion = 'detected'
+        }
     }
 
     # If no available version in list output, check search output
@@ -318,7 +328,12 @@ $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';
 # (https://github.com/ryanoasis/nerd-fonts). Installs per-user, no admin needed.
 
 Write-Host "Installing NerdFont $NerdFont..." -ForegroundColor Cyan
-if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
+$fontInstalled = [System.Drawing.Text.InstalledFontCollection]::new().Families |
+    Where-Object { $_.Name -match [regex]::Escape($NerdFont) -and $_.Name -match 'Nerd Font' }
+if ($fontInstalled) {
+    Write-Host "  Skipped: $NerdFont Nerd Font already installed." -ForegroundColor Yellow
+}
+elseif (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
     oh-my-posh font install $NerdFont
     Write-Host "  Done: $NerdFont Nerd Font" -ForegroundColor Green
 }
@@ -356,6 +371,10 @@ $psModules = @(
     @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
     @{ Name = 'ActiveDirectory';           Description = 'Active Directory' }
     @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune' }
+    # Sentinel / Security
+    @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)' }
+    @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)' }
+    @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)' }
 )
 
 foreach ($mod in $psModules) {
@@ -365,11 +384,46 @@ foreach ($mod in $psModules) {
     }
     else {
         try {
-            Install-Module -Name $mod.Name -Scope CurrentUser -Force -AllowClobber -AcceptLicense -ErrorAction Stop
+            # Use Save-Module to install directly into the custom .psmodule folder
+            # instead of Install-Module -Scope CurrentUser, which always targets
+            # the Documents folder (often synced via OneDrive).
+            Save-Module -Name $mod.Name -Path $psModuleDir -Force -AcceptLicense -ErrorAction Stop
             Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
         }
         catch {
             Write-Warning "  Failed to install $($mod.Name): $_"
+        }
+    }
+}
+
+# ── VS Code Extensions ─────────────────────────────────────────────────────────
+# Install useful extensions into both VS Code and VS Code Insiders.
+
+$vsCodeExtensions = @(
+    @{ Id = 'ms-vscode.azure-account';                 Name = 'Azure Account' }
+    @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
+    @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
+    @{ Id = 'msazurermtools.azurerm-vscode-tools';      Name = 'Azure Resource Manager Tools' }
+    @{ Id = 'GitHub.copilot';                           Name = 'GitHub Copilot' }
+    @{ Id = 'ms-sentinel.azure-sentinel-tools';         Name = 'Microsoft Sentinel KQL' }
+)
+
+foreach ($editor in @('code', 'code-insiders')) {
+    if (-not (Get-Command $editor -ErrorAction SilentlyContinue)) {
+        Write-Host "Skipping $editor extensions ($editor not found on PATH)." -ForegroundColor Yellow
+        continue
+    }
+
+    Write-Host "Installing VS Code extensions ($editor)..." -ForegroundColor Cyan
+    $installedExts = & $editor --list-extensions 2>$null
+
+    foreach ($ext in $vsCodeExtensions) {
+        if ($installedExts -contains $ext.Id) {
+            Write-Host "  Skipped: $($ext.Name) already installed." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Installing $($ext.Name)..." -ForegroundColor Cyan
+            & $editor --install-extension $ext.Id --force 2>&1 | Out-Null
+            Write-Host "  Done: $($ext.Name)" -ForegroundColor Green
         }
     }
 }
