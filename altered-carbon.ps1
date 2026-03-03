@@ -161,9 +161,12 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 # Git and oh-my-posh benefit most from Chocolatey: tools are immediately on
 # PATH, POSH_THEMES_PATH is set correctly, and no session restart is needed.
 
+
+# Add Node.js to Chocolatey packages
 $chocoPackages = @(
     @{ Id = 'git';        Name = 'git' }
     @{ Id = 'oh-my-posh'; Name = 'oh-my-posh' }
+    @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)' }
 )
 
 if (Get-Command choco -ErrorAction SilentlyContinue) {

@@ -29,7 +29,7 @@ The script uses **two** package managers, each for what it does best:
 
 | Manager | Used For | Why |
 |---|---|---|
-| **Chocolatey** | `git` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` immediately without a session restart |
+| **Chocolatey** | `git`, `Node.js` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` and `node.exe` immediately without a session restart |
 | **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
 
 Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git.
@@ -45,6 +45,7 @@ The following are installed in both `-Work` and `-Personal` modes:
 1. PowerShell (7)
 1. PowerShell Preview (7)
 1. git *(via Chocolatey when admin, winget fallback)*
+1. Node.js (LTS) *(via Chocolatey when admin)*
 1. GitHub Desktop
 1. GitHub CLI
 1. oh-my-posh
