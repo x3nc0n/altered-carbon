@@ -163,10 +163,11 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 
 
 # Add Node.js to Chocolatey packages
+# Command is the expected binary name — used to verify the install is healthy.
 $chocoPackages = @(
-    @{ Id = 'git';        Name = 'git' }
-    @{ Id = 'oh-my-posh'; Name = 'oh-my-posh' }
-    @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)' }
+    @{ Id = 'git';        Name = 'git';           Command = 'git' }
+    @{ Id = 'oh-my-posh'; Name = 'oh-my-posh';    Command = 'oh-my-posh' }
+    @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
 )
 
 if (Get-Command choco -ErrorAction SilentlyContinue) {
@@ -175,7 +176,25 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 
         $chocoList = choco list --exact $pkg.Id --limit-output 2>&1
         if ($chocoList -match [regex]::Escape($pkg.Id)) {
-            Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey." -ForegroundColor Yellow
+            # Verify the binary actually exists — winget uninstall can remove
+            # files that Chocolatey installed, leaving stale choco metadata.
+            $cmdInfo = if ($pkg.Command) { Get-Command $pkg.Command -ErrorAction SilentlyContinue } else { $null }
+            $isHealthy = (-not $pkg.Command) -or (
+                $cmdInfo -and $cmdInfo.Source -notmatch 'Microsoft\\WindowsApps'
+            )
+            if ($isHealthy) {
+                Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey." -ForegroundColor Yellow
+            } elseif ($isAdmin) {
+                Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
+                choco install $pkg.Id -y --force --no-progress
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  Done: $($pkg.Name) reinstalled via Chocolatey." -ForegroundColor Green
+                } else {
+                    Write-Warning "  choco exited with code $LASTEXITCODE reinstalling $($pkg.Name)"
+                }
+            } else {
+                Write-Host "  $($pkg.Name) choco install is broken (binary missing). Will fall back to winget. Re-run as admin to repair." -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
             choco install $pkg.Id -y --no-progress
@@ -200,16 +219,6 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
     }
     if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
         $SkipPackages += 'JanDeDobbeleer.OhMyPosh'
-
-        # Remove the winget/Store version if present — its WindowsApps shim
-        # shadows the Chocolatey binary and has no themes bundled.
-        $wingetOmp = winget list --id 'JanDeDobbeleer.OhMyPosh' --exact --source winget --accept-source-agreements 2>&1 |
-            Select-String 'JanDeDobbeleer.OhMyPosh'
-        if ($wingetOmp) {
-            Write-Host '  Removing winget oh-my-posh to avoid conflict with Chocolatey version...' -ForegroundColor Cyan
-            winget uninstall --id 'JanDeDobbeleer.OhMyPosh' --exact --source winget --silent 2>&1 | Out-Null
-            Write-Host '  Done: winget oh-my-posh removed.' -ForegroundColor Green
-        }
     }
 } else {
     Write-Host 'Chocolatey not available — git and oh-my-posh will be installed via winget as fallback.' -ForegroundColor Yellow
@@ -757,12 +766,30 @@ if ($writePs51Stub) {
 }
 
 # ── Validate oh-my-posh theme file ──────────────────────────────────────────
-# Warn early if the selected theme file doesn't exist so the user knows to fix it.
+# Resolve the theme file: prefer POSH_THEMES_PATH (Chocolatey), then the
+# .psprofile folder (downloaded fallback). Download from GitHub if missing.
+$resolvedThemePath = $null
 if ($env:POSH_THEMES_PATH -and (Test-Path (Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"))) {
-    Write-Host "  Verified: $OmpTheme theme found at $(Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json")" -ForegroundColor Green
+    $resolvedThemePath = Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"
+    Write-Host "  Verified: $OmpTheme theme found at $resolvedThemePath" -ForegroundColor Green
 } else {
-    Write-Warning "  Theme file '$OmpTheme.omp.json' not found in `$env:POSH_THEMES_PATH ($env:POSH_THEMES_PATH). oh-my-posh will fall back to the default theme."
-    Write-Host '  Run ''Get-PoshThemes'' in PowerShell 7 to browse available themes.' -ForegroundColor Yellow
+    # POSH_THEMES_PATH not set or theme not there — download to .psprofile.
+    $localTheme = Join-Path $psProfileDir "$OmpTheme.omp.json"
+    if (Test-Path $localTheme) {
+        $resolvedThemePath = $localTheme
+        Write-Host "  Verified: $OmpTheme theme found at $resolvedThemePath" -ForegroundColor Green
+    } else {
+        $themeUrl = "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/$OmpTheme.omp.json"
+        Write-Host "  Theme not found locally. Downloading $OmpTheme from GitHub..." -ForegroundColor Cyan
+        try {
+            Invoke-WebRequest -Uri $themeUrl -OutFile $localTheme -UseBasicParsing -ErrorAction Stop
+            $resolvedThemePath = $localTheme
+            Write-Host "  Done: theme saved to $localTheme" -ForegroundColor Green
+        } catch {
+            Write-Warning "  Failed to download theme: $_"
+            Write-Host '  oh-my-posh will fall back to the default theme.' -ForegroundColor Yellow
+        }
+    }
 }
 
 # ── Battery Detection — Custom Theme ─────────────────────────────────────────
@@ -780,9 +807,10 @@ $customThemePath = Join-Path $psProfileDir "$OmpTheme.omp.json"
 
 if ($hasBattery) {
     Write-Host 'Battery detected — adding battery widget to oh-my-posh theme...' -ForegroundColor Cyan
-    $sourceThemePath = Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"
+    # Use the resolved theme path from the validation step above.
+    $sourceThemePath = $resolvedThemePath
 
-    if (Test-Path $sourceThemePath) {
+    if ($sourceThemePath -and (Test-Path $sourceThemePath)) {
         $theme = Get-Content $sourceThemePath -Raw | ConvertFrom-Json
 
         # Find the right-aligned prompt block
@@ -977,16 +1005,7 @@ foreach ($settingsPath in $vsCodeSettingsPaths) {
     Write-Host "  Done: $label font configured." -ForegroundColor Green
 }
 
-Write-Host "`nSetup complete. Some changes (default terminal delegation) require you to log out and back in for Windows to apply them." -ForegroundColor Green
-Write-Host "If you do not log out, Windows Terminal may be unable to launch until you do." -ForegroundColor Yellow
-Write-Host "Would you like to log out now? (Y/n) [Default: Y]" -ForegroundColor Cyan
-$logoutPrompt = Read-Host
-if ($logoutPrompt -eq '' -or $logoutPrompt -match '^(Y|y)$') {
-    Write-Host 'Logging out...' -ForegroundColor Yellow
-    shutdown.exe /l
-} else {
-    Write-Host 'Logout skipped. Please log out manually to apply terminal changes.' -ForegroundColor Yellow
-}
+Write-Host "`nSetup complete." -ForegroundColor Green
 
 # 5. Configure File Explorer options
 Write-Host 'Configuring File Explorer options...' -ForegroundColor Cyan
