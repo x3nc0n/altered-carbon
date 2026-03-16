@@ -384,17 +384,17 @@ Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://com
     # Refresh PATH so choco is available immediately
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [System.Environment]::GetEnvironmentVariable('Path', 'User')
+}
 
 # ── Chocolatey Packages ──────────────────────────────────────────────────────
-# Git and oh-my-posh benefit most from Chocolatey: tools are immediately on
-# PATH, POSH_THEMES_PATH is set correctly, and no session restart is needed.
+# Git benefits most from Chocolatey: tools are immediately on PATH and no
+# session restart is needed. oh-my-posh is always installed via winget.
 
 
 # Add Node.js to Chocolatey packages
 # Command is the expected binary name — used to verify the install is healthy.
 $chocoPackages = @(
     @{ Id = 'git';        Name = 'git';           Command = 'git' }
-    @{ Id = 'oh-my-posh'; Name = 'oh-my-posh';    Command = 'oh-my-posh' }
     @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
 )
 
@@ -441,22 +441,19 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
     if (-not $chocoThemes) { $chocoThemes = [System.Environment]::GetEnvironmentVariable('POSH_THEMES_PATH', 'User') }
     if ($chocoThemes) { $env:POSH_THEMES_PATH = $chocoThemes }
 
-    # Skip git and oh-my-posh in winget — Chocolatey already handled them
+    # Skip git in winget — Chocolatey already handled it
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $SkipPackages += 'Git.Git'
     }
-    if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-        $SkipPackages += 'JanDeDobbeleer.OhMyPosh'
-    }
 } else {
-    Write-Host 'Chocolatey not available — git and oh-my-posh will be installed via winget as fallback.' -ForegroundColor Yellow
+    Write-Host 'Chocolatey not available — git will be installed via winget as fallback.' -ForegroundColor Yellow
 }
 
 # ── Installations ─────────────────────────────────────────────────────────────
 
 # Core packages — installed in both Work and Personal modes.
-# git and oh-my-posh are installed via Chocolatey above when available; they
-# remain here as winget fallbacks and are auto-skipped when choco handled them.
+# git is installed via Chocolatey above when available and auto-skipped here.
+# oh-my-posh is always installed via winget (required by upstream changes).
 $corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
