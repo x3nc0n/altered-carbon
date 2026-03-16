@@ -39,6 +39,207 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 
+# ── Elevation Helper ───────────────────────────────────────────────────────────
+# Runs a command or script block elevated via UAC when not already admin.
+# Returns $true if successful, $false otherwise. For most commands, uses
+# Start-Process -Verb RunAs which triggers a UAC prompt.
+function Invoke-Elevated {
+    [CmdletBinding()]
+    param(
+        # The command/executable to run (e.g., 'choco', 'winget')
+        [Parameter(Mandatory)]
+        [string] $Command,
+
+        # Arguments to pass to the command
+        [string[]] $Arguments = @(),
+
+        # Description for the elevation prompt (shown in console)
+        [string] $Description = 'Running elevated command',
+
+        # If true, waits for the elevated process to complete
+        [switch] $Wait = $true,
+
+        # If true, suppresses the "elevation required" message
+        [switch] $Quiet
+    )
+
+    if ($isAdmin) {
+        # Already admin — run directly
+        if (-not $Quiet) {
+            Write-Host "  $Description..." -ForegroundColor Cyan
+        }
+        $argString = $Arguments -join ' '
+        $result = & $Command @Arguments 2>&1
+        return @{ Success = ($LASTEXITCODE -eq 0); ExitCode = $LASTEXITCODE; Output = $result }
+    }
+
+    # Not admin — elevate via Start-Process
+    if (-not $Quiet) {
+        Write-Host "  $Description (elevation required)..." -ForegroundColor Cyan
+    }
+
+    # Build the command to run in the elevated shell
+    $argString = ($Arguments | ForEach-Object {
+        if ($_ -match '\s') { "`"$_`"" } else { $_ }
+    }) -join ' '
+
+    $elevatedScript = @"
+try {
+    `$output = & '$Command' $argString 2>&1
+    `$output | ForEach-Object { Write-Host `$_ }
+    exit `$LASTEXITCODE
+} catch {
+    Write-Error `$_.Exception.Message
+    exit 1
+}
+"@
+
+    try {
+        # Use pwsh if available, fall back to powershell.exe
+        $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+        $proc = Start-Process -FilePath $shell `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $elevatedScript `
+            -Verb RunAs `
+            -Wait:$Wait `
+            -PassThru `
+            -ErrorAction Stop
+
+        if ($Wait) {
+            return @{ Success = ($proc.ExitCode -eq 0); ExitCode = $proc.ExitCode; Output = $null }
+        }
+        return @{ Success = $true; ExitCode = 0; Output = $null }
+    }
+    catch {
+        if ($_.Exception.Message -match 'canceled by the user') {
+            Write-Warning "  UAC elevation was cancelled by user."
+        } else {
+            Write-Warning "  Failed to elevate: $($_.Exception.Message)"
+        }
+        return @{ Success = $false; ExitCode = -1; Output = $null }
+    }
+}
+
+# Wrapper specifically for Chocolatey commands that handles elevation automatically
+function Invoke-Choco {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $Arguments,
+        [string] $Description = 'Running Chocolatey command'
+    )
+
+    $chocoPath = (Get-Command choco -ErrorAction SilentlyContinue).Source
+    if (-not $chocoPath) {
+        Write-Warning "  Chocolatey not found on PATH."
+        return @{ Success = $false; ExitCode = -1 }
+    }
+
+    return Invoke-Elevated -Command $chocoPath -Arguments $Arguments -Description $Description
+}
+
+# Wrapper for winget that tries per-user install first, then elevates if needed
+# winget exit codes:
+#   0 = Success
+#   -1978335212 (0x8A150014) = Download error
+#   -1978335210 (0x8A150016) = Installer failed (may need admin)
+#   -1978335189 (0x8A15002B) = Requires elevation / machine scope
+$WINGET_REQUIRES_ADMIN = @(-1978335189, -1978335210)
+$WINGET_APP_IN_USE = -1978335215 # 0x8A150011
+$WINGET_SUCCESS_REBOOT = 3010
+
+function Invoke-Winget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Operation,  # 'install' or 'upgrade'
+
+        [Parameter(Mandatory)]
+        [string] $PackageId,
+
+        [string] $Source = 'winget',
+
+        [string] $PackageName = $PackageId,
+
+        # Whether to try user scope first (default: true for installs)
+        [switch] $PreferUser = $true
+    )
+
+    $baseArgs = @(
+        $Operation,
+        '--id', $PackageId,
+        '--exact',
+        '--source', $Source,
+        '--accept-source-agreements',
+        '--accept-package-agreements',
+        '--silent'
+    )
+
+    # First attempt: try without elevation
+    $result = & winget @baseArgs 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -eq 0 -or $exitCode -eq $WINGET_SUCCESS_REBOOT) {
+        return @{ Success = $true; ExitCode = $exitCode; Output = $result; Elevated = $false }
+    }
+
+    if ($exitCode -eq $WINGET_APP_IN_USE) {
+        Write-Warning "  $PackageName is currently in use. Close it and re-run the script."
+        return @{ Success = $false; ExitCode = $exitCode; Output = $result; Elevated = $false }
+    }
+
+    # Check if we need elevation
+    $needsElevation = $exitCode -in $WINGET_REQUIRES_ADMIN
+
+    # Also check output for admin-related messages
+    $outputText = $result -join "`n"
+    if ($outputText -match 'administrator|elevation|access denied|requires admin' -or $exitCode -eq 1) {
+        $needsElevation = $true
+    }
+
+    if ($needsElevation -and -not $isAdmin) {
+        Write-Host "  Package requires elevation. Requesting admin privileges..." -ForegroundColor Cyan
+
+        # Build the elevated command
+        $argString = ($baseArgs | ForEach-Object {
+            if ($_ -match '\s') { "`"$_`"" } else { $_ }
+        }) -join ' '
+
+        $elevatedScript = @"
+`$output = & winget $argString 2>&1
+`$output | ForEach-Object { Write-Host `$_ }
+exit `$LASTEXITCODE
+"@
+
+        try {
+            $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+            $proc = Start-Process -FilePath $shell `
+                -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $elevatedScript `
+                -Verb RunAs `
+                -Wait `
+                -PassThru `
+                -ErrorAction Stop
+
+            return @{
+                Success = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq $WINGET_SUCCESS_REBOOT)
+                ExitCode = $proc.ExitCode
+                Output = $null
+                Elevated = $true
+            }
+        }
+        catch {
+            if ($_.Exception.Message -match 'canceled by the user') {
+                Write-Warning "  UAC elevation was cancelled by user."
+            } else {
+                Write-Warning "  Failed to elevate: $($_.Exception.Message)"
+            }
+            return @{ Success = $false; ExitCode = -1; Output = $null; Elevated = $false }
+        }
+    }
+
+    # Failed for other reasons
+    return @{ Success = $false; ExitCode = $exitCode; Output = $result; Elevated = $false }
+}
+
 function Get-WingetVersionInfo {
     [CmdletBinding()]
     param(
@@ -140,22 +341,49 @@ Write-Host 'Bootstrapping Chocolatey...' -ForegroundColor Cyan
 
 if (Get-Command choco -ErrorAction SilentlyContinue) {
     Write-Host '  Skipped: Chocolatey already installed.' -ForegroundColor Yellow
-} elseif ($isAdmin) {
-    try {
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-        # Refresh PATH so choco is available immediately
-        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-                    [System.Environment]::GetEnvironmentVariable('Path', 'User')
-        Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "  Failed to install Chocolatey: $_"
-    }
 } else {
-    Write-Warning '  Chocolatey requires admin privileges. Re-run script as Administrator to install.'
-}
+    # Chocolatey requires admin — elevate if needed
+    $chocoInstallScript = @'
+Set-ExecutionPolicy Bypass -Scope Process -Force
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+'@
+
+    if ($isAdmin) {
+        try {
+            Invoke-Expression $chocoInstallScript
+            Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "  Failed to install Chocolatey: $_"
+        }
+    } else {
+        Write-Host '  Chocolatey requires admin privileges. Requesting elevation...' -ForegroundColor Cyan
+        try {
+            $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+            $proc = Start-Process -FilePath $shell `
+                -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $chocoInstallScript `
+                -Verb RunAs `
+                -Wait `
+                -PassThru `
+                -ErrorAction Stop
+            if ($proc.ExitCode -eq 0) {
+                Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
+            } else {
+                Write-Warning "  Chocolatey installation exited with code $($proc.ExitCode)"
+            }
+        }
+        catch {
+            if ($_.Exception.Message -match 'canceled by the user') {
+                Write-Warning '  UAC elevation was cancelled. Chocolatey will not be installed.'
+            } else {
+                Write-Warning "  Failed to install Chocolatey: $_"
+            }
+        }
+    }
+    # Refresh PATH so choco is available immediately
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
 # ── Chocolatey Packages ──────────────────────────────────────────────────────
 # Git and oh-my-posh benefit most from Chocolatey: tools are immediately on
@@ -184,24 +412,24 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
             )
             if ($isHealthy) {
                 Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey." -ForegroundColor Yellow
-            } elseif ($isAdmin) {
+            } else {
                 Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
-                choco install $pkg.Id -y --force --no-progress
-                if ($LASTEXITCODE -eq 0) {
+                $result = Invoke-Choco -Arguments @('install', $pkg.Id, '-y', '--force', '--no-progress') `
+                    -Description "Reinstalling $($pkg.Name)"
+                if ($result.Success) {
                     Write-Host "  Done: $($pkg.Name) reinstalled via Chocolatey." -ForegroundColor Green
                 } else {
-                    Write-Warning "  choco exited with code $LASTEXITCODE reinstalling $($pkg.Name)"
+                    Write-Warning "  choco exited with code $($result.ExitCode) reinstalling $($pkg.Name)"
                 }
-            } else {
-                Write-Host "  $($pkg.Name) choco install is broken (binary missing). Will fall back to winget. Re-run as admin to repair." -ForegroundColor Yellow
             }
         } else {
             Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
-            choco install $pkg.Id -y --no-progress
-            if ($LASTEXITCODE -eq 0) {
+            $result = Invoke-Choco -Arguments @('install', $pkg.Id, '-y', '--no-progress') `
+                -Description "Installing $($pkg.Name)"
+            if ($result.Success) {
                 Write-Host "  Done: $($pkg.Name) installed via Chocolatey." -ForegroundColor Green
             } else {
-                Write-Warning "  choco exited with code $LASTEXITCODE for $($pkg.Name)"
+                Write-Warning "  choco exited with code $($result.ExitCode) for $($pkg.Name)"
             }
         }
     }
@@ -323,13 +551,14 @@ foreach ($pkg in $wingetPackages) {
     if ($installedVersion) {
         if ($latestVersion -and $installedVersion -ne $latestVersion) {
             Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
-            winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
-            } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+            $result = Invoke-Winget -Operation 'upgrade' -PackageId $pkg.Id -Source $source -PackageName $pkg.Name
+            if ($result.Success) {
+                $elevatedNote = if ($result.Elevated) { ' (elevated)' } else { '' }
+                Write-Host "  Done: $($pkg.Name) updated$elevatedNote." -ForegroundColor Green
+            } elseif ($result.ExitCode -eq $WINGET_APP_IN_USE) {
                 Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
             } else {
-                Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
+                Write-Warning "  winget exited with code $($result.ExitCode) updating $($pkg.Name)"
             }
         } else {
             Write-Host "  Skipped: $($pkg.Name) already installed ($installedVersion)." -ForegroundColor Yellow
@@ -338,13 +567,14 @@ foreach ($pkg in $wingetPackages) {
     }
 
     Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
-    winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
-    } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+    $result = Invoke-Winget -Operation 'install' -PackageId $pkg.Id -Source $source -PackageName $pkg.Name
+    if ($result.Success) {
+        $elevatedNote = if ($result.Elevated) { ' (elevated)' } else { '' }
+        Write-Host "  Done: $($pkg.Name) installed$elevatedNote." -ForegroundColor Green
+    } elseif ($result.ExitCode -eq $WINGET_APP_IN_USE) {
         Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
     } else {
-        Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
+        Write-Warning "  winget exited with code $($result.ExitCode) for $($pkg.Name)"
     }
 }
 
@@ -353,8 +583,45 @@ foreach ($pkg in $wingetPackages) {
 
 Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
 
+# Helper script for enabling Windows features (used for elevation)
+$windowsFeaturesScript = @'
+$ErrorActionPreference = 'Stop'
+$results = @{ HyperV = 'skipped'; WSL = 'skipped' }
+
+# Enable Hyper-V
+$hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+if ($hypervState -and $hypervState.State -eq 'Enabled') {
+    $results.HyperV = 'already-enabled'
+} else {
+    try {
+        Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop | Out-Null
+        $results.HyperV = 'enabled'
+    } catch {
+        $results.HyperV = "failed: $_"
+    }
+}
+
+# Enable WSL 2
+$wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+$vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
+if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
+    $results.WSL = 'already-enabled'
+} else {
+    try {
+        Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -All -NoRestart -ErrorAction Stop | Out-Null
+        Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop | Out-Null
+        $results.WSL = 'enabled'
+    } catch {
+        $results.WSL = "failed: $_"
+    }
+}
+
+# Output results as JSON for the parent script to parse
+$results | ConvertTo-Json -Compress
+'@
+
 if ($isAdmin) {
-    # Enable Hyper-V
+    # Already admin — run directly
     $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
     if ($hypervState -and $hypervState.State -eq 'Enabled') {
         Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
@@ -367,7 +634,6 @@ if ($isAdmin) {
         }
     }
 
-    # Enable WSL 2
     $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
     $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
     
@@ -383,7 +649,41 @@ if ($isAdmin) {
         }
     }
 } else {
-    Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
+    # Not admin — check current state first, then elevate if needed
+    $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+    $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+    $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
+
+    $hypervEnabled = $hypervState -and $hypervState.State -eq 'Enabled'
+    $wslEnabled = $wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled'
+
+    if ($hypervEnabled -and $wslEnabled) {
+        Write-Host '  Skipped: Hyper-V and WSL 2 already enabled.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  Windows features require admin privileges. Requesting elevation...' -ForegroundColor Cyan
+        try {
+            $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+            $proc = Start-Process -FilePath $shell `
+                -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $windowsFeaturesScript `
+                -Verb RunAs `
+                -Wait `
+                -PassThru `
+                -ErrorAction Stop
+
+            if ($proc.ExitCode -eq 0) {
+                Write-Host '  Done: Windows features enabled (reboot required).' -ForegroundColor Green
+            } else {
+                Write-Warning "  Windows features script exited with code $($proc.ExitCode)"
+            }
+        }
+        catch {
+            if ($_.Exception.Message -match 'canceled by the user') {
+                Write-Warning '  UAC elevation was cancelled. Windows features will not be enabled.'
+            } else {
+                Write-Warning "  Failed to enable Windows features: $_"
+            }
+        }
+    }
 }
 
 # ── Nvidia App (if Nvidia GPU present) ────────────────────────────────────────
@@ -401,13 +701,14 @@ if ($nvidiaGpu) {
     if ($nvidiaInstalled) {
         Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
     } else {
-        winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
-        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+        $result = Invoke-Winget -Operation 'install' -PackageId 'Nvidia.NvidiaApp' -Source 'winget' -PackageName 'Nvidia App'
+        if ($result.Success) {
+            $elevatedNote = if ($result.Elevated) { ' (elevated)' } else { '' }
+            Write-Host "  Done: Nvidia App installed$elevatedNote." -ForegroundColor Green
+        } elseif ($result.ExitCode -eq $WINGET_APP_IN_USE) {
             Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
         } else {
-            Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
+            Write-Warning "  winget exited with code $($result.ExitCode) for Nvidia App"
         }
     }
 } else {
