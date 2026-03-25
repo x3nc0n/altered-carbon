@@ -1,43 +1,55 @@
 
 # altered-carbon
-## OneDrive-Safe PowerShell Layout
 
-By default, PowerShell stores user modules and the `$PROFILE` script inside the Documents folder, which OneDrive often syncs. This can cause:
+PowerShell that (re)installs and configures developer tools on a fresh Windows installation. Requires either `-Work` or `-Personal` mode.
 
-- Unwanted space usage in OneDrive
-- Sync conflicts across machines
-- Security alerts (e.g., Purview) due to example secrets in default modules
+## Quick Start
 
-**This script creates two hidden folders under your user profile directory to keep PowerShell data out of OneDrive:**
+```powershell
+# Work mode — core apps only
+.\altered-carbon.ps1 -Work
 
-| Folder | Purpose |
-|---|---|
-| `~\.psmodule` | Module storage — `PSModulePath` is set to this location |
-| `~\.psprofile` | Profile config — oh-my-posh init and any other profile customizations live here |
+# Personal mode — core + personal apps
+.\altered-carbon.ps1 -Personal
+```
 
-A tiny stub is placed at the default `$PROFILE` path (inside Documents) that dot-sources the real profile from `~\.psprofile\profile.ps1`. This way only a harmless one-liner syncs via OneDrive, while the actual config stays local.
+> **Tip:** Run as Administrator for full functionality (Chocolatey installs, Hyper-V, WSL 2).
 
-If you already have content in your existing `$PROFILE`, the script will migrate it into `~\.psprofile\profile.ps1` automatically before writing the stub.
+## Examples
 
-> **Note:** You may need to restart your PowerShell session for the new `PSModulePath` to take effect everywhere.
+```powershell
+# Use a different oh-my-posh theme
+.\altered-carbon.ps1 -Work -OmpTheme 'jandedobbeleer'
 
-This repo is PowerShell that (re)installs and/or updates developer tools on a fresh Windows installation. It requires either `-Work` or `-Personal` mode to be specified.
+# Use a different Nerd Font
+.\altered-carbon.ps1 -Personal -NerdFont 'FiraCode'
 
-## Package Managers
+# Skip specific packages
+.\altered-carbon.ps1 -Work -SkipPackages 'Spotify.Spotify'
 
-The script uses **two** package managers, each for what it does best:
+# Add extra packages
+.\altered-carbon.ps1 -Personal -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})
 
-| Manager | Used For | Why |
-|---|---|---|
-| **Chocolatey** | `git`, `Node.js` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` and `node.exe` immediately without a session restart |
-| **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
+# Combine options
+.\altered-carbon.ps1 -Work -OmpTheme 'catppuccin' -NerdFont 'JetBrainsMono' -SkipPackages 'Spotify.Spotify'
+```
 
-Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git.
+## Parameters
 
-## Modes
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `-Work` | Yes* | — | Install core apps for work environment |
+| `-Personal` | Yes* | — | Install core + personal apps |
+| `-OmpTheme` | No | `night-owl` | oh-my-posh theme name (without `.omp.json`) |
+| `-NerdFont` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
+| `-SkipPackages` | No | _(none)_ | winget package IDs to exclude from the default list |
+| `-ExtraPackages` | No | _(none)_ | Additional `@{Id='...'; Name='...'}` hashtables to install |
+
+\* One of `-Work` or `-Personal` must be specified.
+
+## What Gets Installed
 
 ### Core (Both Modes)
-The following are installed in both `-Work` and `-Personal` modes:
 
 1. Visual Studio Code
 1. Visual Studio Code Insiders
@@ -83,6 +95,7 @@ The following are installed in both `-Work` and `-Personal` modes:
     1. Microsoft Sentinel KQL
 
 ### Personal Mode Only (`-Personal`)
+
 In addition to core apps:
 
 1. Steam
@@ -98,55 +111,50 @@ In addition to core apps:
 1. Adobe Lightroom
 1. Xbox
 
-It also sets the following defaults and settings:
+### Configuration Applied
+
 1. Windows Terminal Preview as default terminal
 1. PowerShell Preview as the default shell
 1. oh-my-posh theme (default: `night-owl`, configurable via `-OmpTheme`)
 1. Updates Windows Terminal Preview settings to use the selected Nerd Font (default: `CodeNewRoman`, configurable via `-NerdFont`)
 1. Updates Visual Studio Code and Visual Studio Code Insiders to use the selected Nerd Font Mono variant
-1. Enables the following System->Advanced->File Explorer options:
-  1. Show file extensions
-  1. Show hidden and system files
-  1. Show full path in title bar
-  1. Show option to run as different user in Start
+1. Enables the following System → Advanced → File Explorer options:
+    1. Show file extensions
+    1. Show hidden and system files
+    1. Show full path in title bar
+    1. Show option to run as different user in Start
 
-## Customization
+## OneDrive-Safe PowerShell Layout
 
-The script requires `-Work` or `-Personal` mode, plus accepts optional parameters:
+By default, PowerShell stores user modules and the `$PROFILE` script inside the Documents folder, which OneDrive often syncs. This can cause:
 
-```powershell
-# Work mode (core apps only)
-.\altered-carbon.ps1 -Work
+- Unwanted space usage in OneDrive
+- Sync conflicts across machines
+- Security alerts (e.g., Purview) due to example secrets in default modules
 
-# Personal mode (core + personal apps)
-.\altered-carbon.ps1 -Personal
+**This script creates two hidden folders under your user profile directory to keep PowerShell data out of OneDrive:**
 
-# Use a different oh-my-posh theme
-.\altered-carbon.ps1 -Work -OmpTheme 'jandedobbeleer'
+| Folder | Purpose |
+|---|---|
+| `~\.psmodule` | Module storage — `PSModulePath` is set to this location |
+| `~\.psprofile` | Profile config — oh-my-posh init and any other profile customizations live here |
 
-# Use a different Nerd Font
-.\altered-carbon.ps1 -Personal -NerdFont 'FiraCode'
+A tiny stub is placed at the default `$PROFILE` path (inside Documents) that dot-sources the real profile from `~\.psprofile\profile.ps1`. This way only a harmless one-liner syncs via OneDrive, while the actual config stays local.
 
-# Skip specific packages
-.\altered-carbon.ps1 -Work -SkipPackages 'Spotify.Spotify'
+If you already have content in your existing `$PROFILE`, the script will migrate it into `~\.psprofile\profile.ps1` automatically before writing the stub.
 
-# Add extra packages
-.\altered-carbon.ps1 -Personal -ExtraPackages @(@{Id='Mozilla.Firefox'; Name='Firefox'})
+> **Note:** You may need to restart your PowerShell session for the new `PSModulePath` to take effect everywhere.
 
-# Combine options
-.\altered-carbon.ps1 -Work -OmpTheme 'catppuccin' -NerdFont 'JetBrainsMono' -SkipPackages 'Spotify.Spotify'
-```
+## Package Managers
 
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `-Work` | Yes* | - | Install core apps for work environment |
-| `-Personal` | Yes* | - | Install core + personal apps |
-| `-OmpTheme` | No | `night-owl` | oh-my-posh theme name (without `.omp.json`) |
-| `-NerdFont` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
-| `-SkipPackages` | No | _(none)_ | winget package IDs to exclude from the default list |
-| `-ExtraPackages` | No | _(none)_ | Additional `@{Id='...'; Name='...'}` hashtables to install |
+The script uses **two** package managers, each for what it does best:
 
-\* One of `-Work` or `-Personal` must be specified.
+| Manager | Used For | Why |
+|---|---|---|
+| **Chocolatey** | `git`, `Node.js` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` and `node.exe` immediately without a session restart |
+| **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
+
+Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git.
 
 The script installs tools from the following sources, in order of priority:
 1. Chocolatey (for git and developer tools that need reliable PATH handling)
