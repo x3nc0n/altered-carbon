@@ -182,8 +182,16 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
             $isHealthy = (-not $pkg.Command) -or (
                 $cmdInfo -and $cmdInfo.Source -notmatch 'Microsoft\\WindowsApps'
             )
-            if ($isHealthy) {
-                Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey." -ForegroundColor Yellow
+            if ($isHealthy -and $isAdmin) {
+                Write-Host "  Upgrading $($pkg.Name) via Chocolatey (no-op if already latest)..." -ForegroundColor Cyan
+                choco upgrade $pkg.Id -y --no-progress
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+                } else {
+                    Write-Warning "  choco exited with code $LASTEXITCODE upgrading $($pkg.Name)"
+                }
+            } elseif ($isHealthy) {
+                Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey (run as admin to upgrade)." -ForegroundColor Yellow
             } elseif ($isAdmin) {
                 Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
                 choco install $pkg.Id -y --force --no-progress
