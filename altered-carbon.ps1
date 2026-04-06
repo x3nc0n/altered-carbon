@@ -158,15 +158,13 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 }
 
 # ── Chocolatey Packages ──────────────────────────────────────────────────────
-# Git and oh-my-posh benefit most from Chocolatey: tools are immediately on
-# PATH, POSH_THEMES_PATH is set correctly, and no session restart is needed.
+# Git benefits most from Chocolatey: it's immediately on PATH with Git
+# Credential Manager and no session restart is needed.
 
 
-# Add Node.js to Chocolatey packages
 # Command is the expected binary name — used to verify the install is healthy.
 $chocoPackages = @(
     @{ Id = 'git';        Name = 'git';           Command = 'git' }
-    @{ Id = 'oh-my-posh'; Name = 'oh-my-posh';    Command = 'oh-my-posh' }
     @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
 )
 
@@ -214,29 +212,23 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
         }
     }
 
-    # Refresh PATH and POSH_THEMES_PATH after Chocolatey installs
+    # Refresh PATH after Chocolatey installs
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [System.Environment]::GetEnvironmentVariable('Path', 'User')
-    $chocoThemes = [System.Environment]::GetEnvironmentVariable('POSH_THEMES_PATH', 'Machine')
-    if (-not $chocoThemes) { $chocoThemes = [System.Environment]::GetEnvironmentVariable('POSH_THEMES_PATH', 'User') }
-    if ($chocoThemes) { $env:POSH_THEMES_PATH = $chocoThemes }
 
-    # Skip git and oh-my-posh in winget — Chocolatey already handled them
+    # Skip git in winget — Chocolatey already handled it
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $SkipPackages += 'Git.Git'
     }
-    if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-        $SkipPackages += 'JanDeDobbeleer.OhMyPosh'
-    }
 } else {
-    Write-Host 'Chocolatey not available — git and oh-my-posh will be installed via winget as fallback.' -ForegroundColor Yellow
+    Write-Host 'Chocolatey not available — git will be installed via winget as fallback.' -ForegroundColor Yellow
 }
 
 # ── Installations ─────────────────────────────────────────────────────────────
 
 # Core packages — installed in both Work and Personal modes.
-# git and oh-my-posh are installed via Chocolatey above when available; they
-# remain here as winget fallbacks and are auto-skipped when choco handled them.
+# git is installed via Chocolatey above when available; it remains here as a
+# winget fallback and is auto-skipped when choco handled it.
 $corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
@@ -428,8 +420,7 @@ $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';
             [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
 # ── Nerd Font ────────────────────────────────────────────────────────────────
-# oh-my-posh (installed via Chocolatey above) ships a CLI to install Nerd Fonts
-# from the official nerd-fonts releases.
+# oh-my-posh ships a CLI to install Nerd Fonts from the official nerd-fonts releases.
 # NOTE: Per-user font installs (--user) are NOT visible to Windows Terminal
 # (a packaged/UWP app). We always install system-wide first — if that fails
 # (non-admin), we fall back to --user and then promote the per-user fonts to
@@ -635,26 +626,42 @@ foreach ($editor in @('code', 'code-insiders')) {
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+# Migrate from the deprecated oh-my-posh PowerShell module (if still present).
+# Per the oh-my-posh migration guide: https://ohmyposh.dev/docs/migrating
+Write-Host 'Checking for deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
+if (Get-Module -ListAvailable -Name 'oh-my-posh' -ErrorAction SilentlyContinue) {
+    Write-Host '  Removing deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
+    try {
+        if ($env:POSH_PATH -and (Test-Path $env:POSH_PATH)) {
+            try {
+                Remove-Item $env:POSH_PATH -Force -Recurse -ErrorAction Stop
+                Write-Host "  Done: removed cached module files from `$env:POSH_PATH." -ForegroundColor Green
+            } catch {
+                Write-Warning "  Could not remove `$env:POSH_PATH: $_"
+            }
+        }
+        Uninstall-Module oh-my-posh -AllVersions -Force -ErrorAction Stop
+        Write-Host '  Done: oh-my-posh PowerShell module uninstalled.' -ForegroundColor Green
+    } catch {
+        Write-Warning "  Could not fully remove oh-my-posh module: $_"
+    }
+} else {
+    Write-Host '  Skipped: deprecated module not found.' -ForegroundColor Yellow
+}
+
 # 1. oh-my-posh theme — PowerShell 7 / Preview profile
 #    The real profile lives in $env:USERPROFILE\.psprofile\profile.ps1 to
 #    avoid OneDrive syncing. A stub at the default $PROFILE dot-sources it.
 Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
 
-# Chocolatey places oh-my-posh on the system PATH and sets POSH_THEMES_PATH.
-# However, the WindowsApps shim from a previous winget/Store install may still
-# shadow the Chocolatey binary. The profile block ensures the correct binary
-# is found by prepending the Chocolatey bin directory to PATH if it exists.
+# winget installs oh-my-posh as a standalone executable and sets POSH_THEMES_PATH.
+# The profile block resolves the themes directory at runtime in case the
+# environment variable isn't populated yet in the current session.
 $ompBlock = @"
 
 # ── oh-my-posh (managed by altered-carbon) ───────────────────────────────────
-# Prefer the Chocolatey oh-my-posh over any WindowsApps shim.
-`$_ompChocoBin = 'C:\Program Files (x86)\oh-my-posh\bin'
-if (Test-Path `$_ompChocoBin) {
-    `$env:Path = "`$_ompChocoBin;`$env:Path"
-}
 if (-not `$env:POSH_THEMES_PATH) {
     `$_themeCandidates = @(
-        'C:\Program Files (x86)\oh-my-posh\themes'
         (Join-Path `$env:LOCALAPPDATA 'Programs\oh-my-posh\themes')
     )
     # Derive themes dir from the oh-my-posh binary location as final fallback.
@@ -684,15 +691,20 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
 "@
 
 # ── Write to the real profile in .psprofile ──────────────────────────────────
+# Shared patterns for stripping legacy oh-my-posh config from any profile file.
+$ompBlockPattern  = '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*'
+$ompInitPattern   = '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?'
+$ompModulePattern = '(?m)^[^\r\n]*Import-Module\s+oh-my-posh[^\r\n]*\r?\n?'
+
 if (Test-Path $psProfileFile) {
     $profileContent = Get-Content $psProfileFile -Raw
 
     # Remove any previous managed block (between sentinel comments).
-    $blockPattern = '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*'
-    $cleaned = $profileContent -replace $blockPattern, ''
+    $cleaned = $profileContent -replace $ompBlockPattern, ''
 
-    # Also strip legacy bare oh-my-posh init lines from older versions of this script.
-    $cleaned = $cleaned -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+    # Also strip legacy bare oh-my-posh init lines and module imports from older installs.
+    $cleaned = $cleaned -replace $ompInitPattern, ''
+    $cleaned = $cleaned -replace $ompModulePattern, ''
     $cleaned = $cleaned.TrimEnd()
 
     Set-Content -Path $psProfileFile -Value ($cleaned + $ompBlock) -Encoding UTF8
@@ -737,8 +749,9 @@ if (Test-Path $ps7ProfilePath) {
         Write-Host "  Migrating existing profile content to $psProfileFile" -ForegroundColor Cyan
 
         # Strip any oh-my-posh blocks/lines already handled above, then prepend.
-        $migrated = $existing -replace '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*', ''
-        $migrated = $migrated -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+        $migrated = $existing -replace $ompBlockPattern, ''
+        $migrated = $migrated -replace $ompInitPattern, ''
+        $migrated = $migrated -replace $ompModulePattern, ''
         $migrated = $migrated.Trim()
 
         if ($migrated) {
@@ -767,8 +780,9 @@ if (Test-Path $ps51ProfilePath) {
     if ($existingPs51 -notmatch 'managed by altered-carbon') {
         # Migrate existing PS 5.1 profile content into .psprofile
         Write-Host "  Migrating existing PS 5.1 profile content to $psProfileFile" -ForegroundColor Cyan
-        $migratedPs51 = $existingPs51 -replace '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*', ''
-        $migratedPs51 = $migratedPs51 -replace '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?', ''
+        $migratedPs51 = $existingPs51 -replace $ompBlockPattern, ''
+        $migratedPs51 = $migratedPs51 -replace $ompInitPattern, ''
+        $migratedPs51 = $migratedPs51 -replace $ompModulePattern, ''
         $migratedPs51 = $migratedPs51.Trim()
         if ($migratedPs51) {
             $currentContent = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
