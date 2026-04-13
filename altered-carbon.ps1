@@ -1,4 +1,4 @@
-# altered-carbon.ps1 — Bootstrap a fresh Windows developer environment.
+﻿# altered-carbon.ps1 — Bootstrap a fresh Windows developer environment.
 # Compatible with Windows PowerShell 5.1+ (the default shell on a fresh install).
 #
 # Usage:
