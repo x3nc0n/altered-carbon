@@ -359,16 +359,17 @@ foreach ($pkg in $wingetPackages) {
     if ($installedVersion) {
         if ($latestVersion -and $installedVersion -ne $latestVersion) {
             Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
-            winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  Done: $($pkg.Name) updated." -ForegroundColor Green
-            } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
-                Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
-            } else {
-                Write-Warning "  winget exited with code $LASTEXITCODE updating $($pkg.Name)"
-            }
         } else {
-            Write-Host "  Skipped: $($pkg.Name) already installed ($installedVersion)." -ForegroundColor Yellow
+            Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
+        }
+
+        winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --include-unknown --silent
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+            Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
+        } else {
+            Write-Warning "  winget exited with code $LASTEXITCODE while checking/upgrading $($pkg.Name)"
         }
         continue
     }
@@ -603,8 +604,13 @@ foreach ($mod in $psModules) {
 $vsCodeExtensions = @(
     @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
     @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
-    @{ Id = 'GitHub.copilot';                           Name = 'GitHub Copilot' }
-    @{ Id = 'ms-sentinel.azure-sentinel-tools';         Name = 'Microsoft Sentinel KQL' }
+    @{ Id = 'github.copilot';                           Name = 'GitHub Copilot' }
+    @{ Id = 'ms-security.ms-sentinel';                  Name = 'Microsoft Sentinel' }
+)
+
+# Remove previously managed extension IDs that are no longer in README.
+$staleVsCodeExtensions = @(
+    'ms-sentinel.azure-sentinel-tools'
 )
 
 foreach ($editor in @('code', 'code-insiders')) {
@@ -623,6 +629,14 @@ foreach ($editor in @('code', 'code-insiders')) {
             Write-Host "  Installing $($ext.Name)..." -ForegroundColor Cyan
             & $editor --install-extension $ext.Id --force 2>&1 | Out-Null
             Write-Host "  Done: $($ext.Name)" -ForegroundColor Green
+        }
+    }
+
+    foreach ($staleExtId in $staleVsCodeExtensions) {
+        if ($installedExts -contains $staleExtId) {
+            Write-Host "  Removing stale extension $staleExtId..." -ForegroundColor Cyan
+            & $editor --uninstall-extension $staleExtId --force 2>&1 | Out-Null
+            Write-Host "  Done: removed $staleExtId" -ForegroundColor Green
         }
     }
 }

@@ -89,10 +89,10 @@ PowerShell that (re)installs and configures developer tools on a fresh Windows i
     1. MSAL.PS
     1. PSKusto
 1. VS Code / VS Code Insiders extensions:
-    1. Azure Resources
-    1. Bicep
-    1. GitHub Copilot
-    1. Microsoft Sentinel KQL
+    1. Azure Resources (ID: `ms-azuretools.vscode-azureresourcegroups`)
+    1. Bicep (ID: `ms-azuretools.vscode-bicep`)
+    1. GitHub Copilot (ID: `github.copilot`)
+    1. Microsoft Sentinel (ID: `ms-security.ms-sentinel`)
 
 ### Personal Mode Only (`-Personal`)
 
