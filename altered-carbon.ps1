@@ -279,7 +279,7 @@ $corePackages = @(
     @{ Id = 'Spotify.Spotify';                     Name = 'Spotify';                 Source = 'winget' }
     @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)';      Source = 'winget' }
     @{ Id = '7zip.7zip';                           Name = '7zip';                    Source = 'winget' }
-    @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP';                  Source = 'winget' }
+    @{ Id = '9P0PQ8B65N8X';                         Name = 'WinSCP';                  Source = 'msstore' }
     @{ Id = 'Logitech.GHUB';                       Name = 'Logitech G Hub';          Source = 'winget' }
     @{ Id = 'Logitech.OptionsPlus';                Name = 'Logitech Options+';       Source = 'winget' }
     @{ Id = 'Yealink.YealinkUSBConnect';           Name = 'Yealink USB Connect';     Source = 'winget' }
