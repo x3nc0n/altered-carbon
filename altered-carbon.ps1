@@ -431,6 +431,7 @@ Write-Host "Installing Nerd Font '$NerdFont'..." -ForegroundColor Cyan
 if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
     # Check font registry to see if already installed (prefer HKLM for WT compat).
     $nfPattern = '(' + [regex]::Escape($NerdFont) + '|' + ($NerdFont -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
+    $nfPatternEscaped = $nfPattern -replace "'", "''"
     $fontInstalledScope = $null   # 'Machine' or 'User' or $null
     foreach ($scope in @(
         @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'Machine' },
@@ -451,7 +452,7 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
         $promoteScript = @"
 `$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
 `$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$($nfPattern -replace "'","''")' }
+`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$nfPatternEscaped' }
 foreach (`$e in `$entries) {
     `$srcFile = `$e.Value
     `$destName = Split-Path `$srcFile -Leaf
@@ -482,7 +483,7 @@ foreach (`$e in `$entries) {
                 $promoteScript = @"
 `$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
 `$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$($nfPattern -replace "'","''")' }
+`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$nfPatternEscaped' }
 foreach (`$e in `$entries) {
     `$srcFile = `$e.Value
     `$destName = Split-Path `$srcFile -Leaf
