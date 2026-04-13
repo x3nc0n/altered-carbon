@@ -1,4 +1,4 @@
-# altered-carbon.ps1 — Bootstrap a fresh Windows developer environment.
+﻿# altered-carbon.ps1 — Bootstrap a fresh Windows developer environment.
 # Compatible with Windows PowerShell 5.1+ (the default shell on a fresh install).
 #
 # Usage:
@@ -86,6 +86,42 @@ function Get-WingetVersionInfo {
     return @{
         Version   = if ($version) { $version } else { $null }
         Available = if ($available) { $available } else { $null }
+    }
+}
+
+function Invoke-ElevatedFontPromotion {
+    # Write a small helper script to a temp file and run it elevated so that
+    # per-user Nerd Font files are copied to the system Fonts directory and
+    # registered in HKLM, making them visible to Windows Terminal (UWP).
+    # Uses a temp file to avoid newline-in-argument issues on Windows when
+    # passing multi-line scripts to pwsh -Command.
+    [CmdletBinding()]
+    param(
+        # The regex pattern (already single-quote–escaped) that identifies the
+        # target font entries in the Windows font registry.
+        [string] $NfPattern
+    )
+
+    $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString('N') + '.ps1')
+    Set-Content -Path $tmpScript -Encoding UTF8 -Value (
+        '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
+        '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
+        '$entries = (Get-ItemProperty $hkcuReg).PSObject.Properties | Where-Object { $_.Name -match ''Nerd Font'' -and $_.Name -match ''' + $NfPattern + ''' }' + "`r`n" +
+        'foreach ($e in $entries) {' + "`r`n" +
+        '    $srcFile = $e.Value' + "`r`n" +
+        '    $destName = Split-Path $srcFile -Leaf' + "`r`n" +
+        '    Copy-Item $srcFile (Join-Path $env:SystemRoot ''Fonts'' $destName) -Force -ErrorAction SilentlyContinue' + "`r`n" +
+        '    Set-ItemProperty -Path $hklmReg -Name $e.Name -Value $destName -Force' + "`r`n" +
+        '}'
+    )
+    try {
+        Start-Process pwsh -ArgumentList "-NoProfile -File `"$tmpScript`"" -Verb RunAs -Wait -ErrorAction Stop
+        Write-Host '  Done: fonts promoted to system-wide.' -ForegroundColor Green
+    } catch {
+        Write-Warning '  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts.'
+        Write-Host '  Re-run this script as Administrator to fix this.' -ForegroundColor Yellow
+    } finally {
+        Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -449,24 +485,7 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
     } elseif ($fontInstalledScope -eq 'User') {
         Write-Host "  $NerdFont Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
         # Promote per-user fonts to system scope via elevation
-        $promoteScript = @"
-`$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$nfPatternEscaped' }
-foreach (`$e in `$entries) {
-    `$srcFile = `$e.Value
-    `$destName = Split-Path `$srcFile -Leaf
-    Copy-Item `$srcFile (Join-Path `$env:SystemRoot 'Fonts' `$destName) -Force -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path `$hklmReg -Name `$e.Name -Value `$destName -Force
-}
-"@
-        try {
-            Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $promoteScript -Verb RunAs -Wait -ErrorAction Stop
-            Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
-        } catch {
-            Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
-            Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
-        }
+        Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
     } else {
         # Not installed — install system-wide if admin, per-user + promote otherwise
         if ($isAdmin) {
@@ -480,24 +499,7 @@ foreach (`$e in `$entries) {
             if (-not $isAdmin) {
                 # Promote the per-user install to system scope
                 Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
-                $promoteScript = @"
-`$hkcuReg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$hklmReg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-`$entries = (Get-ItemProperty `$hkcuReg).PSObject.Properties | Where-Object { `$_.Name -match 'Nerd Font' -and `$_.Name -match '$nfPatternEscaped' }
-foreach (`$e in `$entries) {
-    `$srcFile = `$e.Value
-    `$destName = Split-Path `$srcFile -Leaf
-    Copy-Item `$srcFile (Join-Path `$env:SystemRoot 'Fonts' `$destName) -Force -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path `$hklmReg -Name `$e.Name -Value `$destName -Force
-}
-"@
-                try {
-                    Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $promoteScript -Verb RunAs -Wait -ErrorAction Stop
-                    Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
-                } catch {
-                    Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
-                    Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
-                }
+                Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
             }
         } else {
             Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $NerdFont"
@@ -658,38 +660,36 @@ Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
 # winget installs oh-my-posh as a standalone executable and sets POSH_THEMES_PATH.
 # The profile block resolves the themes directory at runtime in case the
 # environment variable isn't populated yet in the current session.
-$ompBlock = @"
-
+$ompBlock = ('
 # ── oh-my-posh (managed by altered-carbon) ───────────────────────────────────
-if (-not `$env:POSH_THEMES_PATH) {
-    `$_themeCandidates = @(
-        (Join-Path `$env:LOCALAPPDATA 'Programs\oh-my-posh\themes')
+if (-not $env:POSH_THEMES_PATH) {
+    $_themeCandidates = @(
+        (Join-Path $env:LOCALAPPDATA ''Programs\oh-my-posh\themes'')
     )
     # Derive themes dir from the oh-my-posh binary location as final fallback.
-    `$_ompCmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
-    if (`$_ompCmd) {
-        `$_themeCandidates += Join-Path (Split-Path (Split-Path `$_ompCmd.Source)) 'themes'
+    $_ompCmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
+    if ($_ompCmd) {
+        $_themeCandidates += Join-Path (Split-Path (Split-Path $_ompCmd.Source)) ''themes''
     }
-    foreach (`$_dir in `$_themeCandidates) {
-        if (`$_dir -and (Test-Path `$_dir)) { `$env:POSH_THEMES_PATH = `$_dir; break }
+    foreach ($_dir in $_themeCandidates) {
+        if ($_dir -and (Test-Path $_dir)) { $env:POSH_THEMES_PATH = $_dir; break }
     }
 }
 if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    `$_customTheme = Join-Path `$env:USERPROFILE '.psprofile\$OmpTheme.omp.json'
-    if (Test-Path `$_customTheme) {
-        `$_ompConfig = `$_customTheme
-    } elseif (`$env:POSH_THEMES_PATH) {
-        `$_ompConfig = Join-Path `$env:POSH_THEMES_PATH '$OmpTheme.omp.json'
+    $_customTheme = Join-Path $env:USERPROFILE ''.psprofile\__OMP_THEME__.omp.json''
+    if (Test-Path $_customTheme) {
+        $_ompConfig = $_customTheme
+    } elseif ($env:POSH_THEMES_PATH) {
+        $_ompConfig = Join-Path $env:POSH_THEMES_PATH ''__OMP_THEME__.omp.json''
     }
-    if (`$_ompConfig -and (Test-Path `$_ompConfig)) {
-        oh-my-posh init pwsh --config `$_ompConfig | Invoke-Expression
+    if ($_ompConfig -and (Test-Path $_ompConfig)) {
+        oh-my-posh init pwsh --config $_ompConfig | Invoke-Expression
     } else {
-        Write-Warning "oh-my-posh theme '$OmpTheme' not found - using default theme."
+        Write-Warning "oh-my-posh theme ''__OMP_THEME__'' not found - using default theme."
         oh-my-posh init pwsh | Invoke-Expression
     }
 }
-# ── end oh-my-posh ───────────────────────────────────────────────────────────
-"@
+# ── end oh-my-posh ───────────────────────────────────────────────────────────').Replace('__OMP_THEME__', $OmpTheme)
 
 # ── Write to the real profile in .psprofile ──────────────────────────────────
 # Shared patterns for stripping legacy oh-my-posh config from any profile file.
@@ -734,12 +734,10 @@ if (-not (Test-Path $ps7ProfileDir)) {
 }
 
 # The stub dot-sources the real profile from .psprofile.
-$stubContent = @"
-# Stub profile — managed by altered-carbon.
+$stubContent = '# Stub profile — managed by altered-carbon.
 # The real profile lives outside OneDrive in ~\.psprofile\profile.ps1.
-`$_realProfile = Join-Path `$env:USERPROFILE '.psprofile\profile.ps1'
-if (Test-Path `$_realProfile) { . `$_realProfile }
-"@
+$_realProfile = Join-Path $env:USERPROFILE ''.psprofile\profile.ps1''
+if (Test-Path $_realProfile) { . $_realProfile }'
 
 # Only overwrite the stub if it is missing or already a stub we manage.
 $writeStub = $true
