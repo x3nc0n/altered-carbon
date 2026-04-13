@@ -89,6 +89,42 @@ function Get-WingetVersionInfo {
     }
 }
 
+function Invoke-ElevatedFontPromotion {
+    # Write a small helper script to a temp file and run it elevated so that
+    # per-user Nerd Font files are copied to the system Fonts directory and
+    # registered in HKLM, making them visible to Windows Terminal (UWP).
+    # Uses a temp file to avoid newline-in-argument issues on Windows when
+    # passing multi-line scripts to pwsh -Command.
+    [CmdletBinding()]
+    param(
+        # The regex pattern (already single-quote–escaped) that identifies the
+        # target font entries in the Windows font registry.
+        [string] $NfPattern
+    )
+
+    $tmpScript = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), '.ps1')
+    Set-Content -Path $tmpScript -Encoding UTF8 -Value (
+        '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
+        '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
+        '$entries = (Get-ItemProperty $hkcuReg).PSObject.Properties | Where-Object { $_.Name -match ''Nerd Font'' -and $_.Name -match ''' + $NfPattern + ''' }' + "`r`n" +
+        'foreach ($e in $entries) {' + "`r`n" +
+        '    $srcFile = $e.Value' + "`r`n" +
+        '    $destName = Split-Path $srcFile -Leaf' + "`r`n" +
+        '    Copy-Item $srcFile (Join-Path $env:SystemRoot ''Fonts'' $destName) -Force -ErrorAction SilentlyContinue' + "`r`n" +
+        '    Set-ItemProperty -Path $hklmReg -Name $e.Name -Value $destName -Force' + "`r`n" +
+        '}'
+    )
+    try {
+        Start-Process pwsh -ArgumentList '-NoProfile', '-File', "`"$tmpScript`"" -Verb RunAs -Wait -ErrorAction Stop
+        Write-Host '  Done: fonts promoted to system-wide.' -ForegroundColor Green
+    } catch {
+        Write-Warning '  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts.'
+        Write-Host '  Re-run this script as Administrator to fix this.' -ForegroundColor Yellow
+    } finally {
+        Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ── Custom PSModulePath Setup ───────────────────────────────────────────────
 # Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
 $psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
@@ -449,27 +485,7 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
     } elseif ($fontInstalledScope -eq 'User') {
         Write-Host "  $NerdFont Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
         # Promote per-user fonts to system scope via elevation
-        $tmpPromoteScript = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), '.ps1')
-        Set-Content -Path $tmpPromoteScript -Encoding UTF8 -Value (
-            '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-            '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-            '$entries = (Get-ItemProperty $hkcuReg).PSObject.Properties | Where-Object { $_.Name -match ''Nerd Font'' -and $_.Name -match ''' + $nfPatternEscaped + ''' }' + "`r`n" +
-            'foreach ($e in $entries) {' + "`r`n" +
-            '    $srcFile = $e.Value' + "`r`n" +
-            '    $destName = Split-Path $srcFile -Leaf' + "`r`n" +
-            '    Copy-Item $srcFile (Join-Path $env:SystemRoot ''Fonts'' $destName) -Force -ErrorAction SilentlyContinue' + "`r`n" +
-            '    Set-ItemProperty -Path $hklmReg -Name $e.Name -Value $destName -Force' + "`r`n" +
-            '}'
-        )
-        try {
-            Start-Process pwsh -ArgumentList '-NoProfile', '-File', "`"$tmpPromoteScript`"" -Verb RunAs -Wait -ErrorAction Stop
-            Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
-        } catch {
-            Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
-            Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
-        } finally {
-            Remove-Item $tmpPromoteScript -Force -ErrorAction SilentlyContinue
-        }
+        Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
     } else {
         # Not installed — install system-wide if admin, per-user + promote otherwise
         if ($isAdmin) {
@@ -483,27 +499,7 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
             if (-not $isAdmin) {
                 # Promote the per-user install to system scope
                 Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
-                $tmpPromoteScript = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), '.ps1')
-                Set-Content -Path $tmpPromoteScript -Encoding UTF8 -Value (
-                    '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-                    '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-                    '$entries = (Get-ItemProperty $hkcuReg).PSObject.Properties | Where-Object { $_.Name -match ''Nerd Font'' -and $_.Name -match ''' + $nfPatternEscaped + ''' }' + "`r`n" +
-                    'foreach ($e in $entries) {' + "`r`n" +
-                    '    $srcFile = $e.Value' + "`r`n" +
-                    '    $destName = Split-Path $srcFile -Leaf' + "`r`n" +
-                    '    Copy-Item $srcFile (Join-Path $env:SystemRoot ''Fonts'' $destName) -Force -ErrorAction SilentlyContinue' + "`r`n" +
-                    '    Set-ItemProperty -Path $hklmReg -Name $e.Name -Value $destName -Force' + "`r`n" +
-                    '}'
-                )
-                try {
-                    Start-Process pwsh -ArgumentList '-NoProfile', '-File', "`"$tmpPromoteScript`"" -Verb RunAs -Wait -ErrorAction Stop
-                    Write-Host "  Done: fonts promoted to system-wide." -ForegroundColor Green
-                } catch {
-                    Write-Warning "  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts."
-                    Write-Host "  Re-run this script as Administrator to fix this." -ForegroundColor Yellow
-                } finally {
-                    Remove-Item $tmpPromoteScript -Force -ErrorAction SilentlyContinue
-                }
+                Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
             }
         } else {
             Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $NerdFont"
