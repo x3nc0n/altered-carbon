@@ -102,7 +102,7 @@ function Invoke-ElevatedFontPromotion {
         [string] $NfPattern
     )
 
-    $tmpScript = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), '.ps1')
+    $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString('N') + '.ps1')
     Set-Content -Path $tmpScript -Encoding UTF8 -Value (
         '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
         '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
@@ -115,7 +115,7 @@ function Invoke-ElevatedFontPromotion {
         '}'
     )
     try {
-        Start-Process pwsh -ArgumentList '-NoProfile', '-File', "`"$tmpScript`"" -Verb RunAs -Wait -ErrorAction Stop
+        Start-Process pwsh -ArgumentList "-NoProfile -File `"$tmpScript`"" -Verb RunAs -Wait -ErrorAction Stop
         Write-Host '  Done: fonts promoted to system-wide.' -ForegroundColor Green
     } catch {
         Write-Warning '  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts.'
