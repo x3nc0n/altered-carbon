@@ -15,6 +15,11 @@ PowerShell that (re)installs and configures developer tools on a fresh Windows i
 
 > **Tip:** Run as Administrator for full functionality (Chocolatey installs, Hyper-V, WSL 2).
 
+## Release Notes
+
+- Current release notes draft: `releases/v1.0.0.md`
+- Changelog: `CHANGELOG.md`
+
 ## Examples
 
 ```powershell
