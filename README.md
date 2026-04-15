@@ -57,9 +57,11 @@ PowerShell that (re)installs and configures developer tools on a fresh Windows i
 1. PowerShell (7)
 1. PowerShell Preview (7)
 1. git *(via Chocolatey when admin, winget fallback)*
-1. Node.js (LTS) *(via Chocolatey when admin)*
+1. Node.js (LTS) *(via Chocolatey when admin, winget fallback)*
 1. GitHub Desktop
 1. GitHub CLI
+1. GitHub Copilot CLI *(via GitHub CLI extension `github/gh-copilot`)*
+1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`)*
 1. oh-my-posh
 1. PowerToys
 1. NerdFont (installed via oh-my-posh CLI, configurable with `-NerdFont` parameter)
@@ -92,6 +94,9 @@ PowerShell that (re)installs and configures developer tools on a fresh Windows i
     1. Azure Resources (ID: `ms-azuretools.vscode-azureresourcegroups`)
     1. Bicep (ID: `ms-azuretools.vscode-bicep`)
     1. GitHub Copilot (ID: `github.copilot`)
+    1. GitHub Copilot Chat (ID: `github.copilot-chat`)
+    1. GitHub Copilot for Azure (ID: `ms-azuretools.vscode-azure-github-copilot`)
+    1. AI Toolkit for Visual Studio Code (ID: `ms-windows-ai-studio.windows-ai-studio`)
     1. Microsoft Sentinel (ID: `ms-security.ms-sentinel`)
 
 ### Personal Mode Only (`-Personal`)
@@ -154,7 +159,7 @@ The script uses **two** package managers, each for what it does best:
 | **Chocolatey** | `git`, `Node.js` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` and `node.exe` immediately without a session restart |
 | **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
 
-Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git.
+Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git and Node.js.
 
 The script installs tools from the following sources, in order of priority:
 1. Chocolatey (for git and developer tools that need reliable PATH handling)

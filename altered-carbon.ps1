@@ -194,8 +194,8 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 }
 
 # ── Chocolatey Packages ──────────────────────────────────────────────────────
-# Git benefits most from Chocolatey: it's immediately on PATH with Git
-# Credential Manager and no session restart is needed.
+# Git and Node.js benefit most from Chocolatey: they're immediately on PATH
+# and available to downstream tools without a session restart.
 
 
 # Command is the expected binary name — used to verify the install is healthy.
@@ -252,19 +252,22 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
-    # Skip git in winget — Chocolatey already handled it
+    # Skip packages already handled by Chocolatey.
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $SkipPackages += 'Git.Git'
     }
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        $SkipPackages += 'OpenJS.NodeJS.LTS'
+    }
 } else {
-    Write-Host 'Chocolatey not available — git will be installed via winget as fallback.' -ForegroundColor Yellow
+    Write-Host 'Chocolatey not available — git and Node.js will be installed via winget as fallback.' -ForegroundColor Yellow
 }
 
 # ── Installations ─────────────────────────────────────────────────────────────
 
 # Core packages — installed in both Work and Personal modes.
-# git is installed via Chocolatey above when available; it remains here as a
-# winget fallback and is auto-skipped when choco handled it.
+# git and Node.js are installed via Chocolatey above when available; they
+# remain here as winget fallbacks and are auto-skipped when choco handled them.
 $corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
@@ -272,6 +275,7 @@ $corePackages = @(
     @{ Id = 'Microsoft.PowerShell';                Name = 'PowerShell 7';            Source = 'winget' }
     @{ Id = 'Microsoft.PowerShell.Preview';        Name = 'PowerShell Preview';      Source = 'winget' }
     @{ Id = 'Git.Git';                             Name = 'git';                     Source = 'winget' }
+    @{ Id = 'OpenJS.NodeJS.LTS';                   Name = 'Node.js (LTS)';           Source = 'winget' }
     @{ Id = 'GitHub.GitHubDesktop';                Name = 'GitHub Desktop';          Source = 'winget' }
     @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI';              Source = 'winget' }
     @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh';              Source = 'winget' }
@@ -456,6 +460,65 @@ if ($nvidiaGpu) {
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
             [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
+# ── GitHub Copilot CLI ───────────────────────────────────────────────────────
+# Copilot CLI is distributed as a GitHub CLI extension.
+Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
+if (Get-Command gh -ErrorAction SilentlyContinue) {
+    $ghExtensions = & gh extension list 2>$null
+    $hasCopilotCli = $false
+    if ($ghExtensions) {
+        $hasCopilotCli = ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet)
+    }
+
+    if ($hasCopilotCli) {
+        Write-Host '  Updating GitHub Copilot CLI extension...' -ForegroundColor Cyan
+        & gh extension upgrade github/gh-copilot 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Done: GitHub Copilot CLI extension is up to date.' -ForegroundColor Green
+        } else {
+            Write-Warning "  gh exited with code $LASTEXITCODE while upgrading GitHub Copilot CLI extension"
+        }
+    } else {
+        Write-Host '  Installing GitHub Copilot CLI extension...' -ForegroundColor Cyan
+        & gh extension install github/gh-copilot 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Done: GitHub Copilot CLI extension installed.' -ForegroundColor Green
+        } else {
+            Write-Warning "  gh exited with code $LASTEXITCODE while installing GitHub Copilot CLI extension"
+            Write-Host '  Tip: Run "gh auth login" if GitHub CLI is not authenticated yet.' -ForegroundColor Yellow
+        }
+    }
+} else {
+    Write-Warning '  GitHub CLI (gh) not found on PATH. Copilot CLI extension setup skipped.'
+}
+
+# ── Microsoft Work IQ CLI ────────────────────────────────────────────────────
+# Work IQ is distributed as a global npm package and requires Node.js.
+Write-Host 'Ensuring Microsoft Work IQ CLI is installed...' -ForegroundColor Cyan
+if (Get-Command npm -ErrorAction SilentlyContinue) {
+    $workIqInstalled = & npm list --global @microsoft/workiq --depth=0 2>$null | Select-String '@microsoft/workiq@'
+
+    if ($workIqInstalled) {
+        Write-Host '  Updating Microsoft Work IQ CLI...' -ForegroundColor Cyan
+        & npm update --global @microsoft/workiq 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Done: Microsoft Work IQ CLI is up to date.' -ForegroundColor Green
+        } else {
+            Write-Warning "  npm exited with code $LASTEXITCODE while updating Microsoft Work IQ CLI"
+        }
+    } else {
+        Write-Host '  Installing Microsoft Work IQ CLI...' -ForegroundColor Cyan
+        & npm install --global @microsoft/workiq 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Done: Microsoft Work IQ CLI installed.' -ForegroundColor Green
+        } else {
+            Write-Warning "  npm exited with code $LASTEXITCODE while installing Microsoft Work IQ CLI"
+        }
+    }
+} else {
+    Write-Warning '  npm not found on PATH. Microsoft Work IQ CLI setup skipped.'
+}
+
 # ── Nerd Font ────────────────────────────────────────────────────────────────
 # oh-my-posh ships a CLI to install Nerd Fonts from the official nerd-fonts releases.
 # NOTE: Per-user font installs (--user) are NOT visible to Windows Terminal
@@ -605,6 +668,9 @@ $vsCodeExtensions = @(
     @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
     @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
     @{ Id = 'github.copilot';                           Name = 'GitHub Copilot' }
+    @{ Id = 'github.copilot-chat';                      Name = 'GitHub Copilot Chat' }
+    @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+    @{ Id = 'ms-windows-ai-studio.windows-ai-studio';   Name = 'AI Toolkit for Visual Studio Code' }
     @{ Id = 'ms-security.ms-sentinel';                  Name = 'Microsoft Sentinel' }
 )
 
@@ -969,8 +1035,6 @@ foreach ($settingsPath in $vsCodeSettingsPaths) {
     Write-Host "  Done: $label font configured." -ForegroundColor Green
 }
 
-Write-Host "`nSetup complete." -ForegroundColor Green
-
 # 5. Configure File Explorer options
 Write-Host 'Configuring File Explorer options...' -ForegroundColor Cyan
 try {
@@ -997,3 +1061,117 @@ try {
 } catch {
     Write-Warning "  Failed to configure File Explorer options: $_"
 }
+
+# 6. Post-install verification summary
+Write-Host "`nPost-install verification summary..." -ForegroundColor Cyan
+
+function Get-CommandVersion {
+    param(
+        [string] $Command,
+        [string[]] $VersionArgs = @('--version')
+    )
+
+    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+
+    try {
+        $output = & $Command @VersionArgs 2>$null
+        if ($output) {
+            return (($output | Select-Object -First 1).ToString().Trim())
+        }
+    } catch {
+        return $null
+    }
+
+    return 'installed'
+}
+
+function Write-VerificationLine {
+    param(
+        [string] $Label,
+        [bool] $Installed,
+        [string] $Details
+    )
+
+    if ($Installed) {
+        $suffix = if ($Details) { " - $Details" } else { '' }
+        Write-Host "  [OK] $Label$suffix" -ForegroundColor Green
+    } else {
+        $suffix = if ($Details) { " - $Details" } else { '' }
+        Write-Host "  [MISSING] $Label$suffix" -ForegroundColor Yellow
+    }
+}
+
+$gitVersion = Get-CommandVersion -Command 'git'
+Write-VerificationLine -Label 'git' -Installed ([bool]$gitVersion) -Details $gitVersion
+
+$nodeVersion = Get-CommandVersion -Command 'node'
+Write-VerificationLine -Label 'Node.js' -Installed ([bool]$nodeVersion) -Details $nodeVersion
+
+$npmVersion = Get-CommandVersion -Command 'npm'
+Write-VerificationLine -Label 'npm' -Installed ([bool]$npmVersion) -Details $npmVersion
+
+$ghVersion = Get-CommandVersion -Command 'gh'
+Write-VerificationLine -Label 'GitHub CLI' -Installed ([bool]$ghVersion) -Details $ghVersion
+
+$ghCopilotInstalled = $false
+$ghCopilotDetails = $null
+if (Get-Command gh -ErrorAction SilentlyContinue) {
+    try {
+        $ghExtensions = & gh extension list 2>$null
+        if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
+            $ghCopilotInstalled = $true
+            try {
+                $ghCopilotHelp = & gh copilot --help 2>$null
+                if ($ghCopilotHelp) {
+                    $ghCopilotDetails = 'gh extension installed'
+                }
+            } catch {
+                $ghCopilotDetails = 'gh extension installed'
+            }
+        }
+    } catch {
+        $ghCopilotDetails = 'unable to query gh extensions'
+    }
+}
+Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed $ghCopilotInstalled -Details $ghCopilotDetails
+
+$workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
+Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion
+
+$ompVersion = Get-CommandVersion -Command 'oh-my-posh'
+Write-VerificationLine -Label 'oh-my-posh' -Installed ([bool]$ompVersion) -Details $ompVersion
+
+$vsCodeVerification = @(
+    @{ Editor = 'code'; Label = 'VS Code'; Extensions = @(
+        @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
+        @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
+        @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+        @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
+        @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
+    ) }
+    @{ Editor = 'code-insiders'; Label = 'VS Code Insiders'; Extensions = @(
+        @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
+        @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
+        @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+        @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
+        @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
+    ) }
+)
+
+foreach ($editorInfo in $vsCodeVerification) {
+    if (-not (Get-Command $editorInfo.Editor -ErrorAction SilentlyContinue)) {
+        Write-VerificationLine -Label $editorInfo.Label -Installed $false -Details 'CLI not found on PATH'
+        continue
+    }
+
+    $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
+    Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
+    foreach ($extension in $editorInfo.Extensions) {
+        $isInstalled = $installedExtensions -contains $extension.Id
+        Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $extension.Id
+    }
+}
+
+Write-Host "`nSetup complete." -ForegroundColor Green
