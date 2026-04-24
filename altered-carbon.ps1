@@ -464,28 +464,39 @@ $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';
 # Copilot CLI is distributed as a GitHub CLI extension.
 Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
 if (Get-Command gh -ErrorAction SilentlyContinue) {
-    $ghExtensions = & gh extension list 2>$null
-    $hasCopilotCli = $false
-    if ($ghExtensions) {
-        $hasCopilotCli = ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet)
-    }
-
-    if ($hasCopilotCli) {
-        Write-Host '  Updating GitHub Copilot CLI extension...' -ForegroundColor Cyan
-        & gh extension upgrade github/gh-copilot 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: GitHub Copilot CLI extension is up to date.' -ForegroundColor Green
-        } else {
-            Write-Warning "  gh exited with code $LASTEXITCODE while upgrading GitHub Copilot CLI extension"
-        }
+    # Verify gh is authenticated before attempting extension operations.
+    # gh extension install/upgrade call the GitHub API; unauthenticated requests
+    # are rate-limited and some corporate networks block them entirely.
+    & gh auth status 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning '  GitHub CLI is not authenticated. Run "gh auth login" first, then re-run this script to install the Copilot CLI extension.'
     } else {
-        Write-Host '  Installing GitHub Copilot CLI extension...' -ForegroundColor Cyan
-        & gh extension install github/gh-copilot 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: GitHub Copilot CLI extension installed.' -ForegroundColor Green
+        $ghExtensions = & gh extension list 2>$null
+        $hasCopilotCli = $false
+        if ($ghExtensions) {
+            $hasCopilotCli = ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet)
+        }
+
+        if ($hasCopilotCli) {
+            Write-Host '  Updating GitHub Copilot CLI extension...' -ForegroundColor Cyan
+            $ghOutput = & gh extension upgrade github/gh-copilot 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Done: GitHub Copilot CLI extension is up to date.' -ForegroundColor Green
+            } else {
+                Write-Warning "  gh exited with code $LASTEXITCODE while upgrading GitHub Copilot CLI extension"
+                if ($ghOutput) { $ghOutput | ForEach-Object { Write-Warning "    $_" } }
+                Write-Host '  Tip: Run "gh auth login" if your GitHub CLI session has expired.' -ForegroundColor Yellow
+            }
         } else {
-            Write-Warning "  gh exited with code $LASTEXITCODE while installing GitHub Copilot CLI extension"
-            Write-Host '  Tip: Run "gh auth login" if GitHub CLI is not authenticated yet.' -ForegroundColor Yellow
+            Write-Host '  Installing GitHub Copilot CLI extension...' -ForegroundColor Cyan
+            $ghOutput = & gh extension install github/gh-copilot 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Done: GitHub Copilot CLI extension installed.' -ForegroundColor Green
+            } else {
+                Write-Warning "  gh exited with code $LASTEXITCODE while installing GitHub Copilot CLI extension"
+                if ($ghOutput) { $ghOutput | ForEach-Object { Write-Warning "    $_" } }
+                Write-Host '  Tip: Run "gh auth login" if GitHub CLI is not authenticated yet.' -ForegroundColor Yellow
+            }
         }
     }
 } else {
