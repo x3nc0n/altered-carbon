@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- GitHub Copilot CLI extension install/upgrade now checks `gh auth status` before attempting the operation and emits a clear warning when `gh` is not authenticated, instead of silently failing with a bare exit-code warning.
+- `gh extension install` and `gh extension upgrade` output is no longer fully suppressed; if either command fails, `gh`'s own error text is surfaced so the cause is visible.
+- Added the `gh auth login` tip to the `gh extension upgrade` failure path (it was previously only shown for `gh extension install` failures).
+
 ## [1.0.0] - 2026-04-15
 
 ### Added
