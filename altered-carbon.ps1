@@ -34,6 +34,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# winget exit code when the target app is currently running.
+$WINGET_APP_IN_USE = -1978335189  # 0x8A150077
+
+# ── Transcript Logging ────────────────────────────────────────────────────────
+$logFile = Join-Path $env:USERPROFILE ".altered-carbon-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+try { Start-Transcript -Path $logFile -Append } catch { Write-Warning "Could not start transcript: $_" }
+
 # ── Admin Check ────────────────────────────────────────────────────────────────
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -411,7 +418,7 @@ if ($isAdmin) {
     # Enable WSL 2
     $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
     $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
-    
+
     if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
         Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
     } else {
@@ -437,7 +444,7 @@ $nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Silen
 if ($nvidiaGpu) {
     Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
     Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
-    
+
     $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
     if ($nvidiaInstalled) {
         Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
@@ -820,7 +827,6 @@ $_realProfile = Join-Path $env:USERPROFILE ''.psprofile\profile.ps1''
 if (Test-Path $_realProfile) { . $_realProfile }'
 
 # Only overwrite the stub if it is missing or already a stub we manage.
-$writeStub = $true
 if (Test-Path $ps7ProfilePath) {
     $existing = Get-Content $ps7ProfilePath -Raw
     if ($existing -notmatch 'managed by altered-carbon') {
@@ -835,12 +841,15 @@ if (Test-Path $ps7ProfilePath) {
 
         if ($migrated) {
             $current = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
-            Set-Content -Path $psProfileFile -Value ($migrated + "`n" + $current) -Encoding UTF8
+            if ($current -notmatch [regex]::Escape($migrated)) {
+                Set-Content -Path $psProfileFile -Value ($migrated + "`n" + $current) -Encoding UTF8
+            }
         }
     }
 }
 
-if ($writeStub) {
+# Write stub if missing or already our managed stub
+if (-not (Test-Path $ps7ProfilePath) -or (Get-Content $ps7ProfilePath -Raw) -match 'managed by altered-carbon') {
     Set-Content -Path $ps7ProfilePath -Value $stubContent -Encoding UTF8
     Write-Host "  Done: stub profile written to $ps7ProfilePath" -ForegroundColor Green
 }
@@ -853,7 +862,6 @@ $ps51ProfileDir  = Split-Path $ps51ProfilePath -Parent
 if (-not (Test-Path $ps51ProfileDir)) {
     New-Item -ItemType Directory -Path $ps51ProfileDir -Force | Out-Null
 }
-$writePs51Stub = $true
 if (Test-Path $ps51ProfilePath) {
     $existingPs51 = Get-Content $ps51ProfilePath -Raw
     if ($existingPs51 -notmatch 'managed by altered-carbon') {
@@ -871,7 +879,8 @@ if (Test-Path $ps51ProfilePath) {
         }
     }
 }
-if ($writePs51Stub) {
+# Write stub if missing or already our managed stub
+if (-not (Test-Path $ps51ProfilePath) -or (Get-Content $ps51ProfilePath -Raw) -match 'managed by altered-carbon') {
     Set-Content -Path $ps51ProfilePath -Value $stubContent -Encoding UTF8
     Write-Host "  Done: stub profile written to $ps51ProfilePath" -ForegroundColor Green
 }
@@ -1175,3 +1184,5 @@ foreach ($editorInfo in $vsCodeVerification) {
 }
 
 Write-Host "`nSetup complete." -ForegroundColor Green
+
+try { Stop-Transcript } catch { }
