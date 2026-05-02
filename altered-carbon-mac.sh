@@ -144,6 +144,19 @@ ensure_vscode_ext() {
 info "altered-carbon-mac: bootstrapping macOS environment (mode: $MODE)"
 echo ""
 
+# Prompt for admin password once and keep sudo credentials cached for the
+# duration of the script.  Homebrew cask installs call sudo internally, so
+# this prevents repeated password prompts.
+info "Requesting administrator privileges (you will only be prompted once)..."
+sudo -v
+# Keep-alive: refresh sudo timestamp every 60 s until this script exits.
+while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+SUDO_KEEPALIVE_PID=$!
+# Ensure the keepalive loop is cleaned up on exit.
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
+ok "Administrator privileges cached."
+echo ""
+
 # Ensure Homebrew is installed
 if ! command -v brew &>/dev/null; then
     info "Installing Homebrew..."
