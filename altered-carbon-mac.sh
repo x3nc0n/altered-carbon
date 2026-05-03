@@ -182,6 +182,18 @@ trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
 ok "Administrator privileges cached."
 echo ""
 
+# ── Xcode Command Line Tools ────────────────────────────────────────────────
+
+info "Checking Xcode Command Line Tools..."
+if xcode-select -p &>/dev/null; then
+    skip "Xcode Command Line Tools already installed."
+else
+    info "  Installing Xcode Command Line Tools..."
+    xcode-select --install 2>/dev/null || true
+    warn "Xcode CLT install triggered. Complete the dialog, then re-run this script."
+fi
+echo ""
+
 # Ensure Homebrew is installed
 if ! command -v brew &>/dev/null; then
     info "Installing Homebrew..."
@@ -197,6 +209,9 @@ if ! command -v brew &>/dev/null; then
 else
     skip "Homebrew already installed."
 fi
+
+export HOMEBREW_CASK_OPTS="--no-quarantine"
+export HOMEBREW_NO_AUTO_UPDATE=1
 
 info "Updating Homebrew..."
 brew update --quiet
@@ -294,18 +309,6 @@ if [[ ${#EXTRA_PACKAGES[@]} -gt 0 ]]; then
     echo ""
 fi
 
-# ── Xcode Command Line Tools ────────────────────────────────────────────────
-
-info "Checking Xcode Command Line Tools..."
-if xcode-select -p &>/dev/null; then
-    skip "Xcode Command Line Tools already installed."
-else
-    info "  Installing Xcode Command Line Tools..."
-    xcode-select --install 2>/dev/null || true
-    warn "Xcode CLT install triggered. Complete the dialog, then re-run this script."
-fi
-echo ""
-
 # ── GitHub Copilot CLI ───────────────────────────────────────────────────────
 
 info "Ensuring GitHub Copilot CLI extension is installed..."
@@ -330,12 +333,13 @@ echo ""
 
 info "Installing Nerd Font '$NERD_FONT'..."
 if command -v oh-my-posh &>/dev/null; then
-    # Check if font is already installed by looking in the system and user font dirs
-    font_pattern=$(echo "$NERD_FONT" | sed 's/\([a-z]\)\([A-Z]\)/\1.*\2/g')
-    if find ~/Library/Fonts /Library/Fonts -iname "*${NERD_FONT}*NerdFont*" -print -quit 2>/dev/null | grep -q .; then
+    local_font_dir="$HOME/Library/Fonts"
+    system_font_dir="/Library/Fonts"
+
+    if find "$local_font_dir" "$system_font_dir" -iname "*${NERD_FONT}*NerdFont*" -print -quit 2>/dev/null | grep -q .; then
         skip "$NERD_FONT Nerd Font already installed."
     else
-        oh-my-posh font install "$NERD_FONT" && ok "$NERD_FONT Nerd Font installed." || warn "Failed to install $NERD_FONT Nerd Font."
+        oh-my-posh font install --user "$NERD_FONT" && ok "$NERD_FONT Nerd Font installed." || warn "Failed to install $NERD_FONT Nerd Font."
     fi
 else
     warn "oh-my-posh not found. Nerd Font installation skipped."
@@ -525,6 +529,123 @@ defaults write com.apple.finder _FXSortFoldersFirst -bool true
 # Restart Finder to apply
 killall Finder 2>/dev/null || true
 ok "Finder configured (extensions, hidden files, path bar, status bar)."
+echo ""
+
+# ── Terminal.app Font Configuration ─────────────────────────────────────────
+
+info "Configuring Terminal.app font..."
+
+TERMINAL_FONT_PS_NAME="${NERD_FONT}NerdFontMono-Regular"
+TERMINAL_FONT_SIZE=14
+
+if ! command -v python3 &>/dev/null; then
+    warn "python3 not found. Terminal.app font configuration skipped."
+elif terminal_font_result=$(python3 - "$TERMINAL_FONT_PS_NAME" "$TERMINAL_FONT_SIZE" <<'PY'
+import plistlib
+import subprocess
+import sys
+from plistlib import UID
+
+font_name = sys.argv[1]
+font_size = int(sys.argv[2])
+
+try:
+    raw = subprocess.check_output(
+        ["defaults", "export", "com.apple.Terminal", "-"],
+        stderr=subprocess.DEVNULL,
+    )
+except subprocess.CalledProcessError:
+    print("missing-domain")
+    sys.exit(0)
+
+data = plistlib.loads(raw)
+default_name = data.get("Default Window Settings")
+window_settings = data.get("Window Settings", {})
+
+if not default_name:
+    print("missing-default")
+    sys.exit(0)
+
+profile = window_settings.get(default_name)
+if not isinstance(profile, dict):
+    print(f"missing-profile|{default_name}")
+    sys.exit(0)
+
+current_name = ""
+current_size = None
+font_blob = profile.get("Font")
+
+if isinstance(font_blob, (bytes, bytearray)):
+    try:
+        font_archive = plistlib.loads(font_blob)
+        objects = font_archive.get("$objects", [])
+        root_uid = font_archive.get("$top", {}).get("root")
+        if isinstance(root_uid, UID):
+            font_object = objects[root_uid.data]
+            name_uid = font_object.get("NSName")
+            if isinstance(name_uid, UID):
+                current_name = objects[name_uid.data]
+            current_size = int(round(float(font_object.get("NSSize", 0))))
+    except Exception:
+        pass
+
+if current_name == font_name and current_size == font_size:
+    print(f"unchanged|{default_name}")
+    sys.exit(0)
+
+font_archive = {
+    "$version": 100000,
+    "$archiver": "NSKeyedArchiver",
+    "$top": {"root": UID(1)},
+    "$objects": [
+        "$null",
+        {
+            "NSSize": float(font_size),
+            "NSfFlags": 16,
+            "NSName": UID(2),
+            "$class": UID(3),
+        },
+        font_name,
+        {"$classname": "NSFont", "$classes": ["NSFont", "NSObject"]},
+    ],
+}
+profile["Font"] = plistlib.dumps(font_archive, fmt=plistlib.FMT_BINARY)
+updated = plistlib.dumps(data, fmt=plistlib.FMT_XML, sort_keys=False)
+subprocess.run(
+    ["defaults", "import", "com.apple.Terminal", "-"],
+    input=updated,
+    check=True,
+)
+print(f"updated|{default_name}")
+PY
+); then
+    terminal_font_status="${terminal_font_result%%|*}"
+    terminal_font_profile="${terminal_font_result#*|}"
+
+    case "$terminal_font_status" in
+        unchanged)
+            skip "Terminal.app profile '$terminal_font_profile' already uses $TERMINAL_FONT_PS_NAME at ${TERMINAL_FONT_SIZE}pt."
+            ;;
+        updated)
+            ok "Terminal.app profile '$terminal_font_profile' set to $TERMINAL_FONT_PS_NAME at ${TERMINAL_FONT_SIZE}pt."
+            ;;
+        missing-domain)
+            warn "Terminal.app preferences not found. Launch Terminal.app once, then re-run to set the Nerd Font."
+            ;;
+        missing-default)
+            warn "Terminal.app default profile could not be determined."
+            ;;
+        missing-profile)
+            warn "Terminal.app profile '$terminal_font_profile' was not found."
+            ;;
+        *)
+            warn "Failed to configure Terminal.app font."
+            ;;
+    esac
+else
+    warn "Failed to configure Terminal.app font."
+fi
+
 echo ""
 
 # ── VS Code Font Configuration ──────────────────────────────────────────────
