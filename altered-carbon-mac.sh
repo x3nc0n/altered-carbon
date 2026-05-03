@@ -83,6 +83,28 @@ is_skipped() {
     return 1
 }
 
+APP_EXISTS_LOCATION=""
+
+app_exists() {
+    local app_name="$1"
+    local system_app="/Applications/${app_name}.app"
+    local user_app="$HOME/Applications/${app_name}.app"
+
+    APP_EXISTS_LOCATION=""
+
+    if [[ -d "$system_app" ]]; then
+        APP_EXISTS_LOCATION="/Applications"
+        return 0
+    fi
+
+    if [[ -d "$user_app" ]]; then
+        APP_EXISTS_LOCATION="~/Applications"
+        return 0
+    fi
+
+    return 1
+}
+
 ensure_formula() {
     local formula="$1"
     local name="${2:-$formula}"
@@ -104,6 +126,7 @@ ensure_formula() {
 ensure_cask() {
     local cask="$1"
     local name="${2:-$cask}"
+    local app_name="${3:-}"
 
     if is_skipped "$cask"; then
         skip "$name (skipped by --skip)"
@@ -111,7 +134,9 @@ ensure_cask() {
     fi
 
     info "Checking $name ($cask)..."
-    if brew list --cask "$cask" &>/dev/null; then
+    if [[ -n "$app_name" ]] && app_exists "$app_name"; then
+        skip "$name already installed (found in ${APP_EXISTS_LOCATION})."
+    elif brew list --cask "$cask" &>/dev/null; then
         skip "$name already installed."
     else
         brew install --cask "$cask" || { warn "Failed to install $name"; return 1; }
@@ -205,21 +230,21 @@ echo ""
 info "Installing core casks..."
 echo ""
 
-ensure_cask visual-studio-code "Visual Studio Code"
-ensure_cask visual-studio-code@insiders "Visual Studio Code Insiders"
-ensure_cask github "GitHub Desktop"
-ensure_cask docker "Docker Desktop"
-ensure_cask microsoft-edge "Microsoft Edge"
-ensure_cask microsoft-teams "Microsoft Teams"
-ensure_cask microsoft-outlook "Microsoft Outlook"
-ensure_cask microsoft-excel "Microsoft Excel"
-ensure_cask microsoft-word "Microsoft Word"
-ensure_cask microsoft-powerpoint "Microsoft PowerPoint"
-ensure_cask microsoft-onenote "Microsoft OneNote"
-ensure_cask windows-app "Windows App"
-ensure_cask logitune "Logi Tune"
-ensure_cask github-copilot-for-xcode "GitHub Copilot for Xcode"
-ensure_cask spotify "Spotify"
+ensure_cask visual-studio-code "Visual Studio Code" "Visual Studio Code"
+ensure_cask visual-studio-code@insiders "Visual Studio Code Insiders" "Visual Studio Code - Insiders"
+ensure_cask github "GitHub Desktop" "GitHub Desktop"
+ensure_cask docker "Docker Desktop" "Docker"
+ensure_cask microsoft-edge "Microsoft Edge" "Microsoft Edge"
+ensure_cask microsoft-teams "Microsoft Teams" "Microsoft Teams"
+ensure_cask microsoft-outlook "Microsoft Outlook" "Microsoft Outlook"
+ensure_cask microsoft-excel "Microsoft Excel" "Microsoft Excel"
+ensure_cask microsoft-word "Microsoft Word" "Microsoft Word"
+ensure_cask microsoft-powerpoint "Microsoft PowerPoint" "Microsoft PowerPoint"
+ensure_cask microsoft-onenote "Microsoft OneNote" "Microsoft OneNote"
+ensure_cask windows-app "Windows App" "Windows App"
+ensure_cask logitune "Logi Tune" "Logi Tune"
+ensure_cask github-copilot-for-xcode "GitHub Copilot for Xcode" "GitHub Copilot for Xcode"
+ensure_cask spotify "Spotify" "Spotify"
 
 echo ""
 
@@ -229,18 +254,18 @@ echo ""
 info "Installing personal casks..."
 echo ""
 
-ensure_cask steam "Steam"
-ensure_cask discord "Discord"
-ensure_cask signal "Signal"
-ensure_cask brave-browser "Brave Browser"
-ensure_cask lm-studio "LM Studio"
-ensure_cask moonlight "Moonlight"
-ensure_cask comfyui "ComfyUI"
-ensure_cask bitwarden "Bitwarden"
-ensure_cask canva "Canva"
-ensure_cask parallels "Parallels Desktop"
-ensure_cask android-studio "Android Studio"
-ensure_cask wifiman "WiFiman Desktop"
+ensure_cask steam "Steam" "Steam"
+ensure_cask discord "Discord" "Discord"
+ensure_cask signal "Signal" "Signal"
+ensure_cask brave-browser "Brave Browser" "Brave Browser"
+ensure_cask lm-studio "LM Studio" "LM Studio"
+ensure_cask moonlight "Moonlight" "Moonlight"
+ensure_cask comfyui "ComfyUI" "ComfyUI"
+ensure_cask bitwarden "Bitwarden" "Bitwarden"
+ensure_cask canva "Canva" "Canva"
+ensure_cask parallels "Parallels Desktop" "Parallels Desktop"
+ensure_cask android-studio "Android Studio" "Android Studio"
+ensure_cask wifiman "WiFiman Desktop" "WiFiman Desktop"
 
 # Ruby toolchain
 ensure_formula chruby "chruby"
