@@ -105,6 +105,38 @@ app_exists() {
     return 1
 }
 
+resolve_terminal_font_ps_name() {
+    local font_name="$1"
+    local family="${font_name} Nerd Font Mono"
+    local ps_name=""
+
+    if ! command -v fc-list &>/dev/null; then
+        warn "fontconfig (fc-list) not found. Terminal.app font configuration skipped."
+        return 1
+    fi
+
+    ps_name="$(fc-list ":family=${family}:style=Regular" -f '%{postscriptname}\n' 2>/dev/null | awk 'NF { print; exit }')"
+
+    if [[ -z "$ps_name" ]]; then
+        ps_name="$(fc-list ":family=${family}" -f '%{style}|%{postscriptname}\n' 2>/dev/null | awk -F'|' '
+            $2 != "" && ($1 == "Regular" || $1 == "Book" || $1 == "Roman") { print $2; exit }
+        ')"
+    fi
+
+    if [[ -z "$ps_name" ]]; then
+        ps_name="$(fc-list ":family=${family}" -f '%{style}|%{postscriptname}\n' 2>/dev/null | awk -F'|' '
+            $2 != "" && $1 !~ /(Bold|Italic|Oblique)/ { print $2; exit }
+        ')"
+    fi
+
+    if [[ -z "$ps_name" ]]; then
+        warn "Could not determine the PostScript name for ${family}. Terminal.app font configuration skipped."
+        return 1
+    fi
+
+    printf '%s\n' "$ps_name"
+}
+
 ensure_formula() {
     local formula="$1"
     local name="${2:-$formula}"
@@ -535,10 +567,18 @@ echo ""
 
 info "Configuring Terminal.app font..."
 
-TERMINAL_FONT_PS_NAME="${NERD_FONT}NerdFontMono-Regular"
+TERMINAL_FONT_PS_NAME=""
 TERMINAL_FONT_SIZE=14
 
-if ! command -v python3 &>/dev/null; then
+if TERMINAL_FONT_PS_NAME="$(resolve_terminal_font_ps_name "$NERD_FONT")"; then
+    ok "Resolved Terminal.app font PostScript name: $TERMINAL_FONT_PS_NAME"
+else
+    TERMINAL_FONT_PS_NAME=""
+fi
+
+if [[ -z "$TERMINAL_FONT_PS_NAME" ]]; then
+    skip "Terminal.app font configuration skipped."
+elif ! command -v python3 &>/dev/null; then
     warn "python3 not found. Terminal.app font configuration skipped."
 elif terminal_font_result=$(python3 - "$TERMINAL_FONT_PS_NAME" "$TERMINAL_FONT_SIZE" <<'PY'
 import plistlib
@@ -653,6 +693,7 @@ echo ""
 info "Configuring VS Code editor font..."
 
 FONT_FACE_MONO="${NERD_FONT} Nerd Font Mono"
+# VS Code uses the family name, not the PostScript name used by Terminal.app.
 
 for settings_dir in \
     "$HOME/Library/Application Support/Code/User" \
