@@ -12,16 +12,17 @@
 
 | Name | Role | Charter | Status |
 |------|------|---------|--------|
-| Kovacs | Lead | .squad/agents/kovacs/charter.md | 🏗️ Lead |
-| Poe | Infra Dev | .squad/agents/poe/charter.md | ⚙️ Infra Dev |
-| Ortega | DevOps | .squad/agents/ortega/charter.md | 🔧 DevOps |
-| Falconer | Tester | .squad/agents/falconer/charter.md | 🧪 Tester |
-| Scribe | Scribe | .squad/agents/scribe/charter.md | 📋 Scribe |
-| Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Monitor |
+| Morpheus | Lead | .squad/agents/morpheus/charter.md | 🏗️ Active |
+| Tank | Shell Dev | .squad/agents/tank/charter.md | 🔧 Active |
+| Mouse | Tester | .squad/agents/mouse/charter.md | 🧪 Active |
+| Niobe | DevOps/Config | .squad/agents/niobe/charter.md | ⚙️ Active |
+| Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Active |
+| Ralph | Work Monitor | — | 🔄 Monitor |
 
 ## Project Context
 
-- **Owner:** John Spaid
-- **Project:** PowerShell automation that reinstalls and configures a Windows developer environment from scratch. Target apps include VS Code, Windows Terminal, PowerShell 7, git, GitHub Desktop/CLI, oh-my-posh, PowerToys, and more. Goal is a seamless "run once" setup experience, with GitHub Actions for testing and validation.
-- **Stack:** PowerShell 7+, winget, GitHub Actions, Windows features (Hyper-V, WSL)
-- **Created:** 2026-04-28
+- **Project:** altered-carbon
+- **User:** John Spaid
+- **Created:** 2026-05-02
+- **Stack:** PowerShell 7+ (Windows), bash (macOS), Homebrew, winget, Chocolatey
+- **Description:** Bootstrap automation that reinstalls and configures developer environments from scratch on Windows and macOS. Scripts must be idempotent, one-shot (minimal user interaction), and able to resume after reboot. Elevation/sudo should prompt at most once per session.

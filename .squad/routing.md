@@ -6,12 +6,12 @@ How to decide who handles what.
 
 | Work Type | Route To | Examples |
 |-----------|----------|----------|
-| PowerShell scripts | Poe | Install scripts, config scripts, winget logic, idempotency |
-| Architecture & review | Kovacs | Script structure, run-once design, code review, decisions |
-| GitHub Actions / CI | Ortega | Workflow files, validation pipelines, linting, testing infra |
-| Testing & QA | Falconer | Edge cases, reboot scenarios, admin/non-admin, idempotency checks |
-| Code review | Kovacs | Review PRs, check quality, suggest improvements |
-| Scope & priorities | Kovacs | What to build next, trade-offs, decisions |
+| Script implementation (bash/PS1) | Tank | Write install functions, fix brew/winget/choco logic, add packages |
+| Configuration & profiles | Niobe | oh-my-posh setup, shell profiles, VS Code settings, elevation/sudo |
+| Testing & idempotency | Mouse | Pester tests, test re-run safety, edge cases, CI workflows |
+| Architecture & cross-platform | Morpheus | Design decisions, Windows/macOS parity, script structure |
+| Code review | Morpheus | Review PRs, check quality, suggest improvements |
+| Scope & priorities | Morpheus | What to build next, trade-offs, decisions |
 | Session logging | Scribe | Automatic — never needs routing |
 
 ## Issue Routing
