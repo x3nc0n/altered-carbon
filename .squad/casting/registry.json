@@ -1,0 +1,32 @@
+{
+  "agents": {
+    "kovacs": {
+      "persistent_name": "Kovacs",
+      "universe": "Altered Carbon",
+      "created_at": "2026-04-28T07:21:18Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "poe": {
+      "persistent_name": "Poe",
+      "universe": "Altered Carbon",
+      "created_at": "2026-04-28T07:21:18Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "ortega": {
+      "persistent_name": "Ortega",
+      "universe": "Altered Carbon",
+      "created_at": "2026-04-28T07:21:18Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "falconer": {
+      "persistent_name": "Falconer",
+      "universe": "Altered Carbon",
+      "created_at": "2026-04-28T07:21:18Z",
+      "legacy_named": false,
+      "status": "active"
+    }
+  }
+}

@@ -1,0 +1,144 @@
+name: Lint (PSScriptAnalyzer)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.ps1'
+      - '**.psd1'
+      - '**.psm1'
+      - '.github/workflows/ci-lint.yml'
+      - 'PSScriptAnalyzerSettings.psd1'
+  pull_request:
+    paths:
+      - '**.ps1'
+      - '**.psd1'
+      - '**.psm1'
+      - '.github/workflows/ci-lint.yml'
+      - 'PSScriptAnalyzerSettings.psd1'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path ./altered-carbon.ps1 `
+            -Settings ./PSScriptAnalyzerSettings.psd1 `
+            -Recurse -ReportSummary
+
+          $results | Format-List RuleName, Severity, ScriptName, Line, Message
+
+          if ($results | Where-Object Severity -in 'Error', 'Warning') {
+              Write-Error "PSScriptAnalyzer found issues. See output above."
+              exit 1
+          }
+
+          Write-Host "PSScriptAnalyzer: all clean." -ForegroundColor Green
+
+  syntax-check:
+    name: Syntax & Parse Validation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse check (PowerShell AST)
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path './altered-carbon.ps1').Path,
+              [ref]$tokens,
+              [ref]$errors
+          )
+
+          if ($errors.Count -gt 0) {
+              Write-Host "Parse errors found:" -ForegroundColor Red
+              $errors | ForEach-Object {
+                  Write-Host "  Line $($_.Extent.StartLineNumber): $($_.Message)" -ForegroundColor Red
+              }
+              exit 1
+          }
+
+          Write-Host "Syntax OK — parsed $($tokens.Count) tokens, 0 errors." -ForegroundColor Green
+
+      - name: Validate parameter definitions
+        shell: pwsh
+        run: |
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path './altered-carbon.ps1').Path,
+              [ref]$null,
+              [ref]$errors
+          )
+
+          # Extract param block
+          $paramBlock = $ast.ParamBlock
+          if (-not $paramBlock) {
+              Write-Error "No param() block found in script."
+              exit 1
+          }
+
+          $params = $paramBlock.Parameters
+          Write-Host "Found $($params.Count) parameters:" -ForegroundColor Cyan
+          foreach ($p in $params) {
+              $name = $p.Name.VariablePath.UserPath
+              $type = ($p.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] }).TypeName.Name
+              Write-Host "  -$name [$type]" -ForegroundColor Green
+          }
+
+          # Verify the required parameter sets exist
+          $paramSets = $params | ForEach-Object {
+              $_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.Name -eq 'Parameter' }
+          } | ForEach-Object {
+              $_.NamedArguments | Where-Object { $_.ArgumentName -eq 'ParameterSetName' }
+          } | ForEach-Object { $_.Argument.Value } | Sort-Object -Unique
+
+          if ('Work' -notin $paramSets -or 'Personal' -notin $paramSets) {
+              Write-Error "Expected parameter sets 'Work' and 'Personal' but found: $($paramSets -join ', ')"
+              exit 1
+          }
+
+          Write-Host "Parameter sets validated: $($paramSets -join ', ')" -ForegroundColor Green
+
+      - name: Validate winget package ID format
+        shell: pwsh
+        run: |
+          # Extract package IDs from the script and validate their format.
+          # Valid winget IDs follow Publisher.Package or are MS Store IDs (alphanumeric).
+          $content = Get-Content ./altered-carbon.ps1 -Raw
+
+          # Match @{ Id = '...' patterns
+          $ids = [regex]::Matches($content, "Id\s*=\s*'([^']+)'") | ForEach-Object { $_.Groups[1].Value }
+
+          $invalid = @()
+          foreach ($id in $ids) {
+              # winget IDs: Publisher.Package (dots allowed) or MS Store IDs (alphanumeric, 12 chars)
+              if ($id -notmatch '^[A-Za-z0-9][\w\-]*(\.[A-Za-z0-9][\w\-]*)+$' -and $id -notmatch '^[A-Za-z0-9]{9,14}$') {
+                  $invalid += $id
+              }
+          }
+
+          Write-Host "Validated $($ids.Count) package IDs." -ForegroundColor Cyan
+          if ($invalid.Count -gt 0) {
+              Write-Host "Suspicious package IDs (may be invalid):" -ForegroundColor Yellow
+              $invalid | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+              Write-Error "Found $($invalid.Count) potentially invalid package IDs."
+              exit 1
+          }
+
+          Write-Host "All package IDs pass format validation." -ForegroundColor Green

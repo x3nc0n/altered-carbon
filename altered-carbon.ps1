@@ -29,7 +29,17 @@ param(
     [string[]] $SkipPackages = @(),
 
     # Additional winget packages to install (array of @{Id='...'; Name='...'} hashtables).
-    [hashtable[]] $ExtraPackages = @()
+    [hashtable[]] $ExtraPackages = @(),
+
+    # Execution phase for run-once workflow.
+    # Auto (default): detect based on admin status and scheduled-task marker.
+    # Phase1: admin installs + register Phase2 task + reboot.
+    # Phase2: user-space config + cleanup.
+    [ValidateSet('Auto','Phase1','Phase2')]
+    [string] $Phase = 'Auto',
+
+    # Skip automatic reboot at end of Phase 1.
+    [switch] $SkipReboot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +55,26 @@ try { Start-Transcript -Path $logFile -Append } catch { Write-Warning "Could not
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
+
+# ── Phase Detection ────────────────────────────────────────────────────────────
+$taskName = 'altered-carbon-phase2'
+$phase2MarkerExists = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+
+if ($Phase -eq 'Auto') {
+    if ($isAdmin -and -not $phase2MarkerExists) {
+        $Phase = 'Phase1'
+    } else {
+        $Phase = 'Phase2'
+    }
+}
+Write-Host "Running in $Phase mode (admin=$isAdmin)" -ForegroundColor Cyan
+
+# ── Helper Functions ───────────────────────────────────────────────────────────
+
+function Update-PathFromRegistry {
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [System.Environment]::GetEnvironmentVariable('Path', 'User')
+}
 
 function Get-WingetVersionInfo {
     [CmdletBinding()]
@@ -133,141 +163,153 @@ function Invoke-ElevatedFontPromotion {
 }
 
 # ── Custom PSModulePath Setup ───────────────────────────────────────────────
-# Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
-$psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
-if (-not (Test-Path $psModuleDir)) {
-    New-Item -Path $psModuleDir -ItemType Directory | Out-Null
-    # Set hidden attribute
-    (Get-Item $psModuleDir).Attributes += 'Hidden'
-    Write-Host "Created hidden module folder: $psModuleDir" -ForegroundColor Green
-} else {
-    Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
-}
+function Initialize-PSModulePath {
+    # Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
+    $psModuleDir = Join-Path $env:USERPROFILE '.psmodule'
+    if (-not (Test-Path $psModuleDir)) {
+        New-Item -Path $psModuleDir -ItemType Directory | Out-Null
+        # Set hidden attribute
+        (Get-Item $psModuleDir).Attributes += 'Hidden'
+        Write-Host "Created hidden module folder: $psModuleDir" -ForegroundColor Green
+    } else {
+        Write-Host ".psmodule folder already exists: $psModuleDir" -ForegroundColor Yellow
+    }
 
-# Prepend the custom module folder to PSModulePath (keep system paths so built-in modules like PowerShellGet still load)
-if ($env:PSModulePath -notlike "*$psModuleDir*") {
-    $env:PSModulePath = "$psModuleDir;$env:PSModulePath"
+    # Prepend the custom module folder to PSModulePath (keep system paths so built-in modules like PowerShellGet still load)
+    if ($env:PSModulePath -notlike "*$psModuleDir*") {
+        $env:PSModulePath = "$psModuleDir;$env:PSModulePath"
+    }
+    # Persist only the custom folder as the User-level PSModulePath; machine/process
+    # paths are inherited automatically by new sessions.
+    [System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
+    Write-Host "PSModulePath includes $psModuleDir (user environment)" -ForegroundColor Cyan
+    return $psModuleDir
 }
-# Persist only the custom folder as the User-level PSModulePath; machine/process
-# paths are inherited automatically by new sessions.
-[System.Environment]::SetEnvironmentVariable('PSModulePath', $psModuleDir, 'User')
-Write-Host "PSModulePath includes $psModuleDir (user environment)" -ForegroundColor Cyan
 
 # ── Custom PowerShell Profile Directory ─────────────────────────────────────
-# Create a hidden .psprofile folder in the user's profile directory so the
-# real PowerShell profile lives outside the OneDrive-synced Documents folder.
-# A tiny stub at the default $PROFILE location dot-sources the real file.
-$psProfileDir = Join-Path $env:USERPROFILE '.psprofile'
-if (-not (Test-Path $psProfileDir)) {
-    New-Item -Path $psProfileDir -ItemType Directory | Out-Null
-    (Get-Item $psProfileDir).Attributes += 'Hidden'
-    Write-Host "Created hidden profile folder: $psProfileDir" -ForegroundColor Green
-} else {
-    Write-Host ".psprofile folder already exists: $psProfileDir" -ForegroundColor Yellow
+function Initialize-PSProfileDir {
+    # Create a hidden .psprofile folder in the user's profile directory so the
+    # real PowerShell profile lives outside the OneDrive-synced Documents folder.
+    # A tiny stub at the default $PROFILE location dot-sources the real file.
+    $psProfileDir = Join-Path $env:USERPROFILE '.psprofile'
+    if (-not (Test-Path $psProfileDir)) {
+        New-Item -Path $psProfileDir -ItemType Directory | Out-Null
+        (Get-Item $psProfileDir).Attributes += 'Hidden'
+        Write-Host "Created hidden profile folder: $psProfileDir" -ForegroundColor Green
+    } else {
+        Write-Host ".psprofile folder already exists: $psProfileDir" -ForegroundColor Yellow
+    }
+
+    # The actual profile file that will hold all config (oh-my-posh, etc.)
+    $psProfileFile = Join-Path $psProfileDir 'profile.ps1'
+    return @{ Dir = $psProfileDir; File = $psProfileFile }
 }
 
-# The actual profile file that will hold all config (oh-my-posh, etc.)
-$psProfileFile = Join-Path $psProfileDir 'profile.ps1'
-
 # ── Pre-flight ────────────────────────────────────────────────────────────────
-
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Error 'winget is not available. Install "App Installer" from the Microsoft Store first.'
+function Test-WingetAvailable {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Error 'winget is not available. Install "App Installer" from the Microsoft Store first.'
+    }
 }
 
 # ── Chocolatey ────────────────────────────────────────────────────────────────
 # Chocolatey provides more reliable PATH handling and version management for
 # developer tools like git. Used alongside winget, not as a full replacement.
+function Install-Chocolatey {
+    param([bool] $IsAdmin)
 
-Write-Host 'Bootstrapping Chocolatey...' -ForegroundColor Cyan
+    Write-Host 'Bootstrapping Chocolatey...' -ForegroundColor Cyan
 
-if (Get-Command choco -ErrorAction SilentlyContinue) {
-    Write-Host '  Skipped: Chocolatey already installed.' -ForegroundColor Yellow
-} elseif ($isAdmin) {
-    try {
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-        # Refresh PATH so choco is available immediately
-        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-                    [System.Environment]::GetEnvironmentVariable('Path', 'User')
-        Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Host '  Skipped: Chocolatey already installed.' -ForegroundColor Yellow
+    } elseif ($IsAdmin) {
+        try {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            Update-PathFromRegistry
+            Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "  Failed to install Chocolatey: $_"
+        }
+    } else {
+        Write-Warning '  Chocolatey requires admin privileges. Re-run script as Administrator to install.'
     }
-    catch {
-        Write-Warning "  Failed to install Chocolatey: $_"
-    }
-} else {
-    Write-Warning '  Chocolatey requires admin privileges. Re-run script as Administrator to install.'
 }
 
 # ── Chocolatey Packages ──────────────────────────────────────────────────────
 # Git and Node.js benefit most from Chocolatey: they're immediately on PATH
 # and available to downstream tools without a session restart.
+function Install-ChocolateyPackages {
+    param([bool] $IsAdmin, [string[]] $CurrentSkipPackages)
 
+    # Command is the expected binary name — used to verify the install is healthy.
+    $chocoPackages = @(
+        @{ Id = 'git';        Name = 'git';           Command = 'git' }
+        @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
+    )
 
-# Command is the expected binary name — used to verify the install is healthy.
-$chocoPackages = @(
-    @{ Id = 'git';        Name = 'git';           Command = 'git' }
-    @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
-)
+    $newSkips = @()
 
-if (Get-Command choco -ErrorAction SilentlyContinue) {
-    foreach ($pkg in $chocoPackages) {
-        Write-Host "Checking $($pkg.Name) ($($pkg.Id)) [choco]..." -ForegroundColor Cyan
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        foreach ($pkg in $chocoPackages) {
+            Write-Host "Checking $($pkg.Name) ($($pkg.Id)) [choco]..." -ForegroundColor Cyan
 
-        $chocoList = choco list --exact $pkg.Id --limit-output 2>&1
-        if ($chocoList -match [regex]::Escape($pkg.Id)) {
-            # Verify the binary actually exists — winget uninstall can remove
-            # files that Chocolatey installed, leaving stale choco metadata.
-            $cmdInfo = if ($pkg.Command) { Get-Command $pkg.Command -ErrorAction SilentlyContinue } else { $null }
-            $isHealthy = (-not $pkg.Command) -or (
-                $cmdInfo -and $cmdInfo.Source -notmatch 'Microsoft\\WindowsApps'
-            )
-            if ($isHealthy -and $isAdmin) {
-                Write-Host "  Upgrading $($pkg.Name) via Chocolatey (no-op if already latest)..." -ForegroundColor Cyan
-                choco upgrade $pkg.Id -y --no-progress
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+            $chocoList = choco list --exact $pkg.Id --limit-output 2>&1
+            if ($chocoList -match [regex]::Escape($pkg.Id)) {
+                # Verify the binary actually exists — winget uninstall can remove
+                # files that Chocolatey installed, leaving stale choco metadata.
+                $cmdInfo = if ($pkg.Command) { Get-Command $pkg.Command -ErrorAction SilentlyContinue } else { $null }
+                $isHealthy = (-not $pkg.Command) -or (
+                    $cmdInfo -and $cmdInfo.Source -notmatch 'Microsoft\\WindowsApps'
+                )
+                if ($isHealthy -and $IsAdmin) {
+                    Write-Host "  Upgrading $($pkg.Name) via Chocolatey (no-op if already latest)..." -ForegroundColor Cyan
+                    choco upgrade $pkg.Id -y --no-progress
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+                    } else {
+                        Write-Warning "  choco exited with code $LASTEXITCODE upgrading $($pkg.Name)"
+                    }
+                } elseif ($isHealthy) {
+                    Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey (run as admin to upgrade)." -ForegroundColor Yellow
+                } elseif ($IsAdmin) {
+                    Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
+                    choco install $pkg.Id -y --force --no-progress
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  Done: $($pkg.Name) reinstalled via Chocolatey." -ForegroundColor Green
+                    } else {
+                        Write-Warning "  choco exited with code $LASTEXITCODE reinstalling $($pkg.Name)"
+                    }
                 } else {
-                    Write-Warning "  choco exited with code $LASTEXITCODE upgrading $($pkg.Name)"
-                }
-            } elseif ($isHealthy) {
-                Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey (run as admin to upgrade)." -ForegroundColor Yellow
-            } elseif ($isAdmin) {
-                Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
-                choco install $pkg.Id -y --force --no-progress
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "  Done: $($pkg.Name) reinstalled via Chocolatey." -ForegroundColor Green
-                } else {
-                    Write-Warning "  choco exited with code $LASTEXITCODE reinstalling $($pkg.Name)"
+                    Write-Host "  $($pkg.Name) choco install is broken (binary missing). Will fall back to winget. Re-run as admin to repair." -ForegroundColor Yellow
                 }
             } else {
-                Write-Host "  $($pkg.Name) choco install is broken (binary missing). Will fall back to winget. Re-run as admin to repair." -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
-            choco install $pkg.Id -y --no-progress
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  Done: $($pkg.Name) installed via Chocolatey." -ForegroundColor Green
-            } else {
-                Write-Warning "  choco exited with code $LASTEXITCODE for $($pkg.Name)"
+                Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
+                choco install $pkg.Id -y --no-progress
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  Done: $($pkg.Name) installed via Chocolatey." -ForegroundColor Green
+                } else {
+                    Write-Warning "  choco exited with code $LASTEXITCODE for $($pkg.Name)"
+                }
             }
         }
+
+        Update-PathFromRegistry
+
+        # Skip packages already handled by Chocolatey.
+        if (Get-Command git -ErrorAction SilentlyContinue) {
+            $newSkips += 'Git.Git'
+        }
+        if (Get-Command node -ErrorAction SilentlyContinue) {
+            $newSkips += 'OpenJS.NodeJS.LTS'
+        }
+    } else {
+        Write-Host 'Chocolatey not available — git and Node.js will be installed via winget as fallback.' -ForegroundColor Yellow
     }
 
-    # Refresh PATH after Chocolatey installs
-    $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-                [System.Environment]::GetEnvironmentVariable('Path', 'User')
-
-    # Skip packages already handled by Chocolatey.
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        $SkipPackages += 'Git.Git'
-    }
-    if (Get-Command node -ErrorAction SilentlyContinue) {
-        $SkipPackages += 'OpenJS.NodeJS.LTS'
-    }
-} else {
-    Write-Host 'Chocolatey not available — git and Node.js will be installed via winget as fallback.' -ForegroundColor Yellow
+    return $newSkips
 }
 
 # ── Installations ─────────────────────────────────────────────────────────────
@@ -314,170 +356,185 @@ $personalPackages = @(
     @{ Id = 'Microsoft.GamingApp';                          Name = 'Xbox';                   Source = 'msstore' }
 )
 
-# Build the final package list based on mode
-$wingetPackages = $corePackages
-if ($Personal) {
-    $wingetPackages += $personalPackages
-}
+function Install-WingetPackages {
+    param(
+        [bool] $Personal,
+        [string[]] $SkipPackages = @(),
+        [hashtable[]] $ExtraPackages = @(),
+        [int] $AppInUseExitCode
+    )
 
-# Apply SkipPackages filter and add any extras
-if ($SkipPackages.Count -gt 0) {
-    $wingetPackages = $wingetPackages | Where-Object { $_.Id -notin $SkipPackages }
-}
-if ($ExtraPackages.Count -gt 0) {
-    $wingetPackages += $ExtraPackages
-}
-
-foreach ($pkg in $wingetPackages) {
-    Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
-
-    # Determine source (default to 'winget' if not specified)
-    $source = if ($pkg.Source) { $pkg.Source } else { 'winget' }
-
-    # Generic handling for all packages
-    $installedVersion = $null
-    $availableVersion = $null
-
-    # Get installed version using column-position parsing
-    $listLines = winget list --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
-    $versionInfo = Get-WingetVersionInfo -Lines $listLines -PackageId $pkg.Id
-    if ($versionInfo) {
-        $installedVersion = $versionInfo.Version
-        $availableVersion = $versionInfo.Available
+    # Build the final package list based on mode
+    $wingetPackages = $corePackages
+    if ($Personal) {
+        $wingetPackages += $personalPackages
     }
 
-    # Fallback: some packages (e.g. Spotify) install as MSIX with a different ID.
-    # If the exact-ID check found nothing, try a name-based lookup.
-    if (-not $installedVersion) {
-        $nameLines = winget list --name $pkg.Name --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
-        $nameHeader = $nameLines | Where-Object { $_ -match '^\s*Name\s+' -and $_ -match 'Version' } | Select-Object -First 1
-        if ($nameHeader) {
-            # At least one installed entry matched by name — treat as installed.
-            $installedVersion = 'detected'
-        }
+    # Apply SkipPackages filter and add any extras
+    if ($SkipPackages.Count -gt 0) {
+        $wingetPackages = $wingetPackages | Where-Object { $_.Id -notin $SkipPackages }
+    }
+    if ($ExtraPackages.Count -gt 0) {
+        $wingetPackages += $ExtraPackages
     }
 
-    # If no available version in list output, check search output
-    $latestVersion = $availableVersion
-    if (-not $latestVersion) {
-        $searchLines = winget search --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
-        $searchInfo = Get-WingetVersionInfo -Lines $searchLines -PackageId $pkg.Id
-        if ($searchInfo -and $searchInfo.Version) {
-            $latestVersion = $searchInfo.Version
-        }
-    }
+    foreach ($pkg in $wingetPackages) {
+        Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
 
-    if ($installedVersion) {
-        if ($latestVersion -and $installedVersion -ne $latestVersion) {
-            Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
-        } else {
-            Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
+        # Determine source (default to 'winget' if not specified)
+        $source = if ($pkg.Source) { $pkg.Source } else { 'winget' }
+
+        # Generic handling for all packages
+        $installedVersion = $null
+        $availableVersion = $null
+
+        # Get installed version using column-position parsing
+        $listLines = winget list --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+        $versionInfo = Get-WingetVersionInfo -Lines $listLines -PackageId $pkg.Id
+        if ($versionInfo) {
+            $installedVersion = $versionInfo.Version
+            $availableVersion = $versionInfo.Available
         }
 
-        winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --include-unknown --silent
+        # Fallback: some packages (e.g. Spotify) install as MSIX with a different ID.
+        if (-not $installedVersion) {
+            $nameLines = winget list --name $pkg.Name --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+            $nameHeader = $nameLines | Where-Object { $_ -match '^\s*Name\s+' -and $_ -match 'Version' } | Select-Object -First 1
+            if ($nameHeader) {
+                $installedVersion = 'detected'
+            }
+        }
+
+        # If no available version in list output, check search output
+        $latestVersion = $availableVersion
+        if (-not $latestVersion) {
+            $searchLines = winget search --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+            $searchInfo = Get-WingetVersionInfo -Lines $searchLines -PackageId $pkg.Id
+            if ($searchInfo -and $searchInfo.Version) {
+                $latestVersion = $searchInfo.Version
+            }
+        }
+
+        if ($installedVersion) {
+            if ($latestVersion -and $installedVersion -ne $latestVersion) {
+                Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
+            } else {
+                Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
+            }
+
+            winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --include-unknown --silent
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+            } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
+                Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
+            } else {
+                Write-Warning "  winget exited with code $LASTEXITCODE while checking/upgrading $($pkg.Name)"
+            }
+            continue
+        }
+
+        Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
+        winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
-        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
-            Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
+            Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
+        } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
+            Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
         } else {
-            Write-Warning "  winget exited with code $LASTEXITCODE while checking/upgrading $($pkg.Name)"
+            Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
         }
-        continue
-    }
-
-    Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
-    winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
-    } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
-        Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
-    } else {
-        Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
     }
 }
 
 # ── Windows Features ──────────────────────────────────────────────────────────
 # Enable Hyper-V and WSL 2 (both modes). Requires admin privileges.
+function Enable-WindowsFeatures {
+    param([bool] $IsAdmin)
 
-Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
+    Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
 
-if ($isAdmin) {
-    # Enable Hyper-V
-    $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
-    if ($hypervState -and $hypervState.State -eq 'Enabled') {
-        Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
-    } else {
-        try {
-            Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop | Out-Null
-            Write-Host '  Done: Hyper-V enabled (reboot required).' -ForegroundColor Green
-        } catch {
-            Write-Warning "  Failed to enable Hyper-V: $_"
+    if ($IsAdmin) {
+        # Enable Hyper-V
+        $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+        if ($hypervState -and $hypervState.State -eq 'Enabled') {
+            Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
+        } else {
+            try {
+                Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop | Out-Null
+                Write-Host '  Done: Hyper-V enabled (reboot required).' -ForegroundColor Green
+            } catch {
+                Write-Warning "  Failed to enable Hyper-V: $_"
+            }
         }
-    }
 
-    # Enable WSL 2
-    $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
-    $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
+        # Enable WSL 2
+        $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+        $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
 
-    if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
-        Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
-    } else {
-        try {
-            Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -All -NoRestart -ErrorAction Stop | Out-Null
-            Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop | Out-Null
-            Write-Host '  Done: WSL 2 features enabled (reboot required). Run "wsl --install" after reboot to complete setup.' -ForegroundColor Green
-        } catch {
-            Write-Warning "  Failed to enable WSL 2: $_"
+        if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
+            Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
+        } else {
+            try {
+                Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -All -NoRestart -ErrorAction Stop | Out-Null
+                Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop | Out-Null
+                Write-Host '  Done: WSL 2 features enabled (reboot required). Run "wsl --install" after reboot to complete setup.' -ForegroundColor Green
+            } catch {
+                Write-Warning "  Failed to enable WSL 2: $_"
+            }
         }
+    } else {
+        Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
     }
-} else {
-    Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
 }
 
 # ── Nvidia App (if Nvidia GPU present) ────────────────────────────────────────
+function Install-NvidiaApp {
+    param([int] $AppInUseExitCode)
 
-Write-Host 'Checking for Nvidia GPU...' -ForegroundColor Cyan
+    Write-Host 'Checking for Nvidia GPU...' -ForegroundColor Cyan
 
-$nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match 'NVIDIA' }
+    $nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'NVIDIA' }
 
-if ($nvidiaGpu) {
-    Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
-    Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
+    if ($nvidiaGpu) {
+        Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
+        Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
 
-    $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
-    if ($nvidiaInstalled) {
-        Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
-    } else {
-        winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
-        } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
-            Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
+        $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
+        if ($nvidiaInstalled) {
+            Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
         } else {
-            Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
+            winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
+            } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
+                Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
+            } else {
+                Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
+            }
         }
+    } else {
+        Write-Host '  Skipped: No Nvidia GPU detected.' -ForegroundColor Yellow
     }
-} else {
-    Write-Host '  Skipped: No Nvidia GPU detected.' -ForegroundColor Yellow
 }
 
 # Refresh PATH so newly installed tools (oh-my-posh, git, etc.) are available
 # in this session without restarting the terminal.
-$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-            [System.Environment]::GetEnvironmentVariable('Path', 'User')
+# (now handled via Update-PathFromRegistry call in orchestration block)
 
 # ── GitHub Copilot CLI ───────────────────────────────────────────────────────
 # Copilot CLI is distributed as a GitHub CLI extension.
-Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    # Verify gh is authenticated before attempting extension operations.
-    # gh extension install/upgrade call the GitHub API; unauthenticated requests
-    # are rate-limited and some corporate networks block them entirely.
-    & gh auth status 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning '  GitHub CLI is not authenticated. Run "gh auth login" first, then re-run this script to install the Copilot CLI extension.'
-    } else {
+function Install-GitHubCopilotCli {
+    Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        # Verify gh is authenticated before attempting extension operations.
+        # gh extension install/upgrade call the GitHub API; unauthenticated requests
+        # are rate-limited and some corporate networks block them entirely.
+        & gh auth status 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning '  GitHub CLI is not authenticated. Run "gh auth login" first, then re-run this script to install the Copilot CLI extension.'
+            return
+        }
+
         $ghExtensions = & gh extension list 2>$null
         $hasCopilotCli = $false
         if ($ghExtensions) {
@@ -505,266 +562,267 @@ if (Get-Command gh -ErrorAction SilentlyContinue) {
                 Write-Host '  Tip: Run "gh auth login" if GitHub CLI is not authenticated yet.' -ForegroundColor Yellow
             }
         }
+    } else {
+        Write-Warning '  GitHub CLI (gh) not found on PATH. Copilot CLI extension setup skipped.'
     }
-} else {
-    Write-Warning '  GitHub CLI (gh) not found on PATH. Copilot CLI extension setup skipped.'
 }
 
 # ── Microsoft Work IQ CLI ────────────────────────────────────────────────────
 # Work IQ is distributed as a global npm package and requires Node.js.
-Write-Host 'Ensuring Microsoft Work IQ CLI is installed...' -ForegroundColor Cyan
-if (Get-Command npm -ErrorAction SilentlyContinue) {
-    $workIqInstalled = & npm list --global @microsoft/workiq --depth=0 2>$null | Select-String '@microsoft/workiq@'
+function Install-WorkIqCli {
+    Write-Host 'Ensuring Microsoft Work IQ CLI is installed...' -ForegroundColor Cyan
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        $workIqInstalled = & npm list --global @microsoft/workiq --depth=0 2>$null | Select-String '@microsoft/workiq@'
 
-    if ($workIqInstalled) {
-        Write-Host '  Updating Microsoft Work IQ CLI...' -ForegroundColor Cyan
-        & npm update --global @microsoft/workiq 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: Microsoft Work IQ CLI is up to date.' -ForegroundColor Green
+        if ($workIqInstalled) {
+            Write-Host '  Updating Microsoft Work IQ CLI...' -ForegroundColor Cyan
+            & npm update --global @microsoft/workiq 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Done: Microsoft Work IQ CLI is up to date.' -ForegroundColor Green
+            } else {
+                Write-Warning "  npm exited with code $LASTEXITCODE while updating Microsoft Work IQ CLI"
+            }
         } else {
-            Write-Warning "  npm exited with code $LASTEXITCODE while updating Microsoft Work IQ CLI"
+            Write-Host '  Installing Microsoft Work IQ CLI...' -ForegroundColor Cyan
+            & npm install --global @microsoft/workiq 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Done: Microsoft Work IQ CLI installed.' -ForegroundColor Green
+            } else {
+                Write-Warning "  npm exited with code $LASTEXITCODE while installing Microsoft Work IQ CLI"
+            }
         }
     } else {
-        Write-Host '  Installing Microsoft Work IQ CLI...' -ForegroundColor Cyan
-        & npm install --global @microsoft/workiq 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host '  Done: Microsoft Work IQ CLI installed.' -ForegroundColor Green
-        } else {
-            Write-Warning "  npm exited with code $LASTEXITCODE while installing Microsoft Work IQ CLI"
-        }
+        Write-Warning '  npm not found on PATH. Microsoft Work IQ CLI setup skipped.'
     }
-} else {
-    Write-Warning '  npm not found on PATH. Microsoft Work IQ CLI setup skipped.'
 }
 
 # ── Nerd Font ────────────────────────────────────────────────────────────────
 # oh-my-posh ships a CLI to install Nerd Fonts from the official nerd-fonts releases.
-# NOTE: Per-user font installs (--user) are NOT visible to Windows Terminal
-# (a packaged/UWP app). We always install system-wide first — if that fails
-# (non-admin), we fall back to --user and then promote the per-user fonts to
-# system scope via an elevated helper so WT can see them.
+function Install-NerdFont {
+    param(
+        [string] $FontName,
+        [bool] $IsAdmin
+    )
 
-Write-Host "Installing Nerd Font '$NerdFont'..." -ForegroundColor Cyan
+    Write-Host "Installing Nerd Font '$FontName'..." -ForegroundColor Cyan
 
-if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-    # Check font registry to see if already installed (prefer HKLM for WT compat).
-    $nfPattern = '(' + [regex]::Escape($NerdFont) + '|' + ($NerdFont -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
-    $nfPatternEscaped = $nfPattern -replace "'", "''"
-    $fontInstalledScope = $null   # 'Machine' or 'User' or $null
-    foreach ($scope in @(
-        @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'Machine' },
-        @{ Key = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'User' }
-    )) {
-        if (Test-Path $scope.Key) {
-            $match = (Get-ItemProperty -Path $scope.Key).PSObject.Properties |
-                Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
-            if ($match) { $fontInstalledScope = $scope.Scope; break }
-        }
-    }
-
-    if ($fontInstalledScope -eq 'Machine') {
-        Write-Host "  Skipped: $NerdFont Nerd Font already installed system-wide." -ForegroundColor Yellow
-    } elseif ($fontInstalledScope -eq 'User') {
-        Write-Host "  $NerdFont Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
-        # Promote per-user fonts to system scope via elevation
-        Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
-    } else {
-        # Not installed — install system-wide if admin, per-user + promote otherwise
-        if ($isAdmin) {
-            & oh-my-posh font install $NerdFont
-        } else {
-            & oh-my-posh font install $NerdFont --user
-        }
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  Done: $NerdFont Nerd Font installed." -ForegroundColor Green
-
-            if (-not $isAdmin) {
-                # Promote the per-user install to system scope
-                Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
-                Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
-            }
-        } else {
-            Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $NerdFont"
-        }
-    }
-
-    # Resolve the actual font face name from the registry so Windows Terminal
-    # and VS Code settings use the exact family name.
     $fontFace     = $null
     $fontFaceMono = $null
-    foreach ($fontReg in @(
-        'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
-        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-    )) {
-        if (-not (Test-Path $fontReg)) { continue }
-        $entries = (Get-ItemProperty -Path $fontReg).PSObject.Properties |
-            Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
-        if ($entries) {
-            $baseEntry = $entries |
-                Where-Object { $_.Name -notmatch 'Nerd Font (Mono|Propo)' -and $_.Name -match 'Regular' } |
-                Select-Object -First 1
-            if ($baseEntry) {
-                $fontFace = ($baseEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
+
+    if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
+        # Check font registry to see if already installed (prefer HKLM for WT compat).
+        $nfPattern = '(' + [regex]::Escape($FontName) + '|' + ($FontName -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
+        $nfPatternEscaped = $nfPattern -replace "'", "''"
+        $fontInstalledScope = $null   # 'Machine' or 'User' or $null
+        foreach ($scope in @(
+            @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'Machine' },
+            @{ Key = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'User' }
+        )) {
+            if (Test-Path $scope.Key) {
+                $match = (Get-ItemProperty -Path $scope.Key).PSObject.Properties |
+                    Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
+                if ($match) { $fontInstalledScope = $scope.Scope; break }
             }
-            $monoEntry = $entries |
-                Where-Object { $_.Name -match 'Nerd Font Mono' -and $_.Name -match 'Regular' } |
-                Select-Object -First 1
-            if ($monoEntry) {
-                $fontFaceMono = ($monoEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
-            }
-            if ($fontFace) { break }
         }
+
+        if ($fontInstalledScope -eq 'Machine') {
+            Write-Host "  Skipped: $FontName Nerd Font already installed system-wide." -ForegroundColor Yellow
+        } elseif ($fontInstalledScope -eq 'User') {
+            Write-Host "  $FontName Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
+            Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
+        } else {
+            if ($IsAdmin) {
+                & oh-my-posh font install $FontName
+            } else {
+                & oh-my-posh font install $FontName --user
+            }
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Done: $FontName Nerd Font installed." -ForegroundColor Green
+
+                if (-not $IsAdmin) {
+                    Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
+                    Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
+                }
+            } else {
+                Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $FontName"
+            }
+        }
+
+        # Resolve the actual font face name from the registry.
+        foreach ($fontReg in @(
+            'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+        )) {
+            if (-not (Test-Path $fontReg)) { continue }
+            $entries = (Get-ItemProperty -Path $fontReg).PSObject.Properties |
+                Where-Object { $_.Name -match 'Nerd Font' -and $_.Name -match $nfPattern }
+            if ($entries) {
+                $baseEntry = $entries |
+                    Where-Object { $_.Name -notmatch 'Nerd Font (Mono|Propo)' -and $_.Name -match 'Regular' } |
+                    Select-Object -First 1
+                if ($baseEntry) {
+                    $fontFace = ($baseEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
+                }
+                $monoEntry = $entries |
+                    Where-Object { $_.Name -match 'Nerd Font Mono' -and $_.Name -match 'Regular' } |
+                    Select-Object -First 1
+                if ($monoEntry) {
+                    $fontFaceMono = ($monoEntry.Name -replace '\s*(Regular|Bold|Italic|BoldItalic|Light|Medium|Thin|ExtraLight|SemiBold|ExtraBold|Black)\b.*$', '').Trim()
+                }
+                if ($fontFace) { break }
+            }
+        }
+    } else {
+        Write-Warning '  oh-my-posh not found on PATH. Nerd Font installation skipped.'
     }
-} else {
-    Write-Warning '  oh-my-posh not found on PATH. Nerd Font installation skipped.'
+
+    # Fallback font names if registry lookup didn't resolve them.
+    if (-not $fontFace)     { $fontFace     = "$FontName Nerd Font" }
+    if (-not $fontFaceMono) { $fontFaceMono = "$fontFace Mono" }
+    Write-Host "  Resolved font face: $fontFace | Mono: $fontFaceMono" -ForegroundColor Cyan
+
+    return @{ Face = $fontFace; Mono = $fontFaceMono }
 }
 
-# Fallback font names if registry lookup didn't resolve them.
-if (-not $fontFace)     { $fontFace     = "$NerdFont Nerd Font" }
-if (-not $fontFaceMono) { $fontFaceMono = "$fontFace Mono" }
-Write-Host "  Resolved font face: $fontFace | Mono: $fontFaceMono" -ForegroundColor Cyan
-
 # ── PSGallery Trust ────────────────────────────────────────────────────────────
-# Ensure PSGallery is registered and trusted so module installs don't prompt.
-
-Write-Host 'Ensuring PSGallery is a trusted repository...' -ForegroundColor Cyan
-$psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
-if (-not $psGallery) {
-    Register-PSRepository -Default -ErrorAction SilentlyContinue
-    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-    Write-Host '  Done: PSGallery registered and trusted.' -ForegroundColor Green
-} elseif ($psGallery.InstallationPolicy -ne 'Trusted') {
-    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-    Write-Host '  Done: PSGallery set to Trusted.' -ForegroundColor Green
-} else {
-    Write-Host '  Skipped: PSGallery already trusted.' -ForegroundColor Yellow
+function Set-PSGalleryTrust {
+    Write-Host 'Ensuring PSGallery is a trusted repository...' -ForegroundColor Cyan
+    $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+    if (-not $psGallery) {
+        Register-PSRepository -Default -ErrorAction SilentlyContinue
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        Write-Host '  Done: PSGallery registered and trusted.' -ForegroundColor Green
+    } elseif ($psGallery.InstallationPolicy -ne 'Trusted') {
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        Write-Host '  Done: PSGallery set to Trusted.' -ForegroundColor Green
+    } else {
+        Write-Host '  Skipped: PSGallery already trusted.' -ForegroundColor Yellow
+    }
 }
 
 # ── PowerShell Modules ─────────────────────────────────────────────────────────
 # Install commonly used modules into CurrentUser scope (no admin required).
+function Install-PSModules {
+    param([string] $ModuleDir)
 
-$psModules = @(
-    # Core
-    @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph' }
-    @{ Name = 'Az';                        Description = 'Azure PowerShell' }
-    @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management' }
-    @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams' }
-    @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }
-    @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management' }
-    @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
-    @{ Name = 'ActiveDirectory';           Description = 'Active Directory' }
-    @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune' }
-    # Sentinel / Security
-    @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)' }
-    @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)' }
-    @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)' }
-)
+    $psModules = @(
+        # Core
+        @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph' }
+        @{ Name = 'Az';                        Description = 'Azure PowerShell' }
+        @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management' }
+        @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams' }
+        @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }
+        @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management' }
+        @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
+        @{ Name = 'ActiveDirectory';           Description = 'Active Directory' }
+        @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune' }
+        # Sentinel / Security
+        @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)' }
+        @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)' }
+        @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)' }
+    )
 
-foreach ($mod in $psModules) {
-    Write-Host "Installing module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
-    if (Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue) {
-        Write-Host "  Skipped: $($mod.Name) already installed." -ForegroundColor Yellow
-    }
-    else {
-        try {
-            # Use Save-Module to install directly into the custom .psmodule folder
-            # instead of Install-Module -Scope CurrentUser, which always targets
-            # the Documents folder (often synced via OneDrive).
-            Save-Module -Name $mod.Name -Path $psModuleDir -Force -AcceptLicense -ErrorAction Stop
-            Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+    foreach ($mod in $psModules) {
+        Write-Host "Installing module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
+        if (Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue) {
+            Write-Host "  Skipped: $($mod.Name) already installed." -ForegroundColor Yellow
         }
-        catch {
-            Write-Warning "  Failed to install $($mod.Name): $_"
+        else {
+            try {
+                Save-Module -Name $mod.Name -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
+                Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  Failed to install $($mod.Name): $_"
+            }
         }
     }
 }
 
 # ── VS Code Extensions ─────────────────────────────────────────────────────────
 # Install useful extensions into both VS Code and VS Code Insiders.
+function Install-VSCodeExtensions {
+    $vsCodeExtensions = @(
+        @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
+        @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
+        @{ Id = 'github.copilot';                           Name = 'GitHub Copilot' }
+        @{ Id = 'github.copilot-chat';                      Name = 'GitHub Copilot Chat' }
+        @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+        @{ Id = 'ms-windows-ai-studio.windows-ai-studio';   Name = 'AI Toolkit for Visual Studio Code' }
+        @{ Id = 'ms-security.ms-sentinel';                  Name = 'Microsoft Sentinel' }
+    )
 
-$vsCodeExtensions = @(
-    @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
-    @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
-    @{ Id = 'github.copilot';                           Name = 'GitHub Copilot' }
-    @{ Id = 'github.copilot-chat';                      Name = 'GitHub Copilot Chat' }
-    @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
-    @{ Id = 'ms-windows-ai-studio.windows-ai-studio';   Name = 'AI Toolkit for Visual Studio Code' }
-    @{ Id = 'ms-security.ms-sentinel';                  Name = 'Microsoft Sentinel' }
-)
+    $staleVsCodeExtensions = @(
+        'ms-sentinel.azure-sentinel-tools'
+    )
 
-# Remove previously managed extension IDs that are no longer in README.
-$staleVsCodeExtensions = @(
-    'ms-sentinel.azure-sentinel-tools'
-)
-
-foreach ($editor in @('code', 'code-insiders')) {
-    if (-not (Get-Command $editor -ErrorAction SilentlyContinue)) {
-        Write-Host "Skipping $editor extensions ($editor not found on PATH)." -ForegroundColor Yellow
-        continue
-    }
-
-    Write-Host "Installing VS Code extensions ($editor)..." -ForegroundColor Cyan
-    $installedExts = & $editor --list-extensions 2>$null
-
-    foreach ($ext in $vsCodeExtensions) {
-        if ($installedExts -contains $ext.Id) {
-            Write-Host "  Skipped: $($ext.Name) already installed." -ForegroundColor Yellow
-        } else {
-            Write-Host "  Installing $($ext.Name)..." -ForegroundColor Cyan
-            & $editor --install-extension $ext.Id --force 2>&1 | Out-Null
-            Write-Host "  Done: $($ext.Name)" -ForegroundColor Green
+    foreach ($editor in @('code', 'code-insiders')) {
+        if (-not (Get-Command $editor -ErrorAction SilentlyContinue)) {
+            Write-Host "Skipping $editor extensions ($editor not found on PATH)." -ForegroundColor Yellow
+            continue
         }
-    }
 
-    foreach ($staleExtId in $staleVsCodeExtensions) {
-        if ($installedExts -contains $staleExtId) {
-            Write-Host "  Removing stale extension $staleExtId..." -ForegroundColor Cyan
-            & $editor --uninstall-extension $staleExtId --force 2>&1 | Out-Null
-            Write-Host "  Done: removed $staleExtId" -ForegroundColor Green
+        Write-Host "Installing VS Code extensions ($editor)..." -ForegroundColor Cyan
+        $installedExts = & $editor --list-extensions 2>$null
+
+        foreach ($ext in $vsCodeExtensions) {
+            if ($installedExts -contains $ext.Id) {
+                Write-Host "  Skipped: $($ext.Name) already installed." -ForegroundColor Yellow
+            } else {
+                Write-Host "  Installing $($ext.Name)..." -ForegroundColor Cyan
+                & $editor --install-extension $ext.Id --force 2>&1 | Out-Null
+                Write-Host "  Done: $($ext.Name)" -ForegroundColor Green
+            }
+        }
+
+        foreach ($staleExtId in $staleVsCodeExtensions) {
+            if ($installedExts -contains $staleExtId) {
+                Write-Host "  Removing stale extension $staleExtId..." -ForegroundColor Cyan
+                & $editor --uninstall-extension $staleExtId --force 2>&1 | Out-Null
+                Write-Host "  Done: removed $staleExtId" -ForegroundColor Green
+            }
         }
     }
 }
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+function Set-OhMyPoshProfile {
+    param(
+        [string] $ThemeName,
+        [string] $ProfileDir,
+        [string] $ProfileFile
+    )
 
-# Migrate from the deprecated oh-my-posh PowerShell module (if still present).
-# Per the oh-my-posh migration guide: https://ohmyposh.dev/docs/migrating
-Write-Host 'Checking for deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
-if (Get-Module -ListAvailable -Name 'oh-my-posh' -ErrorAction SilentlyContinue) {
-    Write-Host '  Removing deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
-    try {
-        if ($env:POSH_PATH -and (Test-Path $env:POSH_PATH)) {
-            try {
-                Remove-Item $env:POSH_PATH -Force -Recurse -ErrorAction Stop
-                Write-Host "  Done: removed cached module files from `$env:POSH_PATH." -ForegroundColor Green
-            } catch {
-                Write-Warning "  Could not remove `$env:POSH_PATH: $_"
+    # Migrate from the deprecated oh-my-posh PowerShell module (if still present).
+    Write-Host 'Checking for deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
+    if (Get-Module -ListAvailable -Name 'oh-my-posh' -ErrorAction SilentlyContinue) {
+        Write-Host '  Removing deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
+        try {
+            if ($env:POSH_PATH -and (Test-Path $env:POSH_PATH)) {
+                try {
+                    Remove-Item $env:POSH_PATH -Force -Recurse -ErrorAction Stop
+                    Write-Host "  Done: removed cached module files from `$env:POSH_PATH." -ForegroundColor Green
+                } catch {
+                    Write-Warning "  Could not remove `$env:POSH_PATH: $_"
+                }
             }
+            Uninstall-Module oh-my-posh -AllVersions -Force -ErrorAction Stop
+            Write-Host '  Done: oh-my-posh PowerShell module uninstalled.' -ForegroundColor Green
+        } catch {
+            Write-Warning "  Could not fully remove oh-my-posh module: $_"
         }
-        Uninstall-Module oh-my-posh -AllVersions -Force -ErrorAction Stop
-        Write-Host '  Done: oh-my-posh PowerShell module uninstalled.' -ForegroundColor Green
-    } catch {
-        Write-Warning "  Could not fully remove oh-my-posh module: $_"
+    } else {
+        Write-Host '  Skipped: deprecated module not found.' -ForegroundColor Yellow
     }
-} else {
-    Write-Host '  Skipped: deprecated module not found.' -ForegroundColor Yellow
-}
 
-# 1. oh-my-posh theme — PowerShell 7 / Preview profile
-#    The real profile lives in $env:USERPROFILE\.psprofile\profile.ps1 to
-#    avoid OneDrive syncing. A stub at the default $PROFILE dot-sources it.
-Write-Host "Configuring oh-my-posh $OmpTheme theme..." -ForegroundColor Cyan
+    Write-Host "Configuring oh-my-posh $ThemeName theme..." -ForegroundColor Cyan
 
-# winget installs oh-my-posh as a standalone executable and sets POSH_THEMES_PATH.
-# The profile block resolves the themes directory at runtime in case the
-# environment variable isn't populated yet in the current session.
-$ompBlock = ('
+    $ompBlock = ('
 # ── oh-my-posh (managed by altered-carbon) ───────────────────────────────────
 if (-not $env:POSH_THEMES_PATH) {
     $_themeCandidates = @(
         (Join-Path $env:LOCALAPPDATA ''Programs\oh-my-posh\themes'')
     )
-    # Derive themes dir from the oh-my-posh binary location as final fallback.
     $_ompCmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
     if ($_ompCmd) {
         $_themeCandidates += Join-Path (Split-Path (Split-Path $_ompCmd.Source)) ''themes''
@@ -787,303 +845,284 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
         oh-my-posh init pwsh | Invoke-Expression
     }
 }
-# ── end oh-my-posh ───────────────────────────────────────────────────────────').Replace('__OMP_THEME__', $OmpTheme)
+# ── end oh-my-posh ───────────────────────────────────────────────────────────').Replace('__OMP_THEME__', $ThemeName)
 
-# ── Write to the real profile in .psprofile ──────────────────────────────────
-# Shared patterns for stripping legacy oh-my-posh config from any profile file.
-$ompBlockPattern  = '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*'
-$ompInitPattern   = '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?'
-$ompModulePattern = '(?m)^[^\r\n]*Import-Module\s+oh-my-posh[^\r\n]*\r?\n?'
+    # Shared patterns for stripping legacy oh-my-posh config from any profile file.
+    $ompBlockPattern  = '(?s)\r?\n?# ── oh-my-posh \(managed by altered-carbon\).*?# ── end oh-my-posh[^\r\n]*'
+    $ompInitPattern   = '(?m)^[^\r\n]*oh-my-posh\s+init\s+(pwsh|powershell)[^\r\n]*\r?\n?'
+    $ompModulePattern = '(?m)^[^\r\n]*Import-Module\s+oh-my-posh[^\r\n]*\r?\n?'
 
-if (Test-Path $psProfileFile) {
-    $profileContent = Get-Content $psProfileFile -Raw
+    if (Test-Path $ProfileFile) {
+        $profileContent = Get-Content $ProfileFile -Raw
+        $cleaned = $profileContent -replace $ompBlockPattern, ''
+        $cleaned = $cleaned -replace $ompInitPattern, ''
+        $cleaned = $cleaned -replace $ompModulePattern, ''
+        $cleaned = $cleaned.TrimEnd()
+        Set-Content -Path $ProfileFile -Value ($cleaned + $ompBlock) -Encoding UTF8
+        Write-Host "  Done: oh-my-posh config written to $ProfileFile" -ForegroundColor Green
+    }
+    else {
+        Set-Content -Path $ProfileFile -Value $ompBlock.TrimStart() -Encoding UTF8
+        Write-Host "  Done: profile created at $ProfileFile with oh-my-posh config." -ForegroundColor Green
+    }
 
-    # Remove any previous managed block (between sentinel comments).
-    $cleaned = $profileContent -replace $ompBlockPattern, ''
+    # ── Create stub at default $PROFILE that dot-sources the real profile ────
+    $ps7ProfilePath = $null
+    if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+        $ps7ProfilePath = & pwsh -NoProfile -Command '$PROFILE' 2>$null
+    }
+    if (-not $ps7ProfilePath) {
+        $documentsPath  = [Environment]::GetFolderPath('MyDocuments')
+        $ps7ProfilePath = Join-Path $documentsPath 'PowerShell\Microsoft.PowerShell_profile.ps1'
+    }
+    $ps7ProfileDir = Split-Path $ps7ProfilePath -Parent
 
-    # Also strip legacy bare oh-my-posh init lines and module imports from older installs.
-    $cleaned = $cleaned -replace $ompInitPattern, ''
-    $cleaned = $cleaned -replace $ompModulePattern, ''
-    $cleaned = $cleaned.TrimEnd()
+    if (-not (Test-Path $ps7ProfileDir)) {
+        New-Item -ItemType Directory -Path $ps7ProfileDir -Force | Out-Null
+    }
 
-    Set-Content -Path $psProfileFile -Value ($cleaned + $ompBlock) -Encoding UTF8
-    Write-Host "  Done: oh-my-posh config written to $psProfileFile" -ForegroundColor Green
-}
-else {
-    Set-Content -Path $psProfileFile -Value $ompBlock.TrimStart() -Encoding UTF8
-    Write-Host "  Done: profile created at $psProfileFile with oh-my-posh config." -ForegroundColor Green
-}
-
-# ── Create stub at default $PROFILE that dot-sources the real profile ────────
-# Determine the default $PROFILE path for PowerShell 7 / Preview
-$ps7ProfilePath = $null
-if (Get-Command pwsh -ErrorAction SilentlyContinue) {
-    $ps7ProfilePath = & pwsh -NoProfile -Command '$PROFILE' 2>$null
-}
-if (-not $ps7ProfilePath) {
-    # Fallback: build the path manually when pwsh is not yet on PATH.
-    $documentsPath  = [Environment]::GetFolderPath('MyDocuments')
-    $ps7ProfilePath = Join-Path $documentsPath 'PowerShell\Microsoft.PowerShell_profile.ps1'
-}
-$ps7ProfileDir = Split-Path $ps7ProfilePath -Parent
-
-if (-not (Test-Path $ps7ProfileDir)) {
-    New-Item -ItemType Directory -Path $ps7ProfileDir -Force | Out-Null
-}
-
-# The stub dot-sources the real profile from .psprofile.
-$stubContent = '# Stub profile — managed by altered-carbon.
+    $stubContent = '# Stub profile — managed by altered-carbon.
 # The real profile lives outside OneDrive in ~\.psprofile\profile.ps1.
 $_realProfile = Join-Path $env:USERPROFILE ''.psprofile\profile.ps1''
 if (Test-Path $_realProfile) { . $_realProfile }'
 
-# Only overwrite the stub if it is missing or already a stub we manage.
-if (Test-Path $ps7ProfilePath) {
-    $existing = Get-Content $ps7ProfilePath -Raw
-    if ($existing -notmatch 'managed by altered-carbon') {
-        # The user has a custom profile we don't own — migrate its content first.
-        Write-Host "  Migrating existing profile content to $psProfileFile" -ForegroundColor Cyan
+    if (Test-Path $ps7ProfilePath) {
+        $existing = Get-Content $ps7ProfilePath -Raw
+        if ($existing -notmatch 'managed by altered-carbon') {
+            Write-Host "  Migrating existing profile content to $ProfileFile" -ForegroundColor Cyan
+            $migrated = $existing -replace $ompBlockPattern, ''
+            $migrated = $migrated -replace $ompInitPattern, ''
+            $migrated = $migrated -replace $ompModulePattern, ''
+            $migrated = $migrated.Trim()
 
-        # Strip any oh-my-posh blocks/lines already handled above, then prepend.
-        $migrated = $existing -replace $ompBlockPattern, ''
-        $migrated = $migrated -replace $ompInitPattern, ''
-        $migrated = $migrated -replace $ompModulePattern, ''
-        $migrated = $migrated.Trim()
-
-        if ($migrated) {
-            $current = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
-            if ($current -notmatch [regex]::Escape($migrated)) {
-                Set-Content -Path $psProfileFile -Value ($migrated + "`n" + $current) -Encoding UTF8
+            if ($migrated) {
+                $current = if (Test-Path $ProfileFile) { Get-Content $ProfileFile -Raw } else { '' }
+                if ($current -notmatch [regex]::Escape($migrated)) {
+                    Set-Content -Path $ProfileFile -Value ($migrated + "`n" + $current) -Encoding UTF8
+                }
             }
         }
     }
-}
 
-# Write stub if missing or already our managed stub
-if (-not (Test-Path $ps7ProfilePath) -or (Get-Content $ps7ProfilePath -Raw) -match 'managed by altered-carbon') {
-    Set-Content -Path $ps7ProfilePath -Value $stubContent -Encoding UTF8
-    Write-Host "  Done: stub profile written to $ps7ProfilePath" -ForegroundColor Green
-}
+    if (-not (Test-Path $ps7ProfilePath) -or (Get-Content $ps7ProfilePath -Raw) -match 'managed by altered-carbon') {
+        Set-Content -Path $ps7ProfilePath -Value $stubContent -Encoding UTF8
+        Write-Host "  Done: stub profile written to $ps7ProfilePath" -ForegroundColor Green
+    }
 
-# Also create the stub for Windows PowerShell 5.1 so opening any PS edition
-# picks up oh-my-posh.  The oh-my-posh block already uses "pwsh" init which
-# still works under 5.1; it just skips PS 7-only features gracefully.
-$ps51ProfilePath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'
-$ps51ProfileDir  = Split-Path $ps51ProfilePath -Parent
-if (-not (Test-Path $ps51ProfileDir)) {
-    New-Item -ItemType Directory -Path $ps51ProfileDir -Force | Out-Null
-}
-if (Test-Path $ps51ProfilePath) {
-    $existingPs51 = Get-Content $ps51ProfilePath -Raw
-    if ($existingPs51 -notmatch 'managed by altered-carbon') {
-        # Migrate existing PS 5.1 profile content into .psprofile
-        Write-Host "  Migrating existing PS 5.1 profile content to $psProfileFile" -ForegroundColor Cyan
-        $migratedPs51 = $existingPs51 -replace $ompBlockPattern, ''
-        $migratedPs51 = $migratedPs51 -replace $ompInitPattern, ''
-        $migratedPs51 = $migratedPs51 -replace $ompModulePattern, ''
-        $migratedPs51 = $migratedPs51.Trim()
-        if ($migratedPs51) {
-            $currentContent = if (Test-Path $psProfileFile) { Get-Content $psProfileFile -Raw } else { '' }
-            if ($currentContent -notmatch [regex]::Escape($migratedPs51)) {
-                Set-Content -Path $psProfileFile -Value ($migratedPs51 + "`n" + $currentContent) -Encoding UTF8
+    # PS 5.1 stub
+    $ps51ProfilePath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'
+    $ps51ProfileDir  = Split-Path $ps51ProfilePath -Parent
+    if (-not (Test-Path $ps51ProfileDir)) {
+        New-Item -ItemType Directory -Path $ps51ProfileDir -Force | Out-Null
+    }
+    if (Test-Path $ps51ProfilePath) {
+        $existingPs51 = Get-Content $ps51ProfilePath -Raw
+        if ($existingPs51 -notmatch 'managed by altered-carbon') {
+            Write-Host "  Migrating existing PS 5.1 profile content to $ProfileFile" -ForegroundColor Cyan
+            $migratedPs51 = $existingPs51 -replace $ompBlockPattern, ''
+            $migratedPs51 = $migratedPs51 -replace $ompInitPattern, ''
+            $migratedPs51 = $migratedPs51 -replace $ompModulePattern, ''
+            $migratedPs51 = $migratedPs51.Trim()
+            if ($migratedPs51) {
+                $currentContent = if (Test-Path $ProfileFile) { Get-Content $ProfileFile -Raw } else { '' }
+                if ($currentContent -notmatch [regex]::Escape($migratedPs51)) {
+                    Set-Content -Path $ProfileFile -Value ($migratedPs51 + "`n" + $currentContent) -Encoding UTF8
+                }
             }
         }
     }
-}
-# Write stub if missing or already our managed stub
-if (-not (Test-Path $ps51ProfilePath) -or (Get-Content $ps51ProfilePath -Raw) -match 'managed by altered-carbon') {
-    Set-Content -Path $ps51ProfilePath -Value $stubContent -Encoding UTF8
-    Write-Host "  Done: stub profile written to $ps51ProfilePath" -ForegroundColor Green
-}
+    if (-not (Test-Path $ps51ProfilePath) -or (Get-Content $ps51ProfilePath -Raw) -match 'managed by altered-carbon') {
+        Set-Content -Path $ps51ProfilePath -Value $stubContent -Encoding UTF8
+        Write-Host "  Done: stub profile written to $ps51ProfilePath" -ForegroundColor Green
+    }
 
-# ── Validate oh-my-posh theme file ──────────────────────────────────────────
-# The customized theme (with battery widget) ships alongside this script in the
-# repo.  Copy it to .psprofile so the profile block can find it at runtime.
-$repoThemePath  = Join-Path $PSScriptRoot "$OmpTheme.omp.json"
-$customThemePath = Join-Path $psProfileDir "$OmpTheme.omp.json"
+    # ── Validate oh-my-posh theme file ──────────────────────────────────────
+    $repoThemePath   = Join-Path $PSScriptRoot "$ThemeName.omp.json"
+    $customThemePath = Join-Path $ProfileDir "$ThemeName.omp.json"
 
-if (Test-Path $repoThemePath) {
-    Copy-Item -Path $repoThemePath -Destination $customThemePath -Force
-    Write-Host "  Done: $OmpTheme theme copied to $customThemePath" -ForegroundColor Green
-} elseif ($env:POSH_THEMES_PATH -and (Test-Path (Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json"))) {
-    Copy-Item -Path (Join-Path $env:POSH_THEMES_PATH "$OmpTheme.omp.json") -Destination $customThemePath -Force
-    Write-Host "  Fallback: copied stock $OmpTheme theme from POSH_THEMES_PATH to $customThemePath" -ForegroundColor Yellow
-} elseif (-not (Test-Path $customThemePath)) {
-    $themeUrl = "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/$OmpTheme.omp.json"
-    Write-Host "  Theme not found locally. Downloading $OmpTheme from GitHub..." -ForegroundColor Cyan
-    try {
-        Invoke-WebRequest -Uri $themeUrl -OutFile $customThemePath -UseBasicParsing -ErrorAction Stop
-        Write-Host "  Done: theme saved to $customThemePath" -ForegroundColor Green
-    } catch {
-        Write-Warning "  Failed to download theme: $_"
-        Write-Host '  oh-my-posh will fall back to the default theme.' -ForegroundColor Yellow
+    if (Test-Path $repoThemePath) {
+        Copy-Item -Path $repoThemePath -Destination $customThemePath -Force
+        Write-Host "  Done: $ThemeName theme copied to $customThemePath" -ForegroundColor Green
+    } elseif ($env:POSH_THEMES_PATH -and (Test-Path (Join-Path $env:POSH_THEMES_PATH "$ThemeName.omp.json"))) {
+        Copy-Item -Path (Join-Path $env:POSH_THEMES_PATH "$ThemeName.omp.json") -Destination $customThemePath -Force
+        Write-Host "  Fallback: copied stock $ThemeName theme from POSH_THEMES_PATH to $customThemePath" -ForegroundColor Yellow
+    } elseif (-not (Test-Path $customThemePath)) {
+        $themeUrl = "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/$ThemeName.omp.json"
+        Write-Host "  Theme not found locally. Downloading $ThemeName from GitHub..." -ForegroundColor Cyan
+        try {
+            Invoke-WebRequest -Uri $themeUrl -OutFile $customThemePath -UseBasicParsing -ErrorAction Stop
+            Write-Host "  Done: theme saved to $customThemePath" -ForegroundColor Green
+        } catch {
+            Write-Warning "  Failed to download theme: $_"
+            Write-Host '  oh-my-posh will fall back to the default theme.' -ForegroundColor Yellow
+        }
     }
 }
 
 # 2. Windows Terminal — default profile + font
-#    Handles both Windows Terminal Preview and the stable release.
-Write-Host 'Configuring Windows Terminal...' -ForegroundColor Cyan
+function Set-WindowsTerminalConfig {
+    param([string] $FontFaceName)
 
-$wtPackageDirs = @(
-    (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminalPreview_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName),
-    (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminal_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName)
-) | Where-Object { $_ }
+    Write-Host 'Configuring Windows Terminal...' -ForegroundColor Cyan
 
-if ($wtPackageDirs.Count -eq 0) {
-    Write-Warning '  No Windows Terminal package folder found. Launch it once, then re-run this script.'
-}
+    $wtPackageDirs = @(
+        (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminalPreview_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName),
+        (Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Microsoft.WindowsTerminal_*' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName)
+    ) | Where-Object { $_ }
 
-foreach ($wtPackageDir in $wtPackageDirs) {
-    $wtLabel = if ($wtPackageDir -match 'Preview') { 'Windows Terminal Preview' } else { 'Windows Terminal' }
-    Write-Host "  Configuring $wtLabel..." -ForegroundColor Cyan
-
-    $wtLocalState   = Join-Path $wtPackageDir 'LocalState'
-    $wtSettingsPath = Join-Path $wtLocalState 'settings.json'
-
-    if (-not (Test-Path $wtLocalState)) {
-        New-Item -ItemType Directory -Path $wtLocalState -Force | Out-Null
+    if ($wtPackageDirs.Count -eq 0) {
+        Write-Warning '  No Windows Terminal package folder found. Launch it once, then re-run this script.'
     }
 
-    if (Test-Path $wtSettingsPath) {
-        $wt = Get-Content $wtSettingsPath -Raw | ConvertFrom-Json
-    }
-    else {
-        $wt = [PSCustomObject]@{
-            '$help'   = 'https://aka.ms/terminal-documentation'
-            '$schema' = 'https://aka.ms/terminal-profiles-schema'
-            profiles  = [PSCustomObject]@{
-                defaults = [PSCustomObject]@{}
-            }
+    foreach ($wtPackageDir in $wtPackageDirs) {
+        $wtLabel = if ($wtPackageDir -match 'Preview') { 'Windows Terminal Preview' } else { 'Windows Terminal' }
+        Write-Host "  Configuring $wtLabel..." -ForegroundColor Cyan
+
+        $wtLocalState   = Join-Path $wtPackageDir 'LocalState'
+        $wtSettingsPath = Join-Path $wtLocalState 'settings.json'
+
+        if (-not (Test-Path $wtLocalState)) {
+            New-Item -ItemType Directory -Path $wtLocalState -Force | Out-Null
         }
-    }
 
-    # Default profile → PowerShell Preview (GUID is auto-generated by WT, so
-    # we discover it from the profiles list rather than hardcoding).
-    $pwshPreviewGuid = $null
-    if ($wt.profiles -and $wt.profiles.list) {
-        $pwshPreviewGuid = $wt.profiles.list |
-            Where-Object { $_.name -match 'Preview' -and $_.source -eq 'Windows.Terminal.PowershellCore' } |
-            Select-Object -First 1 -ExpandProperty guid
-    }
-    if (-not $pwshPreviewGuid) {
-        # Fallback: look for any PowerShell Core profile (pwsh 7 stable).
-        if ($wt.profiles -and $wt.profiles.list) {
-            $pwshPreviewGuid = $wt.profiles.list |
-                Where-Object { $_.source -eq 'Windows.Terminal.PowershellCore' } |
-                Select-Object -First 1 -ExpandProperty guid
-        }
-    }
-    if ($pwshPreviewGuid) {
-        if ($wt.PSObject.Properties['defaultProfile']) {
-            $wt.defaultProfile = $pwshPreviewGuid
+        if (Test-Path $wtSettingsPath) {
+            $wt = Get-Content $wtSettingsPath -Raw | ConvertFrom-Json
         }
         else {
-            $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $pwshPreviewGuid -Force
+            $wt = [PSCustomObject]@{
+                '$help'   = 'https://aka.ms/terminal-documentation'
+                '$schema' = 'https://aka.ms/terminal-profiles-schema'
+                profiles  = [PSCustomObject]@{
+                    defaults = [PSCustomObject]@{}
+                }
+            }
         }
-        Write-Host "    Default profile set to $pwshPreviewGuid" -ForegroundColor Green
-    }
-    else {
-        Write-Warning "    Could not find PowerShell Preview/Core profile in $wtLabel — defaultProfile unchanged."
-    }
 
-    # Font → selected Nerd Font for all profiles
-    if (-not $wt.profiles) {
-        $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{ defaults = [PSCustomObject]@{} }) -Force
-    }
-    if (-not $wt.profiles.defaults) {
-        $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
-    }
-    $fontObj = [PSCustomObject]@{ face = $fontFace }
-    if ($wt.profiles.defaults.PSObject.Properties['font']) {
-        $wt.profiles.defaults.font = $fontObj
-    }
-    else {
-        $wt.profiles.defaults | Add-Member -NotePropertyName 'font' -NotePropertyValue $fontObj -Force
-    }
+        $pwshPreviewGuid = $null
+        if ($wt.profiles -and $wt.profiles.list) {
+            $pwshPreviewGuid = $wt.profiles.list |
+                Where-Object { $_.name -match 'Preview' -and $_.source -eq 'Windows.Terminal.PowershellCore' } |
+                Select-Object -First 1 -ExpandProperty guid
+        }
+        if (-not $pwshPreviewGuid) {
+            if ($wt.profiles -and $wt.profiles.list) {
+                $pwshPreviewGuid = $wt.profiles.list |
+                    Where-Object { $_.source -eq 'Windows.Terminal.PowershellCore' } |
+                    Select-Object -First 1 -ExpandProperty guid
+            }
+        }
+        if ($pwshPreviewGuid) {
+            if ($wt.PSObject.Properties['defaultProfile']) {
+                $wt.defaultProfile = $pwshPreviewGuid
+            }
+            else {
+                $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $pwshPreviewGuid -Force
+            }
+            Write-Host "    Default profile set to $pwshPreviewGuid" -ForegroundColor Green
+        }
+        else {
+            Write-Warning "    Could not find PowerShell Preview/Core profile in $wtLabel — defaultProfile unchanged."
+        }
 
-    $wt | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsPath -Encoding UTF8
-    Write-Host "    Done: $wtSettingsPath" -ForegroundColor Green
+        if (-not $wt.profiles) {
+            $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{ defaults = [PSCustomObject]@{} }) -Force
+        }
+        if (-not $wt.profiles.defaults) {
+            $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
+        }
+        $fontObj = [PSCustomObject]@{ face = $FontFaceName }
+        if ($wt.profiles.defaults.PSObject.Properties['font']) {
+            $wt.profiles.defaults.font = $fontObj
+        }
+        else {
+            $wt.profiles.defaults | Add-Member -NotePropertyName 'font' -NotePropertyValue $fontObj -Force
+        }
+
+        $wt | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsPath -Encoding UTF8
+        Write-Host "    Done: $wtSettingsPath" -ForegroundColor Green
+    }
 }
 
 # 3. Set Windows Terminal Preview as the default terminal (Windows 11)
-Write-Host 'Setting Windows Terminal Preview as default terminal...' -ForegroundColor Cyan
-$regPath = 'HKCU:\Console\%%Startup'
-try {
-    if (-not (Test-Path $regPath)) {
-        New-Item -Path $regPath -Force | Out-Null
+function Set-DefaultTerminal {
+    Write-Host 'Setting Windows Terminal Preview as default terminal...' -ForegroundColor Cyan
+    $regPath = 'HKCU:\Console\%%Startup'
+    try {
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $regPath -Name 'DelegationConsole'  -Value '{06171993-2EB2-4CB9-8A6E-492235E1EAFC}'
+        Set-ItemProperty -Path $regPath -Name 'DelegationTerminal' -Value '{86633F1F-6C40-4FA7-B9A0-E7E6D27C4B72}'
+        Write-Host '  Done: default terminal set.' -ForegroundColor Green
     }
-    # COM class IDs for Windows Terminal Preview delegation
-    Set-ItemProperty -Path $regPath -Name 'DelegationConsole'  -Value '{06171993-2EB2-4CB9-8A6E-492235E1EAFC}'
-    Set-ItemProperty -Path $regPath -Name 'DelegationTerminal' -Value '{86633F1F-6C40-4FA7-B9A0-E7E6D27C4B72}'
-    Write-Host '  Done: default terminal set.' -ForegroundColor Green
-}
-catch {
-    Write-Warning "  Failed to set default terminal: $_"
+    catch {
+        Write-Warning "  Failed to set default terminal: $_"
+    }
 }
 
 # 4. VS Code & VS Code Insiders — Nerd Font Mono for editor
-Write-Host 'Configuring VS Code editor font...' -ForegroundColor Cyan
+function Set-VSCodeFont {
+    param([string] $FontFaceMonoName)
 
-$vsCodeSettingsPaths = @(
-    (Join-Path $env:APPDATA 'Code\User\settings.json'),
-    (Join-Path $env:APPDATA 'Code - Insiders\User\settings.json')
-)
+    Write-Host 'Configuring VS Code editor font...' -ForegroundColor Cyan
 
-foreach ($settingsPath in $vsCodeSettingsPaths) {
-    $label = if ($settingsPath -match 'Insiders') { 'VS Code Insiders' } else { 'VS Code' }
+    $vsCodeSettingsPaths = @(
+        (Join-Path $env:APPDATA 'Code\User\settings.json'),
+        (Join-Path $env:APPDATA 'Code - Insiders\User\settings.json')
+    )
 
-    if (Test-Path $settingsPath) {
-        $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
-    }
-    else {
-        $settingsDir = Split-Path $settingsPath -Parent
-        if (-not (Test-Path $settingsDir)) {
-            New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+    foreach ($settingsPath in $vsCodeSettingsPaths) {
+        $label = if ($settingsPath -match 'Insiders') { 'VS Code Insiders' } else { 'VS Code' }
+
+        if (Test-Path $settingsPath) {
+            $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
         }
-        $settings = [PSCustomObject]@{}
-    }
+        else {
+            $settingsDir = Split-Path $settingsPath -Parent
+            if (-not (Test-Path $settingsDir)) {
+                New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+            }
+            $settings = [PSCustomObject]@{}
+        }
 
-    $fontValue = "'$fontFaceMono', Consolas, 'Courier New', monospace"
-    if ($settings.PSObject.Properties['editor.fontFamily']) {
-        $settings.'editor.fontFamily' = $fontValue
-    }
-    else {
-        $settings | Add-Member -NotePropertyName 'editor.fontFamily' -NotePropertyValue $fontValue -Force
-    }
+        $fontValue = "'$FontFaceMonoName', Consolas, 'Courier New', monospace"
+        if ($settings.PSObject.Properties['editor.fontFamily']) {
+            $settings.'editor.fontFamily' = $fontValue
+        }
+        else {
+            $settings | Add-Member -NotePropertyName 'editor.fontFamily' -NotePropertyValue $fontValue -Force
+        }
 
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsPath -Encoding UTF8
-    Write-Host "  Done: $label font configured." -ForegroundColor Green
+        $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsPath -Encoding UTF8
+        Write-Host "  Done: $label font configured." -ForegroundColor Green
+    }
 }
 
 # 5. Configure File Explorer options
-Write-Host 'Configuring File Explorer options...' -ForegroundColor Cyan
-try {
-    # Show file extensions
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Value 0
-    # Show hidden files
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'Hidden' -Value 1
-    # Show system files
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'ShowSuperHidden' -Value 1
-    # Show full path in title bar
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState' -Name 'FullPath' -Value 1
-    # Show "Run as different user" in Start (requires Group Policy or registry tweak)
-    $runAsKey = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
-    $runAsName = 'ShowRunAsDifferentUserInStart'
+function Set-FileExplorerOptions {
+    Write-Host 'Configuring File Explorer options...' -ForegroundColor Cyan
     try {
-        Set-ItemProperty -Path $runAsKey -Name $runAsName -Value 1 -Force
+        Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Value 0
+        Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'Hidden' -Value 1
+        Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'ShowSuperHidden' -Value 1
+        Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState' -Name 'FullPath' -Value 1
+        $runAsKey = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
+        $runAsName = 'ShowRunAsDifferentUserInStart'
+        try {
+            Set-ItemProperty -Path $runAsKey -Name $runAsName -Value 1 -Force
+        } catch {
+            Write-Warning "  Could not enable 'Run as different user' in Start menu. This setting may require admin rights or Group Policy access."
+            Write-Host "  To enable manually, open Group Policy Editor (gpedit.msc) and go to: User Configuration > Administrative Templates > Start Menu and Taskbar > Show 'Run as different user' command on Start. Or, open System Settings: " -ForegroundColor Yellow
+            Write-Host "  ms-settings:personalization-start" -ForegroundColor Cyan
+            Write-Host "  (Copy and paste the above URI into the Run dialog [Win+R] or a browser address bar.)" -ForegroundColor Yellow
+        }
+        Write-Host '  Done: File Explorer options configured.' -ForegroundColor Green
     } catch {
-        Write-Warning "  Could not enable 'Run as different user' in Start menu. This setting may require admin rights or Group Policy access."
-        Write-Host "  To enable manually, open Group Policy Editor (gpedit.msc) and go to: User Configuration > Administrative Templates > Start Menu and Taskbar > Show 'Run as different user' command on Start. Or, open System Settings: " -ForegroundColor Yellow
-        Write-Host "  ms-settings:personalization-start" -ForegroundColor Cyan
-        Write-Host "  (Copy and paste the above URI into the Run dialog [Win+R] or a browser address bar.)" -ForegroundColor Yellow
+        Write-Warning "  Failed to configure File Explorer options: $_"
     }
-    Write-Host '  Done: File Explorer options configured.' -ForegroundColor Green
-} catch {
-    Write-Warning "  Failed to configure File Explorer options: $_"
 }
 
 # 6. Post-install verification summary
-Write-Host "`nPost-install verification summary..." -ForegroundColor Cyan
 
 function Get-CommandVersion {
     param(
@@ -1123,75 +1162,155 @@ function Write-VerificationLine {
     }
 }
 
-$gitVersion = Get-CommandVersion -Command 'git'
-Write-VerificationLine -Label 'git' -Installed ([bool]$gitVersion) -Details $gitVersion
+function Show-VerificationSummary {
+    Write-Host "`nPost-install verification summary..." -ForegroundColor Cyan
 
-$nodeVersion = Get-CommandVersion -Command 'node'
-Write-VerificationLine -Label 'Node.js' -Installed ([bool]$nodeVersion) -Details $nodeVersion
+    $gitVersion = Get-CommandVersion -Command 'git'
+    Write-VerificationLine -Label 'git' -Installed ([bool]$gitVersion) -Details $gitVersion
 
-$npmVersion = Get-CommandVersion -Command 'npm'
-Write-VerificationLine -Label 'npm' -Installed ([bool]$npmVersion) -Details $npmVersion
+    $nodeVersion = Get-CommandVersion -Command 'node'
+    Write-VerificationLine -Label 'Node.js' -Installed ([bool]$nodeVersion) -Details $nodeVersion
 
-$ghVersion = Get-CommandVersion -Command 'gh'
-Write-VerificationLine -Label 'GitHub CLI' -Installed ([bool]$ghVersion) -Details $ghVersion
+    $npmVersion = Get-CommandVersion -Command 'npm'
+    Write-VerificationLine -Label 'npm' -Installed ([bool]$npmVersion) -Details $npmVersion
 
-$ghCopilotInstalled = $false
-$ghCopilotDetails = $null
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    try {
-        $ghExtensions = & gh extension list 2>$null
-        if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
-            $ghCopilotInstalled = $true
-            try {
-                $ghCopilotHelp = & gh copilot --help 2>$null
-                if ($ghCopilotHelp) {
+    $ghVersion = Get-CommandVersion -Command 'gh'
+    Write-VerificationLine -Label 'GitHub CLI' -Installed ([bool]$ghVersion) -Details $ghVersion
+
+    $ghCopilotInstalled = $false
+    $ghCopilotDetails = $null
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        try {
+            $ghExtensions = & gh extension list 2>$null
+            if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
+                $ghCopilotInstalled = $true
+                try {
+                    $ghCopilotHelp = & gh copilot --help 2>$null
+                    if ($ghCopilotHelp) {
+                        $ghCopilotDetails = 'gh extension installed'
+                    }
+                } catch {
                     $ghCopilotDetails = 'gh extension installed'
                 }
-            } catch {
-                $ghCopilotDetails = 'gh extension installed'
             }
+        } catch {
+            $ghCopilotDetails = 'unable to query gh extensions'
         }
-    } catch {
-        $ghCopilotDetails = 'unable to query gh extensions'
+    }
+    Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed $ghCopilotInstalled -Details $ghCopilotDetails
+
+    $workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
+    Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion
+
+    $ompVersion = Get-CommandVersion -Command 'oh-my-posh'
+    Write-VerificationLine -Label 'oh-my-posh' -Installed ([bool]$ompVersion) -Details $ompVersion
+
+    $vsCodeVerification = @(
+        @{ Editor = 'code'; Label = 'VS Code'; Extensions = @(
+            @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
+            @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
+            @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+            @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
+            @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
+        ) }
+        @{ Editor = 'code-insiders'; Label = 'VS Code Insiders'; Extensions = @(
+            @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
+            @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
+            @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
+            @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
+            @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
+        ) }
+    )
+
+    foreach ($editorInfo in $vsCodeVerification) {
+        if (-not (Get-Command $editorInfo.Editor -ErrorAction SilentlyContinue)) {
+            Write-VerificationLine -Label $editorInfo.Label -Installed $false -Details 'CLI not found on PATH'
+            continue
+        }
+
+        $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
+        Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
+        foreach ($extension in $editorInfo.Extensions) {
+            $isInstalled = $installedExtensions -contains $extension.Id
+            Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $extension.Id
+        }
     }
 }
-Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed $ghCopilotInstalled -Details $ghCopilotDetails
 
-$workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
-Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Main Orchestration ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-$ompVersion = Get-CommandVersion -Command 'oh-my-posh'
-Write-VerificationLine -Label 'oh-my-posh' -Installed ([bool]$ompVersion) -Details $ompVersion
+# Shared init (idempotent, both phases)
+$psModuleDir = Initialize-PSModulePath
+$profileInfo = Initialize-PSProfileDir
+$psProfileDir  = $profileInfo.Dir
+$psProfileFile = $profileInfo.File
 
-$vsCodeVerification = @(
-    @{ Editor = 'code'; Label = 'VS Code'; Extensions = @(
-        @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
-        @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
-        @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
-        @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
-        @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
-    ) }
-    @{ Editor = 'code-insiders'; Label = 'VS Code Insiders'; Extensions = @(
-        @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
-        @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
-        @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
-        @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
-        @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
-    ) }
-)
+Test-WingetAvailable
 
-foreach ($editorInfo in $vsCodeVerification) {
-    if (-not (Get-Command $editorInfo.Editor -ErrorAction SilentlyContinue)) {
-        Write-VerificationLine -Label $editorInfo.Label -Installed $false -Details 'CLI not found on PATH'
-        continue
+if ($Phase -eq 'Phase1') {
+    # ── Phase 1: Admin installs + Windows features + schedule Phase 2 ────────
+    Install-Chocolatey -IsAdmin $isAdmin
+    $chocoSkips = Install-ChocolateyPackages -IsAdmin $isAdmin -CurrentSkipPackages $SkipPackages
+    $SkipPackages += $chocoSkips
+    # Spotify requires non-admin install — skip in Phase 1
+    $SkipPackages += 'Spotify.Spotify'
+    Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE
+    Enable-WindowsFeatures -IsAdmin $isAdmin
+    Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
+    Update-PathFromRegistry
+    Install-GitHubCopilotCli
+    Install-WorkIqCli
+
+    # Register Phase 2 scheduled task (runs at logon as current user, non-elevated)
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ($scriptPath -and ($Work.IsPresent -or $Personal.IsPresent)) {
+        $modeSwitch = if ($Work.IsPresent) { '-Work' } else { '-Personal' }
+        $action   = New-ScheduledTaskAction -Execute 'pwsh' -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2"
+        $trigger  = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+        Write-Host "  Scheduled task '$taskName' registered for Phase 2 at next logon." -ForegroundColor Green
     }
 
-    $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
-    Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
-    foreach ($extension in $editorInfo.Extensions) {
-        $isInstalled = $installedExtensions -contains $extension.Id
-        Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $extension.Id
+    if (-not $SkipReboot) {
+        Write-Host 'Rebooting in 15 seconds... (Phase 2 will run at next logon)' -ForegroundColor Yellow
+        Write-Host 'Press Ctrl+C to cancel reboot.' -ForegroundColor Yellow
+        shutdown /r /t 15
+    } else {
+        Write-Host 'Phase 1 complete. Reboot skipped (-SkipReboot). Run Phase 2 manually or reboot to trigger it.' -ForegroundColor Yellow
     }
+} elseif ($Phase -eq 'Phase2') {
+    # ── Phase 2: User-space config + cleanup ─────────────────────────────────
+    # Install Spotify (requires non-admin)
+    Write-Host 'Installing Spotify (user-space)...' -ForegroundColor Cyan
+    winget install --id 'Spotify.Spotify' --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host '  Done: Spotify installed.' -ForegroundColor Green
+    } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
+        Write-Host '  Skipped: Spotify already running.' -ForegroundColor Yellow
+    } else {
+        Write-Warning "  winget exited with code $LASTEXITCODE for Spotify"
+    }
+
+    $fontInfo = Install-NerdFont -FontName $NerdFont -IsAdmin $isAdmin
+    $fontFace     = $fontInfo.Face
+    $fontFaceMono = $fontInfo.Mono
+
+    Set-PSGalleryTrust
+    Install-PSModules -ModuleDir $psModuleDir
+    Install-VSCodeExtensions
+    Set-OhMyPoshProfile -ThemeName $OmpTheme -ProfileDir $psProfileDir -ProfileFile $psProfileFile
+    Set-WindowsTerminalConfig -FontFaceName $fontFace
+    Set-DefaultTerminal
+    Set-VSCodeFont -FontFaceMonoName $fontFaceMono
+    Set-FileExplorerOptions
+    Show-VerificationSummary
+
+    # Clean up scheduled task
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "  Scheduled task '$taskName' cleaned up." -ForegroundColor Green
 }
 
 Write-Host "`nSetup complete." -ForegroundColor Green

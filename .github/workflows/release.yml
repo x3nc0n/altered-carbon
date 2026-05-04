@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches CHANGELOG
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME          # e.g. v1.0.0
+          $version = $tag -replace '^v', ''     # e.g. 1.0.0
+
+          $changelog = Get-Content ./CHANGELOG.md -Raw
+          if ($changelog -notmatch [regex]::Escape("[$version]")) {
+              Write-Error "Tag $tag does not have a matching entry in CHANGELOG.md"
+              exit 1
+          }
+
+          Write-Host "CHANGELOG entry found for $version" -ForegroundColor Green
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag -replace '^v', ''
+
+          $lines = Get-Content ./CHANGELOG.md
+          $capture = $false
+          $notes = @()
+
+          foreach ($line in $lines) {
+              if ($line -match "^\#\#\s*\[$([regex]::Escape($version))\]") {
+                  $capture = $true
+                  continue
+              }
+              if ($capture -and $line -match '^\#\#\s*\[') {
+                  break
+              }
+              if ($capture) {
+                  $notes += $line
+              }
+          }
+
+          $body = ($notes -join "`n").Trim()
+
+          # Use release notes file if it exists
+          $releaseNotesPath = "./releases/$tag.md"
+          if (Test-Path $releaseNotesPath) {
+              $body = Get-Content $releaseNotesPath -Raw
+              Write-Host "Using release notes from $releaseNotesPath" -ForegroundColor Green
+          }
+
+          # Write to file for the next step
+          Set-Content -Path ./release-body.md -Value $body -Encoding UTF8
+          Write-Host "Release notes:`n$body"
+
+      - name: Run PSScriptAnalyzer (gate)
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+          $results = Invoke-ScriptAnalyzer -Path ./altered-carbon.ps1 `
+            -Settings ./PSScriptAnalyzerSettings.psd1 -Recurse
+
+          if ($results | Where-Object Severity -in 'Error', 'Warning') {
+              $results | Format-List
+              Write-Error "PSScriptAnalyzer found issues — aborting release."
+              exit 1
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ./release-body.md
+          files: |
+            altered-carbon.ps1
+            night-owl.omp.json
+          fail_on_unmatched_files: false
