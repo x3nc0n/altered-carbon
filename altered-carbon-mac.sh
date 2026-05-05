@@ -396,21 +396,22 @@ fi
 
 # ── GitHub Copilot CLI ───────────────────────────────────────────────────────
 
-info "Ensuring GitHub Copilot CLI extension is installed..."
+info "Ensuring GitHub Copilot CLI is installed..."
 if command -v gh &>/dev/null; then
-    if gh auth status &>/dev/null; then
-        if gh extension list 2>/dev/null | grep -q 'gh-copilot'; then
-            info "  Updating GitHub Copilot CLI extension..."
-            gh extension upgrade github/gh-copilot &>/dev/null && ok "GitHub Copilot CLI extension is up to date." || warn "Failed to upgrade Copilot CLI extension."
+    if gh copilot --version &>/dev/null; then
+        ok "GitHub Copilot CLI is available."
+    elif gh auth status &>/dev/null; then
+        info "  GitHub Copilot CLI not detected. Attempting fallback install..."
+        if gh extension install github/gh-copilot &>/dev/null && gh copilot --version &>/dev/null; then
+            ok "GitHub Copilot CLI installed."
         else
-            info "  Installing GitHub Copilot CLI extension..."
-            gh extension install github/gh-copilot &>/dev/null && ok "GitHub Copilot CLI extension installed." || warn "Failed to install Copilot CLI extension."
+            warn "Failed to install GitHub Copilot CLI fallback."
         fi
     else
-        warn "GitHub CLI is not authenticated. Run 'gh auth login' first."
+        warn "GitHub Copilot CLI not detected and GitHub CLI is not authenticated. Run 'gh auth login' first."
     fi
 else
-    warn "GitHub CLI (gh) not found. Copilot CLI extension setup skipped."
+    warn "GitHub CLI (gh) not found. GitHub Copilot CLI setup skipped."
 fi
 echo ""
 
@@ -436,8 +437,6 @@ echo ""
 VSCODE_EXTENSIONS=(
     "ms-azuretools.vscode-azureresourcegroups|Azure Resources"
     "ms-azuretools.vscode-bicep|Bicep"
-    "github.copilot|GitHub Copilot"
-    "github.copilot-chat|GitHub Copilot Chat"
     "ms-azuretools.vscode-azure-github-copilot|GitHub Copilot for Azure"
     "ms-windows-ai-studio.windows-ai-studio|AI Toolkit for VS Code"
     "ms-security.ms-sentinel|Microsoft Sentinel"
@@ -782,6 +781,14 @@ def current_values(text):
             values[key] = value.strip().strip('"')
     return values
 
+
+def extract_key(raw_line):
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    return line.split("=", 1)[0].strip()
+
+
 text = path.read_text() if path.exists() else ""
 values = current_values(text)
 
@@ -800,19 +807,48 @@ if managed_start in clean_text and managed_end in clean_text:
     elif after:
         clean_text = after
 
-block = "\n".join([
+block_lines = [
     managed_start,
     f'font-family = "{font}"',
     f"font-size = {size}",
     f'theme = "{theme}"',
     managed_end,
-])
+]
+block = "\n".join(block_lines)
+managed_keys = {
+    key
+    for line in block_lines
+    if (key := extract_key(line))
+}
 
 new_text = clean_text.rstrip("\n")
 if new_text:
     new_text = f"{new_text}\n\n{block}\n"
 else:
     new_text = f"{block}\n"
+
+filtered_lines = []
+in_managed_block = False
+for raw_line in new_text.splitlines():
+    stripped = raw_line.strip()
+    if stripped == managed_start:
+        in_managed_block = True
+        filtered_lines.append(raw_line)
+        continue
+    if stripped == managed_end:
+        in_managed_block = False
+        filtered_lines.append(raw_line)
+        continue
+
+    key = extract_key(raw_line)
+    if not in_managed_block and key in managed_keys:
+        continue
+
+    filtered_lines.append(raw_line)
+
+new_text = "\n".join(filtered_lines)
+if new_text:
+    new_text = f"{new_text}\n"
 
 if new_text == text:
     print("unchanged")
@@ -921,8 +957,8 @@ else
 fi
 
 # GitHub Copilot CLI
-if command -v gh &>/dev/null && gh extension list 2>/dev/null | grep -q 'gh-copilot'; then
-    printf "${GREEN}  [OK]${NC} %-30s %s\n" "GitHub Copilot CLI" "gh extension installed"
+if gh copilot --version &>/dev/null; then
+    printf "${GREEN}  [OK]${NC} %-30s %s\n" "GitHub Copilot CLI" "$(gh copilot --version 2>&1 | head -1)"
 else
     printf "${YELLOW}  [MISSING]${NC} %-30s\n" "GitHub Copilot CLI"
 fi
@@ -944,6 +980,8 @@ for editor in code code-insiders; do
                 printf "${YELLOW}  [MISSING]${NC}   %-28s %s\n" "$ext_name" "$ext_id"
             fi
         done
+        printf "${GREEN}  [OK]${NC}   %-28s %s\n" "GitHub Copilot" "built-in"
+        printf "${GREEN}  [OK]${NC}   %-28s %s\n" "GitHub Copilot Chat" "built-in"
     fi
 done
 
