@@ -96,7 +96,7 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 | `--personal`, `-p` | Yes* | — | Install core + personal apps |
 | `--work`, `-w` | Yes* | — | Everything from personal + work-only apps |
 | `--omp-theme` | No | `night-owl` | oh-my-posh theme name (without `.omp.json`) |
-| `--nerd-font` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in editors |
+| `--nerd-font` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
 | `--skip` | No | _(none)_ | Brew formula/cask name to skip (repeatable) |
 | `--extra` | No | _(none)_ | Extra brew cask to install (repeatable) |
 
@@ -217,6 +217,7 @@ In addition to core apps:
 1. Windows App
 1. Logi Tune
 1. GitHub Copilot for Xcode
+1. Ghostty
 1. PowerShell modules (macOS-compatible subset):
     1. Microsoft.Graph
     1. Az
@@ -254,6 +255,7 @@ Work mode includes all personal apps plus work-specific additions. Currently a p
 1. oh-my-posh theme in zsh (`~/.zshrc`) and PowerShell (`$PROFILE`), default: `night-owl`
 1. Managed oh-my-posh config stored in `~/.config/altered-carbon/`
 1. Custom theme stored in `~/.config/oh-my-posh/themes/`
+1. Ghostty config at `~/.config/ghostty/config` updated with selected Nerd Font Mono variant, 14pt font size, and a dark theme (`night-owl` when available, `Catppuccin Frappe` fallback)
 1. VS Code and VS Code Insiders editor font set to selected Nerd Font Mono variant
 1. Finder: show all file extensions, show hidden files, show path bar, show status bar, list view, folders on top
 

@@ -137,6 +137,57 @@ resolve_terminal_font_ps_name() {
     printf '%s\n' "$ps_name"
 }
 
+resolve_ghostty_command() {
+    local candidate
+
+    for candidate in \
+        "/Applications/Ghostty.app/Contents/MacOS/ghostty" \
+        "$HOME/Applications/Ghostty.app/Contents/MacOS/ghostty"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v ghostty &>/dev/null; then
+        command -v ghostty
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_ghostty_theme() {
+    local fallback_theme="Catppuccin Frappe"
+    local ghostty_cmd=""
+    local theme_list=""
+    local theme_name=""
+    local theme_candidates=(
+        "night-owl"
+        "Night Owl"
+        "Night_Owl"
+    )
+
+    if ! ghostty_cmd="$(resolve_ghostty_command)"; then
+        printf '%s\n' "$fallback_theme"
+        return 0
+    fi
+
+    if ! theme_list="$("$ghostty_cmd" +list-themes 2>/dev/null)"; then
+        printf '%s\n' "$fallback_theme"
+        return 0
+    fi
+
+    for theme_name in "${theme_candidates[@]}"; do
+        if echo "$theme_list" | grep -Fxq "$theme_name"; then
+            printf '%s\n' "$theme_name"
+            return 0
+        fi
+    done
+
+    printf '%s\n' "$fallback_theme"
+}
+
 ensure_formula() {
     local formula="$1"
     local name="${2:-$formula}"
@@ -292,6 +343,8 @@ ensure_cask windows-app "Windows App" "Windows App"
 ensure_cask logitune "Logi Tune" "Logi Tune"
 ensure_cask github-copilot-for-xcode "GitHub Copilot for Xcode" "GitHub Copilot for Xcode"
 ensure_cask spotify "Spotify" "Spotify"
+ensure_cask rectangle "Rectangle" "Rectangle"
+ensure_cask ghostty "Ghostty" "Ghostty"
 
 echo ""
 
@@ -688,11 +741,109 @@ fi
 
 echo ""
 
+# ── Ghostty Configuration ───────────────────────────────────────────────────
+
+info "Configuring Ghostty..."
+
+FONT_FACE_MONO="${NERD_FONT} Nerd Font Mono"
+GHOSTTY_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ghostty"
+GHOSTTY_CONFIG_FILE="$GHOSTTY_CONFIG_DIR/config"
+GHOSTTY_FONT_SIZE=14
+GHOSTTY_THEME="$(resolve_ghostty_theme)"
+
+mkdir -p "$GHOSTTY_CONFIG_DIR"
+
+if ! command -v python3 &>/dev/null; then
+    warn "python3 not found. Ghostty configuration skipped."
+elif ghostty_config_result=$(python3 - "$GHOSTTY_CONFIG_FILE" "$FONT_FACE_MONO" "$GHOSTTY_FONT_SIZE" "$GHOSTTY_THEME" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).expanduser()
+font = sys.argv[2]
+size = sys.argv[3]
+theme = sys.argv[4]
+managed_start = "# altered-carbon: ghostty managed settings"
+managed_end = "# /altered-carbon: ghostty managed settings"
+desired = {
+    "font-family": font,
+    "font-size": size,
+    "theme": theme,
+}
+
+def current_values(text):
+    values = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = [part.strip() for part in line.split("=", 1)]
+        if key in desired:
+            values[key] = value.strip().strip('"')
+    return values
+
+text = path.read_text() if path.exists() else ""
+values = current_values(text)
+
+if managed_start not in text and all(values.get(key) == value for key, value in desired.items()):
+    print("unchanged")
+    sys.exit(0)
+
+clean_text = text
+if managed_start in clean_text and managed_end in clean_text:
+    before, remainder = clean_text.split(managed_start, 1)
+    _, after = remainder.split(managed_end, 1)
+    clean_text = before.rstrip("\n")
+    after = after.lstrip("\n")
+    if clean_text and after:
+        clean_text = f"{clean_text}\n\n{after}"
+    elif after:
+        clean_text = after
+
+block = "\n".join([
+    managed_start,
+    f'font-family = "{font}"',
+    f"font-size = {size}",
+    f'theme = "{theme}"',
+    managed_end,
+])
+
+new_text = clean_text.rstrip("\n")
+if new_text:
+    new_text = f"{new_text}\n\n{block}\n"
+else:
+    new_text = f"{block}\n"
+
+if new_text == text:
+    print("unchanged")
+else:
+    path.write_text(new_text)
+    print("updated")
+PY
+); then
+    case "$ghostty_config_result" in
+        unchanged)
+            skip "Ghostty config already sets $FONT_FACE_MONO at ${GHOSTTY_FONT_SIZE}pt with theme '$GHOSTTY_THEME'."
+            ;;
+        updated)
+            ok "Ghostty config set to $FONT_FACE_MONO at ${GHOSTTY_FONT_SIZE}pt with theme '$GHOSTTY_THEME'."
+            ;;
+        *)
+            warn "Failed to configure Ghostty."
+            ;;
+    esac
+else
+    warn "Failed to configure Ghostty."
+fi
+
+skip "macOS default terminal remains unchanged. Set Ghostty manually if desired."
+
+echo ""
+
 # ── VS Code Font Configuration ──────────────────────────────────────────────
 
 info "Configuring VS Code editor font..."
 
-FONT_FACE_MONO="${NERD_FONT} Nerd Font Mono"
 # VS Code uses the family name, not the PostScript name used by Terminal.app.
 
 for settings_dir in \
@@ -762,6 +913,12 @@ verify "oh-my-posh" oh-my-posh
 verify "Docker" docker
 verify "Azure CLI" az "--version"
 verify "Ruby" ruby "--version"
+
+if app_exists "Ghostty"; then
+    printf "${GREEN}  [OK]${NC} %-30s %s\n" "Ghostty" "Installed (${APP_EXISTS_LOCATION})"
+else
+    printf "${YELLOW}  [MISSING]${NC} %-30s\n" "Ghostty"
+fi
 
 # GitHub Copilot CLI
 if command -v gh &>/dev/null && gh extension list 2>/dev/null | grep -q 'gh-copilot'; then
