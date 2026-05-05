@@ -1180,21 +1180,28 @@ function Show-VerificationSummary {
     $ghCopilotInstalled = $false
     $ghCopilotDetails = $null
     if (Get-Command gh -ErrorAction SilentlyContinue) {
+        # First: check if gh copilot is available as a built-in subcommand
         try {
-            $ghExtensions = & gh extension list 2>$null
-            if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
+            $null = & gh copilot --help 2>$null
+            if ($LASTEXITCODE -eq 0) {
                 $ghCopilotInstalled = $true
-                try {
-                    $ghCopilotHelp = & gh copilot --help 2>$null
-                    if ($ghCopilotHelp) {
-                        $ghCopilotDetails = 'gh extension installed'
-                    }
-                } catch {
-                    $ghCopilotDetails = 'gh extension installed'
-                }
+                $ghCopilotDetails = 'built-in subcommand'
             }
         } catch {
-            $ghCopilotDetails = 'unable to query gh extensions'
+            $null = $_  # built-in not available; fall through to extension check
+        }
+
+        # Fallback: check for the gh-copilot extension
+        if (-not $ghCopilotInstalled) {
+            try {
+                $ghExtensions = & gh extension list 2>$null
+                if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
+                    $ghCopilotInstalled = $true
+                    $ghCopilotDetails = 'gh extension installed'
+                }
+            } catch {
+                $ghCopilotDetails = 'unable to query gh extensions'
+            }
         }
     }
     Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed $ghCopilotInstalled -Details $ghCopilotDetails
@@ -1230,9 +1237,19 @@ function Show-VerificationSummary {
 
         $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
         Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
+
+        # github.copilot and github.copilot-chat have been consolidated — either presence satisfies both
+        $copilotPairIds = @('github.copilot', 'github.copilot-chat')
+        $copilotPairPresent = [bool]($copilotPairIds | Where-Object { $installedExtensions -contains $_ })
+
         foreach ($extension in $editorInfo.Extensions) {
             $isInstalled = $installedExtensions -contains $extension.Id
-            Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $extension.Id
+            $details = $extension.Id
+            if ($extension.Id -in $copilotPairIds -and -not $isInstalled -and $copilotPairPresent) {
+                $isInstalled = $true
+                $details = "$($extension.Id) (consolidated)"
+            }
+            Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $details
         }
     }
 }
