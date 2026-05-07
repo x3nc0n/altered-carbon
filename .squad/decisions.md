@@ -72,6 +72,36 @@ Three-workflow CI/CD pipeline created:
 - **Rationale:** The macOS bootstrap installs Nerd Fonts and configures VS Code, but Terminal.app kept its existing font. This keeps the bootstrap idempotent, uses the existing `--nerd-font` option, and avoids relying on AppleScript automation permissions.
 - **Status:** Implementation complete and tested (8 passing tests).
 
+### Post-install verification logic fixes (Tank, 2026-05-05)
+
+**Severity:** Medium
+
+`Show-VerificationSummary` in `altered-carbon.ps1` had two detection bugs that caused false MISSING results on an otherwise correctly-configured machine.
+
+**Decision 1: GitHub Copilot CLI — prefer built-in subcommand over extension**
+
+GitHub has rolled Copilot CLI functionality directly into the `gh` binary as a built-in subcommand. Running `gh extension list` returns "no installed extensions found" even when `gh copilot --help` works perfectly, so the old extension-only check produced a false negative.
+
+New logic:
+1. Run `gh copilot --help`; if exit code is 0, mark installed with `'built-in subcommand'`.
+2. Only if the built-in check fails, fall back to scanning `gh extension list` for `gh-copilot`; if found, mark installed with `'gh extension installed'`.
+3. If neither passes, report MISSING.
+
+**Decision 2: VS Code Copilot extensions — treat github.copilot + github.copilot-chat as a consolidated pair**
+
+GitHub consolidated `github.copilot` and `github.copilot-chat` into a single distributed extension. VS Code stable lists only `github.copilot-chat`; VS Code Insiders lists only `github.copilot`. Both represent full Copilot functionality.
+
+New logic:
+- Before iterating extensions, compute whether either ID in the pair is present in the installed list.
+- For each member of the pair: if it is not directly installed but its partner is, mark it installed with `(consolidated)` appended to the details string.
+- Extensions outside the pair are unaffected.
+
+### User directive: Spotify in core packages (2026-04-28)
+
+**By:** John Spaid (via Copilot)
+
+Spotify in core packages (Work mode) is intentional — do not move it to personal-only. This is a user request and intentional design decision.
+
 ## Governance
 
 - All meaningful changes require team consensus
