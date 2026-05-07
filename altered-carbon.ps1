@@ -44,8 +44,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# winget exit code when the target app is currently running.
-$WINGET_APP_IN_USE = -1978335189  # 0x8A150077
+# winget exit codes that require explicit handling for idempotent installs.
+$WINGET_NO_APPLICABLE_UPGRADE = -1978335189  # 0x8A15002B
+$WINGET_PACKAGE_NOT_FOUND     = -1978335212  # 0x8A150014
+$WINGET_APP_IN_USE            = -1978335113  # 0x8A150077
 
 # ── Transcript Logging ────────────────────────────────────────────────────────
 $logFile = Join-Path $env:USERPROFILE ".altered-carbon-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -124,6 +126,12 @@ function Get-WingetVersionInfo {
         Version   = if ($version) { $version } else { $null }
         Available = if ($available) { $available } else { $null }
     }
+}
+
+function Test-WingetKnownVersion {
+    param([string] $Version)
+
+    return -not [string]::IsNullOrWhiteSpace($Version) -and $Version -ne 'Unknown'
 }
 
 function Invoke-ElevatedFontPromotion {
@@ -344,7 +352,7 @@ $corePackages = @(
 $personalPackages = @(
     @{ Id = 'Valve.Steam';                                  Name = 'Steam';                  Source = 'winget' }
     @{ Id = 'Discord.Discord';                              Name = 'Discord';                Source = 'winget' }
-    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net';             Source = 'winget' }
+    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net';             Source = 'winget'; Location = 'C:\Program Files (x86)\Battle.net' }
     @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal';                 Source = 'winget' }
     @{ Id = 'Google.Chrome';                                Name = 'Google Chrome';          Source = 'winget' }
     @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser';          Source = 'winget' }
@@ -361,7 +369,9 @@ function Install-WingetPackages {
         [bool] $Personal,
         [string[]] $SkipPackages = @(),
         [hashtable[]] $ExtraPackages = @(),
-        [int] $AppInUseExitCode
+        [int] $AppInUseExitCode,
+        [int] $NoApplicableUpgradeExitCode,
+        [int] $PackageNotFoundExitCode
     )
 
     # Build the final package list based on mode
@@ -383,6 +393,10 @@ function Install-WingetPackages {
 
         # Determine source (default to 'winget' if not specified)
         $source = if ($pkg.Source) { $pkg.Source } else { 'winget' }
+        $wingetArgs = @('--id', $pkg.Id, '--exact', '--source', $source, '--accept-source-agreements', '--accept-package-agreements', '--silent')
+        if ($pkg.Location) {
+            $wingetArgs += @('--location', $pkg.Location)
+        }
 
         # Generic handling for all packages
         $installedVersion = $null
@@ -407,38 +421,47 @@ function Install-WingetPackages {
 
         # If no available version in list output, check search output
         $latestVersion = $availableVersion
-        if (-not $latestVersion) {
+        if (-not (Test-WingetKnownVersion -Version $latestVersion)) {
             $searchLines = winget search --id $pkg.Id --exact --source $source --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
             $searchInfo = Get-WingetVersionInfo -Lines $searchLines -PackageId $pkg.Id
-            if ($searchInfo -and $searchInfo.Version) {
+            if ($searchInfo -and (Test-WingetKnownVersion -Version $searchInfo.Version)) {
                 $latestVersion = $searchInfo.Version
             }
         }
 
         if ($installedVersion) {
-            if ($latestVersion -and $installedVersion -ne $latestVersion) {
+            if ((Test-WingetKnownVersion -Version $latestVersion) -and $installedVersion -ne $latestVersion) {
                 Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
             } else {
                 Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
             }
 
-            winget upgrade --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --include-unknown --silent
+            & winget upgrade @wingetArgs --include-unknown
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
+                continue
+            } elseif ($LASTEXITCODE -eq $NoApplicableUpgradeExitCode) {
+                Write-Host "  Done: $($pkg.Name) is already up to date." -ForegroundColor Green
+                continue
             } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
                 Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
-            } else {
+                continue
+            } elseif ($LASTEXITCODE -ne $PackageNotFoundExitCode) {
                 Write-Warning "  winget exited with code $LASTEXITCODE while checking/upgrading $($pkg.Name)"
+                continue
             }
-            continue
+
+            Write-Warning "  winget could not map the installed package to $($pkg.Id) for upgrade. Trying install to reconcile package metadata."
         }
 
         Write-Host "  Installing $($pkg.Name)..." -ForegroundColor Cyan
-        winget install --id $pkg.Id --exact --source $source --accept-source-agreements --accept-package-agreements --silent
+        & winget install @wingetArgs
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Done: $($pkg.Name) installed." -ForegroundColor Green
         } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
             Write-Warning "  $($pkg.Name) installer reports the app is in use. Close it and re-run to complete installation."
+        } elseif ($LASTEXITCODE -eq $PackageNotFoundExitCode) {
+            Write-Warning "  $($pkg.Name) is not available from the configured sources. Verify the package ID and source."
         } else {
             Write-Warning "  winget exited with code $LASTEXITCODE for $($pkg.Name)"
         }
@@ -453,8 +476,16 @@ function Enable-WindowsFeatures {
     Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
 
     if ($IsAdmin) {
+        try {
+            $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop
+            $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction Stop
+            $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
+        } catch {
+            Write-Warning "  Windows optional feature management is unavailable on this system ($($_.Exception.Message)). Skipping Hyper-V and WSL 2 configuration."
+            return
+        }
+
         # Enable Hyper-V
-        $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
         if ($hypervState -and $hypervState.State -eq 'Enabled') {
             Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
         } else {
@@ -467,9 +498,6 @@ function Enable-WindowsFeatures {
         }
 
         # Enable WSL 2
-        $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
-        $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction SilentlyContinue
-
         if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
             Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
         } else {
@@ -1273,7 +1301,7 @@ if ($Phase -eq 'Phase1') {
     $SkipPackages += $chocoSkips
     # Spotify requires non-admin install — skip in Phase 1
     $SkipPackages += 'Spotify.Spotify'
-    Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE
+    Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND
     Enable-WindowsFeatures -IsAdmin $isAdmin
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
     Update-PathFromRegistry

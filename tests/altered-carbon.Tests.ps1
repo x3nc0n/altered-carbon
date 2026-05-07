@@ -16,6 +16,10 @@ BeforeAll {
     # Also extract key data structures (package arrays) by evaluating variable assignments.
     # We'll parse them manually from the script content for test assertions.
     $scriptContent = Get-Content $scriptPath -Raw
+    $wingetConstants = @{}
+    [regex]::Matches($scriptContent, '(?m)^\$(WINGET_[A-Z_]+)\s*=\s*(-?\d+)') | ForEach-Object {
+        $wingetConstants[$_.Groups[1].Value] = [int64]$_.Groups[2].Value
+    }
 }
 
 Describe 'Script Parse Validation' {
@@ -119,6 +123,43 @@ Describe 'Get-CommandVersion' {
     }
 }
 
+Describe 'Winget constants' {
+    It 'defines the expected exit code constants' {
+        $wingetConstants.Keys | Should -Contain 'WINGET_NO_APPLICABLE_UPGRADE'
+        $wingetConstants.Keys | Should -Contain 'WINGET_PACKAGE_NOT_FOUND'
+        $wingetConstants.Keys | Should -Contain 'WINGET_APP_IN_USE'
+    }
+
+    It 'assigns the correct exit code values' {
+        $wingetConstants.WINGET_NO_APPLICABLE_UPGRADE | Should -Be -1978335189
+        $wingetConstants.WINGET_PACKAGE_NOT_FOUND | Should -Be -1978335212
+        $wingetConstants.WINGET_APP_IN_USE | Should -Be -1978335113
+    }
+}
+
+Describe 'Test-WingetKnownVersion' {
+    It 'returns true for real version strings' -TestCases @(
+        @{ Version = '1.2.3' }
+        @{ Version = '7.4.2' }
+        @{ Version = '2026.5.1-preview' }
+    ) {
+        param($Version)
+
+        Test-WingetKnownVersion -Version $Version | Should -BeTrue
+    }
+
+    It 'returns false for null, blank, whitespace, and Unknown values' -TestCases @(
+        @{ Version = $null; Label = 'null' }
+        @{ Version = ''; Label = 'empty string' }
+        @{ Version = '   '; Label = 'whitespace' }
+        @{ Version = 'Unknown'; Label = 'Unknown' }
+    ) {
+        param($Version, $Label)
+
+        Test-WingetKnownVersion -Version $Version | Should -BeFalse -Because "$Label should not count as a known version"
+    }
+}
+
 Describe 'Write-VerificationLine' {
     It 'runs without error for installed=true' {
         { Write-VerificationLine -Label 'test' -Installed $true -Details 'v1.0' } | Should -Not -Throw
@@ -151,6 +192,10 @@ Describe 'Package Data Integrity' {
         $allIds | Should -Contain 'GitHub.cli'
         $allIds | Should -Contain 'JanDeDobbeleer.OhMyPosh'
         $allIds | Should -Contain 'Git.Git'
+    }
+
+    It 'defines a custom install location for Blizzard Battle.net' {
+        $scriptContent | Should -Match "Id\s*=\s*'Blizzard\.BattleNet'.*Location\s*=\s*'C:\\Program Files \(x86\)\\Battle\.net'"
     }
 
     It 'has no duplicate package IDs within the same list' {
@@ -211,5 +256,163 @@ Describe 'Package List Logic' {
 
     It 'adds personal packages only in Personal mode' {
         $scriptContent | Should -Match 'if\s*\(\$Personal\)\s*\{[^}]*\$wingetPackages\s*\+=\s*\$personalPackages'
+    }
+}
+
+Describe 'Install-WingetPackages' {
+    BeforeEach {
+        $script:corePackages = @()
+        $script:personalPackages = @()
+        $script:wingetCalls = [System.Collections.Generic.List[object[]]]::new()
+        $script:wingetResponses = [System.Collections.Generic.Queue[hashtable]]::new()
+
+        function global:winget {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Args)
+
+            $script:wingetCalls.Add(@($Args))
+            if ($script:wingetResponses.Count -eq 0) {
+                throw "Unexpected winget invocation: $($Args -join ' ')"
+            }
+
+            $response = $script:wingetResponses.Dequeue()
+            $global:LASTEXITCODE = $response.ExitCode
+
+            foreach ($line in $response.Output) {
+                $line
+            }
+        }
+    }
+
+    AfterEach {
+        Remove-Item function:\global:winget -ErrorAction SilentlyContinue
+    }
+
+    It 'treats no-applicable-upgrade as success without falling back to install' {
+        $script:corePackages = @(
+            @{ Id = 'Contoso.App'; Name = 'Contoso App'; Source = 'winget' }
+        )
+
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @(
+                    'Name                   Id           Version    Available  Source'
+                    '----------------------------------------------------------------'
+                    'Contoso App            Contoso.App  1.0.0      1.0.0      winget'
+                )
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335189
+                Output   = @()
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 1
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 0
+    }
+
+    It 'falls back from upgrade to install when winget cannot map a package for upgrade' {
+        $script:corePackages = @(
+            @{ Id = 'Contoso.App'; Name = 'Contoso App'; Source = 'winget' }
+        )
+
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @(
+                    'Name                   Id           Version    Available  Source'
+                    '----------------------------------------------------------------'
+                    'Contoso App            Contoso.App  1.0.0      2.0.0      winget'
+                )
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335212
+                Output   = @()
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @()
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 1
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 1
+    }
+
+    It 'warns clearly when install also returns package-not-found' {
+        Mock Write-Warning {}
+        $script:corePackages = @(
+            @{ Id = 'Contoso.App'; Name = 'Contoso App'; Source = 'winget' }
+        )
+
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @(
+                    'Name                   Id           Version    Available  Source'
+                    '----------------------------------------------------------------'
+                    'Contoso App            Contoso.App  1.0.0      2.0.0      winget'
+                )
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335212
+                Output   = @()
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335212
+                Output   = @()
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        Assert-MockCalled Write-Warning -Times 1 -ParameterFilter {
+            $Message -like '*not available from the configured sources*'
+        }
+    }
+
+    It 'passes package location through to winget install arguments' {
+        $script:corePackages = @(
+            @{ Id = 'Blizzard.BattleNet'; Name = 'Battle.net'; Source = 'winget'; Location = 'C:\Program Files (x86)\Battle.net' }
+        )
+
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No installed package found matching input criteria.')
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No installed package found matching input criteria.')
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No package found matching input criteria.')
+            })
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @()
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        $installArgs = $script:wingetCalls | Where-Object { $_[0] -eq 'install' } | Select-Object -First 1
+        $installArgs | Should -Contain '--location'
+        $installArgs | Should -Contain 'C:\Program Files (x86)\Battle.net'
+    }
+}
+
+Describe 'Enable-WindowsFeatures' {
+    It 'skips gracefully when optional feature management is unavailable' {
+        Mock Get-WindowsOptionalFeature {
+            throw [System.InvalidOperationException]::new('Class not registered')
+        }
+        Mock Enable-WindowsOptionalFeature {}
+        Mock Write-Warning {}
+
+        Enable-WindowsFeatures -IsAdmin $true
+
+        Assert-MockCalled Get-WindowsOptionalFeature -Times 1
+        Assert-MockCalled Enable-WindowsOptionalFeature -Times 0
+        Assert-MockCalled Write-Warning -Times 1 -ParameterFilter {
+            $Message -like '*feature management is unavailable*'
+        }
     }
 }
