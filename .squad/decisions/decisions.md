@@ -1,5 +1,21 @@
 # Decisions Archive
 
+## 2026-05-07: winget exit-code regression coverage in Pester tests
+
+**Date:** 2026-05-07T16:54:11.295-05:00  
+**Author:** Mouse (Tester)  
+**Scope:** `tests/altered-carbon.Tests.ps1`
+
+### Decision
+
+Keep regression coverage for `altered-carbon.ps1` side-effect free by AST-loading function definitions, then inject package lists and mock `winget`, `Get-WindowsOptionalFeature`, and `Enable-WindowsOptionalFeature` for exit-code and feature-management scenarios.
+
+### Why
+
+The new winget handling depends on `$LASTEXITCODE`, optional `--location` arguments, and upgrade-to-install fallback behavior that should be tested without performing real installs. Mocked command-level tests give us deterministic coverage for idempotency paths and "Class not registered" skips while staying aligned with the existing test architecture.
+
+---
+
 ## 2026-05-07: winget exit-code handling for idempotent Windows installs
 
 **Date:** 2026-05-07T16:54:11.295-05:00  
