@@ -63,10 +63,9 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 
 # ── Phase Detection ────────────────────────────────────────────────────────────
 $taskName = 'altered-carbon-phase2'
-$phase2MarkerExists = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 
 if ($Phase -eq 'Auto') {
-    if ($isAdmin -and -not $phase2MarkerExists) {
+    if ($isAdmin) {
         $Phase = 'Phase1'
     } else {
         $Phase = 'Phase2'
@@ -1359,6 +1358,14 @@ Test-WingetAvailable
 
 if ($Phase -eq 'Phase1') {
     # ── Phase 1: Admin installs + Windows features + schedule Phase 2 ────────
+
+    # Clean up any leftover Phase 2 scheduled task from a previous run
+    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "  Cleaned up leftover '$taskName' scheduled task from previous run." -ForegroundColor Yellow
+    }
+
     Install-Chocolatey -IsAdmin $isAdmin
     $chocoSkips = Install-ChocolateyPackages -IsAdmin $isAdmin -CurrentSkipPackages $SkipPackages
     $SkipPackages += $chocoSkips
