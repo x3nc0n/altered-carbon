@@ -102,6 +102,23 @@ New logic:
 
 Spotify in core packages (Work mode) is intentional — do not move it to personal-only. This is a user request and intentional design decision.
 
+### Winget source reconciliation for renamed or unavailable packages (Tank, 2026-05-07)
+
+**Severity:** High
+
+Recent Phase 1 and Phase 2 runs showed three recurring automation failures:
+1. winget was logging "Updating X from newer to older Y" when the catalog version was behind the installed version.
+2. Some package IDs had drifted (`PrivateInternetAccess.PrivateInternetAccessVPN`, `LMStudio.LMStudio`).
+3. Some requested packages are no longer discoverable from the configured sources (Adobe Lightroom, Xbox app, NVIDIA App), and some PowerShell modules are not PSGallery content (`ActiveDirectory`, `PSKusto`).
+
+**Decision:**
+- Compare installed and available versions before logging an upgrade. If the installed version is newer, skip with an explicit message instead of claiming an update is happening.
+- Update renamed package IDs when `winget search` confirms a replacement.
+- When a package or module is not actually available from the configured automation source, skip it with actionable manual guidance instead of retrying a known-bad install path every run.
+- Treat GitHub Copilot CLI as built into `gh` when `gh copilot --help` succeeds, and skip extension install in that case.
+
+**Impact:** Logs stay trustworthy and idempotent re-runs stay quiet. Package drift is handled explicitly instead of generating repeated false failures. Team members have a clear rule for future package/module churn: verify the source first, then either update the ID or convert the item to a documented manual step.
+
 ## Governance
 
 - All meaningful changes require team consensus
