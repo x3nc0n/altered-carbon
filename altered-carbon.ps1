@@ -1495,4 +1495,8 @@ if ($Phase -eq 'Phase1') {
 
 Write-Host "`nSetup complete." -ForegroundColor Green
 
+if ($Phase -eq 'Phase2') {
+    Read-Host 'Press Enter to close this window'
+}
+
 try { Stop-Transcript } catch { }
