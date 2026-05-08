@@ -419,6 +419,13 @@ function Install-WingetPackages {
             }
         }
 
+        # Fallback: if a Location is specified and that path exists, treat as installed.
+        # Some installers (e.g. Battle.net) don't register with winget in a detectable way.
+        if (-not $installedVersion -and $pkg.Location -and (Test-Path $pkg.Location)) {
+            $installedVersion = 'detected'
+            Write-Host "  $($pkg.Name) detected at $($pkg.Location)." -ForegroundColor Green
+        }
+
         # If no available version in list output, check search output
         $latestVersion = $availableVersion
         if (-not (Test-WingetKnownVersion -Version $latestVersion)) {

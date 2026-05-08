@@ -370,6 +370,8 @@ Describe 'Install-WingetPackages' {
     }
 
     It 'passes package location through to winget install arguments' {
+        Mock Test-Path { $false } -ParameterFilter { $Path -eq 'C:\Program Files (x86)\Battle.net' }
+
         $script:corePackages = @(
             @{ Id = 'Blizzard.BattleNet'; Name = 'Battle.net'; Source = 'winget'; Location = 'C:\Program Files (x86)\Battle.net' }
         )
@@ -396,6 +398,41 @@ Describe 'Install-WingetPackages' {
         $installArgs = $script:wingetCalls | Where-Object { $_[0] -eq 'install' } | Select-Object -First 1
         $installArgs | Should -Contain '--location'
         $installArgs | Should -Contain 'C:\Program Files (x86)\Battle.net'
+    }
+
+    It 'detects installed package via Location path when winget cannot find it' {
+        Mock Test-Path { $true } -ParameterFilter { $Path -eq 'C:\Program Files (x86)\Battle.net' }
+
+        $script:corePackages = @(
+            @{ Id = 'Blizzard.BattleNet'; Name = 'Battle.net'; Source = 'winget'; Location = 'C:\Program Files (x86)\Battle.net' }
+        )
+
+        # winget list --id returns nothing
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No installed package found matching input criteria.')
+            })
+        # winget list --name returns nothing
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No installed package found matching input criteria.')
+            })
+        # winget search (for latest version) returns nothing
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('No package found matching input criteria.')
+            })
+        # winget upgrade (since detected as installed)
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335189
+                Output   = @()
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        # Should attempt upgrade (not install) since it was detected via filesystem
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 1
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 0
     }
 }
 
