@@ -254,6 +254,7 @@ Describe 'Script Structure' {
         $fnNames = $functionDefs | ForEach-Object { $_.Name }
         $fnNames | Should -Contain 'Get-WingetVersionInfo'
         $fnNames | Should -Contain 'Compare-WingetVersions'
+        $fnNames | Should -Contain 'Stop-WingetUpgradeProcess'
         $fnNames | Should -Contain 'Invoke-ElevatedFontPromotion'
         $fnNames | Should -Contain 'Install-GitHubCopilotCli'
         $fnNames | Should -Contain 'Get-CommandVersion'
@@ -281,6 +282,11 @@ Describe 'Script Structure' {
     It 'handles Spotify ShellExecute install failures explicitly' {
         $scriptContent | Should -Match '\$LASTEXITCODE -eq \$WINGET_SHELLEXEC_INSTALL_FAILED'
         $scriptContent | Should -Match 'ShellExecute failed'
+    }
+
+    It 'defines a pre-upgrade process stop map for LM Studio' {
+        $scriptContent | Should -Match "'ElementLabs\.LMStudio'\s*=\s*@\('LM Studio'\)"
+        $scriptContent | Should -Match 'Stop-WingetUpgradeProcess\s+-Package\s+\$pkg\s+-PackageProcessMap\s+\$upgradeProcessMap'
     }
 }
 
@@ -500,6 +506,40 @@ Describe 'Install-WingetPackages' {
         Assert-MockCalled Write-Host -Times 1 -ParameterFilter {
             $Object -like '*installed version (2.0.0) is newer than available (1.5.0)*'
         }
+    }
+}
+
+Describe 'Stop-WingetUpgradeProcess' {
+    It 'stops mapped running processes and waits before upgrade' {
+        Mock Get-Process { [pscustomobject]@{ Id = 4242; ProcessName = 'LM Studio' } } -ParameterFilter { $Name -eq 'LM Studio' }
+        Mock Stop-Process {}
+        Mock Start-Sleep {}
+        Mock Write-Host {}
+
+        Stop-WingetUpgradeProcess -Package @{ Id = 'ElementLabs.LMStudio'; Name = 'LM Studio' } -PackageProcessMap @{
+            'ElementLabs.LMStudio' = @('LM Studio')
+        }
+
+        Assert-MockCalled Get-Process -Times 1 -ParameterFilter { $Name -eq 'LM Studio' }
+        Assert-MockCalled Stop-Process -Times 1
+        Assert-MockCalled Start-Sleep -Times 1 -ParameterFilter { $Seconds -eq 3 }
+        Assert-MockCalled Write-Host -Times 1 -ParameterFilter {
+            $Object -like '*Stopping running process(es) before upgrade: LM Studio.*'
+        }
+    }
+
+    It 'does nothing when the package is not in the stop map' {
+        Mock Get-Process {}
+        Mock Stop-Process {}
+        Mock Start-Sleep {}
+
+        Stop-WingetUpgradeProcess -Package @{ Id = 'Contoso.App'; Name = 'Contoso App' } -PackageProcessMap @{
+            'ElementLabs.LMStudio' = @('LM Studio')
+        }
+
+        Assert-MockCalled Get-Process -Times 0
+        Assert-MockCalled Stop-Process -Times 0
+        Assert-MockCalled Start-Sleep -Times 0
     }
 }
 

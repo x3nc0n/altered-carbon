@@ -164,6 +164,37 @@ function Compare-WingetVersions {
     return 0
 }
 
+function Stop-WingetUpgradeProcess {
+    [CmdletBinding()]
+    param(
+        [hashtable] $Package,
+        [hashtable] $PackageProcessMap,
+        [int] $WaitSeconds = 3
+    )
+
+    if (-not $PackageProcessMap.ContainsKey($Package.Id)) {
+        return
+    }
+
+    $processNames = @($PackageProcessMap[$Package.Id]) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($processNames.Count -eq 0) {
+        return
+    }
+
+    $runningProcesses = foreach ($processName in $processNames) {
+        Get-Process -Name $processName -ErrorAction SilentlyContinue
+    }
+    $runningProcesses = @($runningProcesses | Sort-Object Id -Unique)
+    if ($runningProcesses.Count -eq 0) {
+        return
+    }
+
+    $stoppedProcessNames = $runningProcesses | Select-Object -ExpandProperty ProcessName -Unique
+    Write-Host "  Stopping running process(es) before upgrade: $($stoppedProcessNames -join ', ')." -ForegroundColor Yellow
+    $runningProcesses | Stop-Process -ErrorAction Stop
+    Start-Sleep -Seconds $WaitSeconds
+}
+
 function Invoke-ElevatedFontPromotion {
     # Write a small helper script to a temp file and run it elevated so that
     # per-user Nerd Font files are copied to the system Fonts directory and
@@ -419,6 +450,10 @@ function Install-WingetPackages {
         $wingetPackages += $ExtraPackages
     }
 
+    $upgradeProcessMap = @{
+        'ElementLabs.LMStudio' = @('LM Studio')
+    }
+
     foreach ($pkg in $wingetPackages) {
         Write-Host "Checking $($pkg.Name) ($($pkg.Id))..." -ForegroundColor Cyan
 
@@ -478,6 +513,7 @@ function Install-WingetPackages {
                 Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
             }
 
+            Stop-WingetUpgradeProcess -Package $pkg -PackageProcessMap $upgradeProcessMap
             & winget upgrade @wingetArgs --include-unknown
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
