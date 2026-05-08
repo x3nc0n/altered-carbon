@@ -1312,17 +1312,21 @@ if ($Phase -eq 'Phase1') {
     $scriptPath = $MyInvocation.MyCommand.Path
     if ($scriptPath -and ($Work.IsPresent -or $Personal.IsPresent)) {
         $modeSwitch = if ($Work.IsPresent) { '-Work' } else { '-Personal' }
-        $action   = New-ScheduledTaskAction -Execute 'pwsh' -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2"
-        $trigger  = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+        $pwshPath   = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+        if (-not $pwshPath) { $pwshPath = 'pwsh' }
+        $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2"
+        $trigger   = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         Write-Host "  Scheduled task '$taskName' registered for Phase 2 at next logon." -ForegroundColor Green
     }
 
     if (-not $SkipReboot) {
-        Write-Host 'Rebooting in 15 seconds... (Phase 2 will run at next logon)' -ForegroundColor Yellow
-        Write-Host 'Press Ctrl+C to cancel reboot.' -ForegroundColor Yellow
-        shutdown /r /t 15
+        Write-Host ''
+        Write-Host 'Phase 1 complete. A reboot is required for Phase 2.' -ForegroundColor Yellow
+        Read-Host 'Press Enter to reboot now (or Ctrl+C to cancel)'
+        shutdown /r /t 0
     } else {
         Write-Host 'Phase 1 complete. Reboot skipped (-SkipReboot). Run Phase 2 manually or reboot to trigger it.' -ForegroundColor Yellow
     }
