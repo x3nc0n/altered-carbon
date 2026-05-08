@@ -128,12 +128,16 @@ Describe 'Winget constants' {
         $wingetConstants.Keys | Should -Contain 'WINGET_NO_APPLICABLE_UPGRADE'
         $wingetConstants.Keys | Should -Contain 'WINGET_PACKAGE_NOT_FOUND'
         $wingetConstants.Keys | Should -Contain 'WINGET_APP_IN_USE'
+        $wingetConstants.Keys | Should -Contain 'WINGET_UPGRADE_VERSION_NOT_NEWER'
+        $wingetConstants.Keys | Should -Contain 'WINGET_SHELLEXEC_INSTALL_FAILED'
     }
 
     It 'assigns the correct exit code values' {
         $wingetConstants.WINGET_NO_APPLICABLE_UPGRADE | Should -Be -1978335189
         $wingetConstants.WINGET_PACKAGE_NOT_FOUND | Should -Be -1978335212
         $wingetConstants.WINGET_APP_IN_USE | Should -Be -1978335113
+        $wingetConstants.WINGET_UPGRADE_VERSION_NOT_NEWER | Should -Be -1978335153
+        $wingetConstants.WINGET_SHELLEXEC_INSTALL_FAILED | Should -Be -1978335226
     }
 }
 
@@ -157,6 +161,24 @@ Describe 'Test-WingetKnownVersion' {
         param($Version, $Label)
 
         Test-WingetKnownVersion -Version $Version | Should -BeFalse -Because "$Label should not count as a known version"
+    }
+}
+
+Describe 'Compare-WingetVersions' {
+    It 'returns -1 when the available version is newer' {
+        Compare-WingetVersions -InstalledVersion '1.2.3' -AvailableVersion '1.2.4' | Should -Be -1
+    }
+
+    It 'returns 0 for equivalent numeric versions with different segment lengths' {
+        Compare-WingetVersions -InstalledVersion '1.2' -AvailableVersion '1.2.0' | Should -Be 0
+    }
+
+    It 'returns 1 when the installed version is newer than the available version' {
+        Compare-WingetVersions -InstalledVersion '2.0.0' -AvailableVersion '1.9.9' | Should -Be 1
+    }
+
+    It 'returns null when either version is unknown' {
+        Compare-WingetVersions -InstalledVersion 'Unknown' -AvailableVersion '1.0.0' | Should -BeNullOrEmpty
     }
 }
 
@@ -194,6 +216,13 @@ Describe 'Package Data Integrity' {
         $allIds | Should -Contain 'Git.Git'
     }
 
+    It 'includes the updated personal package IDs and excludes delisted apps from package IDs' {
+        $allIds | Should -Contain 'PrivateInternetAccess.PrivateInternetAccess'
+        $allIds | Should -Contain 'ElementLabs.LMStudio'
+        $scriptContent | Should -Match 'Adobe Lightroom is installed through Creative Cloud'
+        $scriptContent | Should -Match 'Xbox app is not currently discoverable'
+    }
+
     It 'defines a custom install location for Blizzard Battle.net' {
         $scriptContent | Should -Match "Id\s*=\s*'Blizzard\.BattleNet'.*Location\s*=\s*'C:\\Program Files \(x86\)\\Battle\.net'"
     }
@@ -224,8 +253,11 @@ Describe 'Script Structure' {
     It 'defines expected helper functions' {
         $fnNames = $functionDefs | ForEach-Object { $_.Name }
         $fnNames | Should -Contain 'Get-WingetVersionInfo'
+        $fnNames | Should -Contain 'Compare-WingetVersions'
         $fnNames | Should -Contain 'Invoke-ElevatedFontPromotion'
+        $fnNames | Should -Contain 'Install-GitHubCopilotCli'
         $fnNames | Should -Contain 'Get-CommandVersion'
+        $fnNames | Should -Contain 'Set-OhMyPoshProfile'
         $fnNames | Should -Contain 'Write-VerificationLine'
     }
 
@@ -239,6 +271,16 @@ Describe 'Script Structure' {
 
     It 'handles non-admin Chocolatey gracefully' {
         $scriptContent | Should -Match 'Chocolatey requires admin'
+    }
+
+    It 'marks special-case modules as non-PSGallery installs' {
+        $scriptContent | Should -Match "(?s)Name = 'ActiveDirectory'.*?Source = 'RSAT'"
+        $scriptContent | Should -Match "(?s)Name = 'PSKusto'.*?Source = 'Unavailable'"
+    }
+
+    It 'handles Spotify ShellExecute install failures explicitly' {
+        $scriptContent | Should -Match '\$LASTEXITCODE -eq \$WINGET_SHELLEXEC_INSTALL_FAILED'
+        $scriptContent | Should -Match 'ShellExecute failed'
     }
 }
 
@@ -434,6 +476,31 @@ Describe 'Install-WingetPackages' {
         @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 1
         @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 0
     }
+
+    It 'skips upgrade attempts when the installed version is newer than the catalog version' {
+        Mock Write-Host {}
+        $script:corePackages = @(
+            @{ Id = 'Contoso.App'; Name = 'Contoso App'; Source = 'winget' }
+        )
+
+        $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @(
+                    'Name                   Id           Version    Available  Source'
+                    '----------------------------------------------------------------'
+                    'Contoso App            Contoso.App  2.0.0      1.5.0      winget'
+                )
+            })
+
+        Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
+
+        $script:wingetCalls.Count | Should -Be 1
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 0
+        @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 0
+        Assert-MockCalled Write-Host -Times 1 -ParameterFilter {
+            $Object -like '*installed version (2.0.0) is newer than available (1.5.0)*'
+        }
+    }
 }
 
 Describe 'Enable-WindowsFeatures' {
@@ -450,6 +517,94 @@ Describe 'Enable-WindowsFeatures' {
         Assert-MockCalled Enable-WindowsOptionalFeature -Times 0
         Assert-MockCalled Write-Warning -Times 1 -ParameterFilter {
             $Message -like '*feature management is unavailable*'
+        }
+    }
+}
+
+Describe 'Install-GitHubCopilotCli' {
+    BeforeEach {
+        $script:ghCalls = [System.Collections.Generic.List[object[]]]::new()
+        $script:ghResponses = [System.Collections.Generic.Queue[hashtable]]::new()
+
+        function global:gh {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Args)
+
+            $script:ghCalls.Add(@($Args))
+            if ($script:ghResponses.Count -eq 0) {
+                throw "Unexpected gh invocation: $($Args -join ' ')"
+            }
+
+            $response = $script:ghResponses.Dequeue()
+            $global:LASTEXITCODE = $response.ExitCode
+
+            foreach ($line in $response.Output) {
+                $line
+            }
+        }
+    }
+
+    AfterEach {
+        Remove-Item function:\global:gh -ErrorAction SilentlyContinue
+    }
+
+    It 'skips extension management when gh copilot is available as a built-in subcommand' {
+        $script:ghResponses.Enqueue(@{
+                ExitCode = 0
+                Output   = @('Usage: gh copilot')
+            })
+
+        Install-GitHubCopilotCli
+
+        $script:ghCalls.Count | Should -Be 1
+        $script:ghCalls[0][0] | Should -Be 'copilot'
+        $script:ghCalls[0][1] | Should -Be '--help'
+        @($script:ghCalls | Where-Object { $_[0] -eq 'auth' }).Count | Should -Be 0
+        @($script:ghCalls | Where-Object { $_[0] -eq 'extension' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Set-OhMyPoshProfile' {
+    BeforeEach {
+        Mock Get-Module { @{ Name = 'oh-my-posh' } } -ParameterFilter {
+            $ListAvailable -and $Name -eq 'oh-my-posh'
+        }
+        Mock Get-InstalledModule { $null } -ParameterFilter { $Name -eq 'oh-my-posh' }
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'pwsh' }
+        Mock Join-Path { "C:\Mock\$ChildPath" } -ParameterFilter { [string]::IsNullOrEmpty($Path) }
+        Mock Test-Path { $false }
+        Mock Get-Content { '' }
+        Mock Set-Content {}
+        Mock New-Item {}
+        Mock Copy-Item {}
+        Mock Invoke-WebRequest {}
+        Mock Uninstall-Module {}
+    }
+
+    It 'does not uninstall the deprecated oh-my-posh module unless PowerShellGet reports it installed' {
+        try {
+            Set-OhMyPoshProfile -ThemeName 'night-owl' -ProfileDir 'C:\Profiles' -ProfileFile 'C:\Profiles\profile.ps1'
+        } catch {
+            $null = $_
+        }
+
+        Assert-MockCalled Uninstall-Module -Times 0
+    }
+}
+
+Describe 'Set-FileExplorerOptions' {
+    It 'creates the Run as different user registry path before setting the policy value' {
+        Mock Test-Path { $false } -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
+        Mock New-Item {}
+        Mock Set-ItemProperty {}
+        Mock Write-Warning {}
+
+        Set-FileExplorerOptions
+
+        Assert-MockCalled New-Item -Times 1 -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
+        Assert-MockCalled Set-ItemProperty -Times 1 -ParameterFilter {
+            $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -and
+            $Name -eq 'ShowRunAsDifferentUserInStart' -and
+            $Value -eq 1
         }
     }
 }

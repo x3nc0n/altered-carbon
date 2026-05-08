@@ -48,6 +48,9 @@ $ErrorActionPreference = 'Stop'
 $WINGET_NO_APPLICABLE_UPGRADE = -1978335189  # 0x8A15002B
 $WINGET_PACKAGE_NOT_FOUND     = -1978335212  # 0x8A150014
 $WINGET_APP_IN_USE            = -1978335113  # 0x8A150077
+$WINGET_UPGRADE_VERSION_NOT_NEWER = -1978335153  # 0x8A15004F
+$WINGET_SHELLEXEC_INSTALL_FAILED  = -1978335226  # 0x8A150006
+$WINGET_PACKAGE_ALREADY_INSTALLED = -1978335135  # 0x8A150061
 
 # ── Transcript Logging ────────────────────────────────────────────────────────
 $logFile = Join-Path $env:USERPROFILE ".altered-carbon-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -132,6 +135,34 @@ function Test-WingetKnownVersion {
     param([string] $Version)
 
     return -not [string]::IsNullOrWhiteSpace($Version) -and $Version -ne 'Unknown'
+}
+
+function Compare-WingetVersions {
+    param(
+        [string] $InstalledVersion,
+        [string] $AvailableVersion
+    )
+
+    if (-not (Test-WingetKnownVersion -Version $InstalledVersion) -or -not (Test-WingetKnownVersion -Version $AvailableVersion)) {
+        return $null
+    }
+
+    $installedParts = [regex]::Matches($InstalledVersion, '\d+') | ForEach-Object { [int64]$_.Value }
+    $availableParts = [regex]::Matches($AvailableVersion, '\d+') | ForEach-Object { [int64]$_.Value }
+    if ($installedParts.Count -eq 0 -or $availableParts.Count -eq 0) {
+        return $null
+    }
+
+    $maxCount = [Math]::Max($installedParts.Count, $availableParts.Count)
+    for ($i = 0; $i -lt $maxCount; $i++) {
+        $installedPart = if ($i -lt $installedParts.Count) { $installedParts[$i] } else { 0 }
+        $availablePart = if ($i -lt $availableParts.Count) { $availableParts[$i] } else { 0 }
+
+        if ($installedPart -lt $availablePart) { return -1 }
+        if ($installedPart -gt $availablePart) { return 1 }
+    }
+
+    return 0
 }
 
 function Invoke-ElevatedFontPromotion {
@@ -356,12 +387,12 @@ $personalPackages = @(
     @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal';                 Source = 'winget' }
     @{ Id = 'Google.Chrome';                                Name = 'Google Chrome';          Source = 'winget' }
     @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser';          Source = 'winget' }
-    @{ Id = 'PrivateInternetAccess.PrivateInternetAccessVPN'; Name = 'PIA VPN Client';         Source = 'winget' }
+    @{ Id = 'PrivateInternetAccess.PrivateInternetAccess';    Name = 'PIA VPN Client';         Source = 'winget' }
     @{ Id = 'Anysphere.Cursor';                             Name = 'Cursor IDE';             Source = 'winget' }
-    @{ Id = 'LMStudio.LMStudio';                            Name = 'LM Studio';              Source = 'winget' }
+    @{ Id = 'ElementLabs.LMStudio';                         Name = 'LM Studio';              Source = 'winget' }
     @{ Id = 'Adobe.CreativeCloud';                          Name = 'Adobe Creative Cloud';   Source = 'winget' }
-    @{ Id = 'Adobe.Lightroom';                              Name = 'Adobe Lightroom';        Source = 'winget' }
-    @{ Id = 'Microsoft.GamingApp';                          Name = 'Xbox';                   Source = 'msstore' }
+    # Adobe Lightroom is installed through Creative Cloud; a direct winget package is not currently available.
+    # Xbox app is not currently discoverable from the configured winget or Store sources.
 )
 
 function Install-WingetPackages {
@@ -371,7 +402,8 @@ function Install-WingetPackages {
         [hashtable[]] $ExtraPackages = @(),
         [int] $AppInUseExitCode,
         [int] $NoApplicableUpgradeExitCode,
-        [int] $PackageNotFoundExitCode
+        [int] $PackageNotFoundExitCode,
+        [int] $UpgradeVersionNotNewerExitCode = -1978335153
     )
 
     # Build the final package list based on mode
@@ -437,8 +469,12 @@ function Install-WingetPackages {
         }
 
         if ($installedVersion) {
-            if ((Test-WingetKnownVersion -Version $latestVersion) -and $installedVersion -ne $latestVersion) {
+            $versionComparison = Compare-WingetVersions -InstalledVersion $installedVersion -AvailableVersion $latestVersion
+            if ((Test-WingetKnownVersion -Version $latestVersion) -and $versionComparison -lt 0) {
                 Write-Host "  Updating $($pkg.Name) from $installedVersion to $latestVersion..." -ForegroundColor Cyan
+            } elseif ((Test-WingetKnownVersion -Version $latestVersion) -and $versionComparison -gt 0) {
+                Write-Host "  Skipped: installed version ($installedVersion) is newer than available ($latestVersion)." -ForegroundColor Yellow
+                continue
             } else {
                 Write-Host "  Checking for upgrades for $($pkg.Name) via winget..." -ForegroundColor Cyan
             }
@@ -449,6 +485,13 @@ function Install-WingetPackages {
                 continue
             } elseif ($LASTEXITCODE -eq $NoApplicableUpgradeExitCode) {
                 Write-Host "  Done: $($pkg.Name) is already up to date." -ForegroundColor Green
+                continue
+            } elseif ($LASTEXITCODE -eq $UpgradeVersionNotNewerExitCode) {
+                if (Test-WingetKnownVersion -Version $latestVersion) {
+                    Write-Host "  Skipped: installed version ($installedVersion) is newer than available ($latestVersion)." -ForegroundColor Yellow
+                } else {
+                    Write-Host "  Done: $($pkg.Name) is already up to date." -ForegroundColor Green
+                }
                 continue
             } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
                 Write-Warning "  $($pkg.Name) is currently in use. Close it and re-run the script to update."
@@ -532,21 +575,7 @@ function Install-NvidiaApp {
 
     if ($nvidiaGpu) {
         Write-Host "  Detected: $($nvidiaGpu.Name)" -ForegroundColor Green
-        Write-Host '  Installing Nvidia App...' -ForegroundColor Cyan
-
-        $nvidiaInstalled = winget list --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements 2>&1 | Select-String 'Nvidia.NvidiaApp'
-        if ($nvidiaInstalled) {
-            Write-Host '  Skipped: Nvidia App already installed.' -ForegroundColor Yellow
-        } else {
-            winget install --id 'Nvidia.NvidiaApp' --exact --source winget --accept-source-agreements --accept-package-agreements --silent
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host '  Done: Nvidia App installed.' -ForegroundColor Green
-            } elseif ($LASTEXITCODE -eq $AppInUseExitCode) {
-                Write-Warning '  Nvidia App installer reports the app is in use. Close it and re-run to complete installation.'
-            } else {
-                Write-Warning "  winget exited with code $LASTEXITCODE for Nvidia App"
-            }
-        }
+        Write-Warning '  NVIDIA App is not currently published in the configured winget sources. Skipping automatic install; install it manually from NVIDIA if needed.'
     } else {
         Write-Host '  Skipped: No Nvidia GPU detected.' -ForegroundColor Yellow
     }
@@ -561,6 +590,16 @@ function Install-NvidiaApp {
 function Install-GitHubCopilotCli {
     Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
     if (Get-Command gh -ErrorAction SilentlyContinue) {
+        try {
+            & gh copilot --help 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Skipped: GitHub Copilot CLI is built into gh.' -ForegroundColor Yellow
+                return
+            }
+        } catch {
+            $null = $_
+        }
+
         # Verify gh is authenticated before attempting extension operations.
         # gh extension install/upgrade call the GitHub API; unauthenticated requests
         # are rate-limited and some corporate networks block them entirely.
@@ -742,33 +781,40 @@ function Install-PSModules {
 
     $psModules = @(
         # Core
-        @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph' }
-        @{ Name = 'Az';                        Description = 'Azure PowerShell' }
-        @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management' }
-        @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams' }
-        @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)' }
-        @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management' }
-        @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC' }
-        @{ Name = 'ActiveDirectory';           Description = 'Active Directory' }
-        @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune' }
+        @{ Name = 'Microsoft.Graph';           Description = 'Microsoft Graph';                         Source = 'PSGallery' }
+        @{ Name = 'Az';                        Description = 'Azure PowerShell';                        Source = 'PSGallery' }
+        @{ Name = 'ExchangeOnlineManagement';  Description = 'Exchange Online Management';              Source = 'PSGallery' }
+        @{ Name = 'MicrosoftTeams';            Description = 'Microsoft Teams';                         Source = 'PSGallery' }
+        @{ Name = 'PnP.PowerShell';            Description = 'PnP PowerShell (SharePoint / M365)';     Source = 'PSGallery' }
+        @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management';                     Source = 'PSGallery' }
+        @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC';                       Source = 'PSGallery' }
+        @{ Name = 'ActiveDirectory';           Description = 'Active Directory';                        Source = 'RSAT';        Message = 'ActiveDirectory comes from RSAT, not PSGallery. Install "RSAT: Active Directory Domain Services and Lightweight Directory Services Tools" from Optional Features or with Add-WindowsCapability as admin.' }
+        @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune';                  Source = 'PSGallery' }
         # Sentinel / Security
-        @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)' }
-        @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)' }
-        @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)' }
+        @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)';              Source = 'PSGallery' }
+        @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)';             Source = 'PSGallery' }
+        @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)';           Source = 'Unavailable'; Message = 'PSKusto is not currently available in PSGallery. Skipping automatic install.' }
     )
 
     foreach ($mod in $psModules) {
         Write-Host "Installing module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
         if (Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue) {
             Write-Host "  Skipped: $($mod.Name) already installed." -ForegroundColor Yellow
+            continue
         }
-        else {
-            try {
-                Save-Module -Name $mod.Name -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
-                Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+
+        switch ($mod.Source) {
+            'PSGallery' {
+                try {
+                    Save-Module -Name $mod.Name -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
+                    Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+                }
+                catch {
+                    Write-Warning "  Failed to install $($mod.Name): $_"
+                }
             }
-            catch {
-                Write-Warning "  Failed to install $($mod.Name): $_"
+            default {
+                Write-Host "  Skipped: $($mod.Message)" -ForegroundColor Yellow
             }
         }
     }
@@ -830,7 +876,9 @@ function Set-OhMyPoshProfile {
 
     # Migrate from the deprecated oh-my-posh PowerShell module (if still present).
     Write-Host 'Checking for deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
-    if (Get-Module -ListAvailable -Name 'oh-my-posh' -ErrorAction SilentlyContinue) {
+    $availableOhMyPoshModule = Get-Module -ListAvailable -Name 'oh-my-posh' -ErrorAction SilentlyContinue
+    $installedOhMyPoshModule = Get-InstalledModule -Name 'oh-my-posh' -ErrorAction SilentlyContinue
+    if ($availableOhMyPoshModule -or ($env:POSH_PATH -and (Test-Path $env:POSH_PATH))) {
         Write-Host '  Removing deprecated oh-my-posh PowerShell module...' -ForegroundColor Cyan
         try {
             if ($env:POSH_PATH -and (Test-Path $env:POSH_PATH)) {
@@ -841,8 +889,13 @@ function Set-OhMyPoshProfile {
                     Write-Warning "  Could not remove `$env:POSH_PATH: $_"
                 }
             }
-            Uninstall-Module oh-my-posh -AllVersions -Force -ErrorAction Stop
-            Write-Host '  Done: oh-my-posh PowerShell module uninstalled.' -ForegroundColor Green
+
+            if ($installedOhMyPoshModule) {
+                Uninstall-Module oh-my-posh -AllVersions -Force -ErrorAction Stop
+                Write-Host '  Done: oh-my-posh PowerShell module uninstalled.' -ForegroundColor Green
+            } else {
+                Write-Host '  Skipped: deprecated module is not registered with PowerShellGet.' -ForegroundColor Yellow
+            }
         } catch {
             Write-Warning "  Could not fully remove oh-my-posh module: $_"
         }
@@ -1144,6 +1197,9 @@ function Set-FileExplorerOptions {
         $runAsKey = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
         $runAsName = 'ShowRunAsDifferentUserInStart'
         try {
+            if (-not (Test-Path $runAsKey)) {
+                New-Item -Path $runAsKey -Force | Out-Null
+            }
             Set-ItemProperty -Path $runAsKey -Name $runAsName -Value 1 -Force
         } catch {
             Write-Warning "  Could not enable 'Run as different user' in Start menu. This setting may require admin rights or Group Policy access."
@@ -1308,7 +1364,7 @@ if ($Phase -eq 'Phase1') {
     $SkipPackages += $chocoSkips
     # Spotify requires non-admin install — skip in Phase 1
     $SkipPackages += 'Spotify.Spotify'
-    Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND
+    Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND -UpgradeVersionNotNewerExitCode $WINGET_UPGRADE_VERSION_NOT_NEWER
     Enable-WindowsFeatures -IsAdmin $isAdmin
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
     Update-PathFromRegistry
@@ -1341,11 +1397,36 @@ if ($Phase -eq 'Phase1') {
     # ── Phase 2: User-space config + cleanup ─────────────────────────────────
     # Install Spotify (requires non-admin)
     Write-Host 'Installing Spotify (user-space)...' -ForegroundColor Cyan
-    winget install --id 'Spotify.Spotify' --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1 | Out-Null
+    $spotifyOutput = winget install --id 'Spotify.Spotify' --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { $_.ToString() }
     if ($LASTEXITCODE -eq 0) {
         Write-Host '  Done: Spotify installed.' -ForegroundColor Green
     } elseif ($LASTEXITCODE -eq $WINGET_APP_IN_USE) {
         Write-Host '  Skipped: Spotify already running.' -ForegroundColor Yellow
+    } elseif ($LASTEXITCODE -eq $WINGET_PACKAGE_ALREADY_INSTALLED) {
+        Write-Host '  Skipped: Spotify is already installed.' -ForegroundColor Yellow
+    } elseif ($LASTEXITCODE -eq $WINGET_SHELLEXEC_INSTALL_FAILED) {
+        $spotifyInstalled = $false
+        $spotifyVersionInfo = Get-WingetVersionInfo -Lines (
+            winget list --id 'Spotify.Spotify' --exact --source winget --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
+        ) -PackageId 'Spotify.Spotify'
+        if ($spotifyVersionInfo) {
+            $spotifyInstalled = $true
+        } else {
+            $spotifyInstalled = [bool](
+                winget list --name 'Spotify' --accept-source-agreements 2>&1 |
+                    ForEach-Object { $_.ToString() } |
+                    Where-Object { $_ -match '^\s*Spotify(\s{2,}|\t)' }
+            )
+        }
+
+        if ($spotifyInstalled) {
+            Write-Host '  Skipped: Spotify is already installed.' -ForegroundColor Yellow
+        } else {
+            Write-Warning '  winget could not launch the Spotify installer (ShellExecute failed). Open Spotify from the Microsoft Store or rerun winget after refreshing App Installer.'
+            if ($spotifyOutput) {
+                $spotifyOutput | ForEach-Object { Write-Warning "    $_" }
+            }
+        }
     } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for Spotify"
     }

@@ -11,6 +11,8 @@
 5. **Sentinel comments for managed blocks** — Use start/end comment markers (e.g., `# ── managed by X ──` / `# ── end X ──`) and strip-then-rewrite pattern for idempotent config injection.
 6. **PATH refresh after installs** — Always refresh `$env:Path` from Machine+User registry values after installing tools that modify PATH. Check that downstream code doesn't run before the refresh.
 7. **Exit code handling** — winget, choco, npm all use different exit code conventions. Define constants for known codes. Never assume `0 = success, anything else = failure` without checking docs.
+8. **Catalog-vs-installed version drift** — Before logging `Updating X from A to B`, compare version segments numerically. If `A > B`, skip and log that the installed version is newer than the catalog version.
+9. **Unavailable-source handling** — If `winget search` or `Find-Module` confirms an item is no longer published from the configured source, replace the stale ID or skip with manual guidance. Do not keep retrying a guaranteed package-not-found path.
 
 ## Anti-patterns
 
@@ -18,3 +20,5 @@
 - Appending to files without dedup check on re-run
 - Assuming tools are on PATH immediately after `winget install` without explicit refresh
 - Using `$ErrorActionPreference = 'Stop'` globally but wrapping external commands (winget/choco) that communicate via exit codes, not exceptions
+- Logging an upgrade before verifying that the available version is actually newer
+- Treating RSAT or delisted modules as if they were normal PSGallery installs
