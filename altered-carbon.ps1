@@ -421,6 +421,7 @@ $personalPackages = @(
     @{ Id = 'Anysphere.Cursor';                             Name = 'Cursor IDE';             Source = 'winget' }
     @{ Id = 'ElementLabs.LMStudio';                         Name = 'LM Studio';              Source = 'winget' }
     @{ Id = 'Adobe.CreativeCloud';                          Name = 'Adobe Creative Cloud';   Source = 'winget' }
+    @{ Id = 'Cloudflare.cloudflared';                        Name = 'cloudflared';            Source = 'winget' }
     # Adobe Lightroom is installed through Creative Cloud; a direct winget package is not currently available.
     # Xbox app is not currently discoverable from the configured winget or Store sources.
 )
