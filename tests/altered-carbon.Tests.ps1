@@ -13,6 +13,16 @@ BeforeAll {
         Invoke-Expression $fn.Extent.Text
     }
 
+    if (-not (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
+        function global:Get-WindowsOptionalFeature { param([string] $FeatureName) }
+    }
+    if (-not (Get-Command Enable-WindowsOptionalFeature -ErrorAction SilentlyContinue)) {
+        function global:Enable-WindowsOptionalFeature { param([string] $FeatureName) }
+    }
+    if (-not (Get-Command Get-InstalledModule -ErrorAction SilentlyContinue)) {
+        function global:Get-InstalledModule { param([string] $Name) }
+    }
+
     # Also extract key data structures (package arrays) by evaluating variable assignments.
     # We'll parse them manually from the script content for test assertions.
     $scriptContent = Get-Content $scriptPath -Raw
@@ -256,7 +266,6 @@ Describe 'Script Structure' {
         $fnNames | Should -Contain 'Compare-WingetVersions'
         $fnNames | Should -Contain 'Stop-WingetUpgradeProcess'
         $fnNames | Should -Contain 'Invoke-ElevatedFontPromotion'
-        $fnNames | Should -Contain 'Install-GitHubCopilotCli'
         $fnNames | Should -Contain 'Get-CommandVersion'
         $fnNames | Should -Contain 'Set-OhMyPoshProfile'
         $fnNames | Should -Contain 'Write-VerificationLine'
@@ -274,9 +283,20 @@ Describe 'Script Structure' {
         $scriptContent | Should -Match 'Chocolatey requires admin'
     }
 
-    It 'marks special-case modules as non-PSGallery installs' {
+    It 'marks Active Directory as an RSAT-provided module' {
         $scriptContent | Should -Match "(?s)Name = 'ActiveDirectory'.*?Source = 'RSAT'"
-        $scriptContent | Should -Match "(?s)Name = 'PSKusto'.*?Source = 'Unavailable'"
+    }
+
+    It 'does not include retired PowerShell modules or the retired gh-copilot extension' {
+        $scriptContent | Should -Not -Match "Name = 'Microsoft\.Graph\.Intune'"
+        $scriptContent | Should -Not -Match "Name = 'AzSentinel'"
+        $scriptContent | Should -Not -Match "Name = 'MSAL\.PS'"
+        $scriptContent | Should -Not -Match "Name = 'PSKusto'"
+        $scriptContent | Should -Not -Match 'github/gh-copilot'
+    }
+
+    It 'uses the current oh-my-posh font install syntax' {
+        $scriptContent | Should -Not -Match 'oh-my-posh font install[^\r\n]*--user'
     }
 
     It 'handles Spotify ShellExecute install failures explicitly' {
@@ -412,7 +432,7 @@ Describe 'Install-WingetPackages' {
 
         Install-WingetPackages -Personal $false -AppInUseExitCode -1978335113 -NoApplicableUpgradeExitCode -1978335189 -PackageNotFoundExitCode -1978335212
 
-        Assert-MockCalled Write-Warning -Times 1 -ParameterFilter {
+        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
             $Message -like '*not available from the configured sources*'
         }
     }
@@ -503,7 +523,7 @@ Describe 'Install-WingetPackages' {
         $script:wingetCalls.Count | Should -Be 1
         @($script:wingetCalls | Where-Object { $_[0] -eq 'upgrade' }).Count | Should -Be 0
         @($script:wingetCalls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 0
-        Assert-MockCalled Write-Host -Times 1 -ParameterFilter {
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
             $Object -like '*installed version (2.0.0) is newer than available (1.5.0)*'
         }
     }
@@ -520,10 +540,10 @@ Describe 'Stop-WingetUpgradeProcess' {
             'ElementLabs.LMStudio' = @('LM Studio')
         }
 
-        Assert-MockCalled Get-Process -Times 1 -ParameterFilter { $Name -eq 'LM Studio' }
-        Assert-MockCalled Stop-Process -Times 1
-        Assert-MockCalled Start-Sleep -Times 1 -ParameterFilter { $Seconds -eq 3 }
-        Assert-MockCalled Write-Host -Times 1 -ParameterFilter {
+        Should -Invoke Get-Process -Times 1 -Exactly -ParameterFilter { $Name -eq 'LM Studio' }
+        Should -Invoke Stop-Process -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 3 }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
             $Object -like '*Stopping running process(es) before upgrade: LM Studio.*'
         }
     }
@@ -537,9 +557,9 @@ Describe 'Stop-WingetUpgradeProcess' {
             'ElementLabs.LMStudio' = @('LM Studio')
         }
 
-        Assert-MockCalled Get-Process -Times 0
-        Assert-MockCalled Stop-Process -Times 0
-        Assert-MockCalled Start-Sleep -Times 0
+        Should -Invoke Get-Process -Times 0 -Exactly
+        Should -Invoke Stop-Process -Times 0 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 }
 
@@ -553,53 +573,11 @@ Describe 'Enable-WindowsFeatures' {
 
         Enable-WindowsFeatures -IsAdmin $true
 
-        Assert-MockCalled Get-WindowsOptionalFeature -Times 1
-        Assert-MockCalled Enable-WindowsOptionalFeature -Times 0
-        Assert-MockCalled Write-Warning -Times 1 -ParameterFilter {
+        Should -Invoke Get-WindowsOptionalFeature -Times 1 -Exactly
+        Should -Invoke Enable-WindowsOptionalFeature -Times 0 -Exactly
+        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
             $Message -like '*feature management is unavailable*'
         }
-    }
-}
-
-Describe 'Install-GitHubCopilotCli' {
-    BeforeEach {
-        $script:ghCalls = [System.Collections.Generic.List[object[]]]::new()
-        $script:ghResponses = [System.Collections.Generic.Queue[hashtable]]::new()
-
-        function global:gh {
-            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Args)
-
-            $script:ghCalls.Add(@($Args))
-            if ($script:ghResponses.Count -eq 0) {
-                throw "Unexpected gh invocation: $($Args -join ' ')"
-            }
-
-            $response = $script:ghResponses.Dequeue()
-            $global:LASTEXITCODE = $response.ExitCode
-
-            foreach ($line in $response.Output) {
-                $line
-            }
-        }
-    }
-
-    AfterEach {
-        Remove-Item function:\global:gh -ErrorAction SilentlyContinue
-    }
-
-    It 'skips extension management when gh copilot is available as a built-in subcommand' {
-        $script:ghResponses.Enqueue(@{
-                ExitCode = 0
-                Output   = @('Usage: gh copilot')
-            })
-
-        Install-GitHubCopilotCli
-
-        $script:ghCalls.Count | Should -Be 1
-        $script:ghCalls[0][0] | Should -Be 'copilot'
-        $script:ghCalls[0][1] | Should -Be '--help'
-        @($script:ghCalls | Where-Object { $_[0] -eq 'auth' }).Count | Should -Be 0
-        @($script:ghCalls | Where-Object { $_[0] -eq 'extension' }).Count | Should -Be 0
     }
 }
 
@@ -627,7 +605,7 @@ Describe 'Set-OhMyPoshProfile' {
             $null = $_
         }
 
-        Assert-MockCalled Uninstall-Module -Times 0
+        Should -Invoke Uninstall-Module -Times 0 -Exactly
     }
 }
 
@@ -640,11 +618,34 @@ Describe 'Set-FileExplorerOptions' {
 
         Set-FileExplorerOptions
 
-        Assert-MockCalled New-Item -Times 1 -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
-        Assert-MockCalled Set-ItemProperty -Times 1 -ParameterFilter {
+        Should -Invoke New-Item -Times 1 -Exactly -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
+        Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
             $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -and
             $Name -eq 'ShowRunAsDifferentUserInStart' -and
             $Value -eq 1
         }
+    }
+}
+
+Describe 'Shared oh-my-posh theme' {
+    BeforeAll {
+        $themePath = Join-Path $PSScriptRoot '..' 'night-owl.omp.json'
+        $theme = Get-Content $themePath -Raw | ConvertFrom-Json
+        $themeSegments = $theme.blocks | ForEach-Object { $_.segments }
+        $batterySegment = $themeSegments | Where-Object type -eq 'battery' | Select-Object -First 1
+        $macScriptContent = Get-Content (Join-Path $PSScriptRoot '..' 'altered-carbon-mac.sh') -Raw
+    }
+
+    It 'includes the customized battery segment for both platforms' {
+        $batterySegment | Should -Not -BeNullOrEmpty
+        $batterySegment.options.charging_icon | Should -Not -BeNullOrEmpty
+        $batterySegment.options.discharging_icon | Should -Not -BeNullOrEmpty
+        $batterySegment.options.charged_icon | Should -Not -BeNullOrEmpty
+        $batterySegment.options.not_charging_icon | Should -Not -BeNullOrEmpty
+    }
+
+    It 'copies the repository theme into the macOS managed theme directory' {
+        $macScriptContent | Should -Match 'REPO_THEME="\$SCRIPT_DIR/\$\{OMP_THEME\}\.omp\.json"'
+        $macScriptContent | Should -Match 'cp "\$REPO_THEME" "\$DEST_THEME"'
     }
 }

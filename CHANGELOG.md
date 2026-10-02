@@ -2,12 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.1.0] - 2026-10-02
+
+### Changed
+- Homebrew-managed formulae and casks are now upgraded when outdated instead of being skipped whenever already installed.
+- PowerShell Gallery modules are now version-checked and updated on both Windows and macOS.
+- Updated Homebrew cask names to the current canonical tokens for Docker Desktop (`docker-desktop`) and ComfyUI (`comfy`).
+- Consolidated VS Code Copilot setup on the current `github.copilot-chat` extension.
+- Ensured macOS uses the same customized `night-owl` theme as Windows, including the battery-status segment and current battery option names.
 
 ### Fixed
-- GitHub Copilot CLI extension install/upgrade now checks `gh auth status` before attempting the operation and emits a clear warning when `gh` is not authenticated, instead of silently failing with a bare exit-code warning.
-- `gh extension install` and `gh extension upgrade` output is no longer fully suppressed; if either command fails, `gh`'s own error text is surfaced so the cause is visible.
-- Added the `gh auth login` tip to the `gh extension upgrade` failure path (it was previously only shown for `gh extension install` failures).
+- Updated Nerd Font installation for current Oh My Posh releases, which infer user/system scope and no longer accept `--user`.
+
+### Removed
+- Removed management of the retired `github/gh-copilot` GitHub CLI extension.
+- Removed stale PowerShell modules `Microsoft.Graph.Intune`, `AzSentinel`, `MSAL.PS`, and unavailable `PSKusto`; their supported functionality is covered by the maintained Microsoft Graph and Az modules already installed.
+- Removed Microsoft365DSC from the macOS module list because its full configuration workflow remains Windows-focused.
 
 ## [1.0.0] - 2026-04-15
 

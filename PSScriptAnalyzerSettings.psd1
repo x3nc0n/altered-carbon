@@ -25,6 +25,9 @@
         # The -Work switch is used implicitly via ParameterSetName; the script
         # branches on $Personal while -Work is the "default" core path.
         'PSReviewUnusedParameter'
+
+        # Existing orchestration helpers intentionally describe collections.
+        'PSUseSingularNouns'
     )
 
     Rules = @{

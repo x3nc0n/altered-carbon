@@ -11,6 +11,7 @@ APP_USER_DIR="$TEST_SANDBOX_ROOT/home/Applications"
 SKIP_PACKAGES=()
 APP_EXISTS_LOCATION=""
 BREW_LIST_CASK_STATUS=1
+BREW_OUTDATED_CASK_OUTPUT=""
 BREW_INSTALL_STATUS=0
 BREW_CALLS=()
 EVENTS=()
@@ -32,6 +33,11 @@ brew() {
 
     if [[ "$1" == "list" && "${2:-}" == "--cask" ]]; then
         return "$BREW_LIST_CASK_STATUS"
+    fi
+
+    if [[ "$1" == "outdated" && "${2:-}" == "--quiet" && "${3:-}" == "--cask" ]]; then
+        printf '%s' "$BREW_OUTDATED_CASK_OUTPUT"
+        return 0
     fi
 
     if [[ "$1" == "install" && "${2:-}" == "--cask" ]]; then
@@ -123,6 +129,7 @@ reset_test_state() {
     SKIP_PACKAGES=()
     APP_EXISTS_LOCATION=""
     BREW_LIST_CASK_STATUS=1
+    BREW_OUTDATED_CASK_OUTPUT=""
     BREW_INSTALL_STATUS=0
     BREW_CALLS=()
     EVENTS=()
@@ -183,8 +190,9 @@ test_ensure_cask_skips_install_when_app_bundle_exists() {
 
     ensure_cask "firefox" "Firefox" "Firefox"
 
-    assert_array_empty BREW_CALLS "ensure_cask should not invoke brew when app_exists finds the bundle"
-    assert_array_contains "skip:Firefox already installed (found in /Applications)." EVENTS "ensure_cask should report the app bundle location when skipping"
+    assert_eq "1" "${#BREW_CALLS[@]}" "ensure_cask should check Homebrew ownership before app bundle detection"
+    assert_eq "list --cask firefox" "${BREW_CALLS[0]}" "ensure_cask should check whether Homebrew manages the app"
+    assert_array_contains "skip:Firefox already installed outside Homebrew (found in /Applications)." EVENTS "ensure_cask should report the app bundle location when skipping"
 }
 
 test_ensure_cask_checks_brew_when_app_name_is_empty() {
@@ -199,7 +207,7 @@ test_ensure_cask_checks_brew_when_app_name_is_empty() {
     ensure_cask "firefox" "Firefox" ""
 
     assert_eq "0" "$app_exists_called" "ensure_cask should not call app_exists when app_name is empty"
-    assert_eq "1" "${#BREW_CALLS[@]}" "ensure_cask should fall through to brew list when app_name is empty"
+    assert_eq "1" "${#BREW_CALLS[@]}" "ensure_cask should query Homebrew for an installed cask"
     assert_eq "list --cask firefox" "${BREW_CALLS[0]}" "ensure_cask should check brew list when app_name is empty"
 }
 
@@ -208,8 +216,8 @@ test_ensure_cask_checks_brew_when_bundle_is_missing() {
 
     ensure_cask "google-chrome" "Google Chrome" "Google Chrome"
 
-    assert_eq "1" "${#BREW_CALLS[@]}" "ensure_cask should fall through to brew list when the app bundle is missing"
-    assert_eq "list --cask google-chrome" "${BREW_CALLS[0]}" "ensure_cask should query brew list after app_exists misses"
+    assert_eq "1" "${#BREW_CALLS[@]}" "ensure_cask should query Homebrew for an installed cask"
+    assert_eq "list --cask google-chrome" "${BREW_CALLS[0]}" "ensure_cask should query brew before app bundle detection"
     assert_eq "" "$APP_EXISTS_LOCATION" "ensure_cask should leave APP_EXISTS_LOCATION empty after a miss"
 }
 
