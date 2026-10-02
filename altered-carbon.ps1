@@ -621,62 +621,6 @@ function Install-NvidiaApp {
 # in this session without restarting the terminal.
 # (now handled via Update-PathFromRegistry call in orchestration block)
 
-# ── GitHub Copilot CLI ───────────────────────────────────────────────────────
-# Copilot CLI is distributed as a GitHub CLI extension.
-function Install-GitHubCopilotCli {
-    Write-Host 'Ensuring GitHub Copilot CLI extension is installed...' -ForegroundColor Cyan
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
-        try {
-            & gh copilot --help 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host '  Skipped: GitHub Copilot CLI is built into gh.' -ForegroundColor Yellow
-                return
-            }
-        } catch {
-            $null = $_
-        }
-
-        # Verify gh is authenticated before attempting extension operations.
-        # gh extension install/upgrade call the GitHub API; unauthenticated requests
-        # are rate-limited and some corporate networks block them entirely.
-        & gh auth status 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning '  GitHub CLI is not authenticated. Run "gh auth login" first, then re-run this script to install the Copilot CLI extension.'
-            return
-        }
-
-        $ghExtensions = & gh extension list 2>$null
-        $hasCopilotCli = $false
-        if ($ghExtensions) {
-            $hasCopilotCli = ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet)
-        }
-
-        if ($hasCopilotCli) {
-            Write-Host '  Updating GitHub Copilot CLI extension...' -ForegroundColor Cyan
-            $ghOutput = & gh extension upgrade github/gh-copilot 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host '  Done: GitHub Copilot CLI extension is up to date.' -ForegroundColor Green
-            } else {
-                Write-Warning "  gh exited with code $LASTEXITCODE while upgrading GitHub Copilot CLI extension"
-                if ($ghOutput) { $ghOutput | ForEach-Object { Write-Warning "    $_" } }
-                Write-Host '  Tip: Run "gh auth login" if your GitHub CLI session has expired.' -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host '  Installing GitHub Copilot CLI extension...' -ForegroundColor Cyan
-            $ghOutput = & gh extension install github/gh-copilot 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host '  Done: GitHub Copilot CLI extension installed.' -ForegroundColor Green
-            } else {
-                Write-Warning "  gh exited with code $LASTEXITCODE while installing GitHub Copilot CLI extension"
-                if ($ghOutput) { $ghOutput | ForEach-Object { Write-Warning "    $_" } }
-                Write-Host '  Tip: Run "gh auth login" if GitHub CLI is not authenticated yet.' -ForegroundColor Yellow
-            }
-        }
-    } else {
-        Write-Warning '  GitHub CLI (gh) not found on PATH. Copilot CLI extension setup skipped.'
-    }
-}
-
 # ── Microsoft Work IQ CLI ────────────────────────────────────────────────────
 # Work IQ is distributed as a global npm package and requires Node.js.
 function Install-WorkIqCli {
@@ -741,11 +685,7 @@ function Install-NerdFont {
             Write-Host "  $FontName Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
             Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
         } else {
-            if ($IsAdmin) {
-                & oh-my-posh font install $FontName
-            } else {
-                & oh-my-posh font install $FontName --user
-            }
+            & oh-my-posh font install $FontName
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $FontName Nerd Font installed." -ForegroundColor Green
 
@@ -825,28 +765,29 @@ function Install-PSModules {
         @{ Name = 'MicrosoftPowerBIMgmt';      Description = 'Power BI Management';                     Source = 'PSGallery' }
         @{ Name = 'Microsoft365DSC';           Description = 'Microsoft 365 DSC';                       Source = 'PSGallery' }
         @{ Name = 'ActiveDirectory';           Description = 'Active Directory';                        Source = 'RSAT';        Message = 'ActiveDirectory comes from RSAT, not PSGallery. Install "RSAT: Active Directory Domain Services and Lightweight Directory Services Tools" from Optional Features or with Add-WindowsCapability as admin.' }
-        @{ Name = 'Microsoft.Graph.Intune';    Description = 'Microsoft Graph Intune';                  Source = 'PSGallery' }
-        # Sentinel / Security
-        @{ Name = 'AzSentinel';                Description = 'Azure Sentinel (community)';              Source = 'PSGallery' }
-        @{ Name = 'MSAL.PS';                   Description = 'MSAL.PS (token acquisition)';             Source = 'PSGallery' }
-        @{ Name = 'PSKusto';                   Description = 'PSKusto (KQL from PowerShell)';           Source = 'Unavailable'; Message = 'PSKusto is not currently available in PSGallery. Skipping automatic install.' }
     )
 
     foreach ($mod in $psModules) {
-        Write-Host "Installing module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
-        if (Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue) {
-            Write-Host "  Skipped: $($mod.Name) already installed." -ForegroundColor Yellow
-            continue
-        }
+        Write-Host "Installing or updating module $($mod.Description) ($($mod.Name))..." -ForegroundColor Cyan
 
         switch ($mod.Source) {
             'PSGallery' {
                 try {
+                    $installedModule = Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue |
+                        Sort-Object Version -Descending |
+                        Select-Object -First 1
+                    $latestModule = Find-Module -Name $mod.Name -Repository PSGallery -ErrorAction Stop
+
+                    if ($installedModule -and $installedModule.Version -ge $latestModule.Version) {
+                        Write-Host "  Skipped: $($mod.Name) is already up to date ($($installedModule.Version))." -ForegroundColor Yellow
+                        continue
+                    }
+
                     Save-Module -Name $mod.Name -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
-                    Write-Host "  Done: $($mod.Name)" -ForegroundColor Green
+                    Write-Host "  Done: $($mod.Name) $($latestModule.Version)" -ForegroundColor Green
                 }
                 catch {
-                    Write-Warning "  Failed to install $($mod.Name): $_"
+                    Write-Warning "  Failed to install or update $($mod.Name): $_"
                 }
             }
             default {
@@ -862,7 +803,6 @@ function Install-VSCodeExtensions {
     $vsCodeExtensions = @(
         @{ Id = 'ms-azuretools.vscode-azureresourcegroups'; Name = 'Azure Resources' }
         @{ Id = 'ms-azuretools.vscode-bicep';               Name = 'Bicep' }
-        @{ Id = 'github.copilot';                           Name = 'GitHub Copilot' }
         @{ Id = 'github.copilot-chat';                      Name = 'GitHub Copilot Chat' }
         @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
         @{ Id = 'ms-windows-ai-studio.windows-ai-studio';   Name = 'AI Toolkit for Visual Studio Code' }
@@ -1304,35 +1244,6 @@ function Show-VerificationSummary {
     $ghVersion = Get-CommandVersion -Command 'gh'
     Write-VerificationLine -Label 'GitHub CLI' -Installed ([bool]$ghVersion) -Details $ghVersion
 
-    $ghCopilotInstalled = $false
-    $ghCopilotDetails = $null
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
-        # First: check if gh copilot is available as a built-in subcommand
-        try {
-            $null = & gh copilot --help 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $ghCopilotInstalled = $true
-                $ghCopilotDetails = 'built-in subcommand'
-            }
-        } catch {
-            $null = $_  # built-in not available; fall through to extension check
-        }
-
-        # Fallback: check for the gh-copilot extension
-        if (-not $ghCopilotInstalled) {
-            try {
-                $ghExtensions = & gh extension list 2>$null
-                if ($ghExtensions | Select-String -Pattern '(^|\s)(github/)?gh-copilot(\s|$)' -Quiet) {
-                    $ghCopilotInstalled = $true
-                    $ghCopilotDetails = 'gh extension installed'
-                }
-            } catch {
-                $ghCopilotDetails = 'unable to query gh extensions'
-            }
-        }
-    }
-    Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed $ghCopilotInstalled -Details $ghCopilotDetails
-
     $workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
     Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion
 
@@ -1341,14 +1252,12 @@ function Show-VerificationSummary {
 
     $vsCodeVerification = @(
         @{ Editor = 'code'; Label = 'VS Code'; Extensions = @(
-            @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
             @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
             @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
             @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
             @{ Id = 'ms-security.ms-sentinel'; Name = 'Microsoft Sentinel' }
         ) }
         @{ Editor = 'code-insiders'; Label = 'VS Code Insiders'; Extensions = @(
-            @{ Id = 'github.copilot'; Name = 'GitHub Copilot' }
             @{ Id = 'github.copilot-chat'; Name = 'GitHub Copilot Chat' }
             @{ Id = 'ms-azuretools.vscode-azure-github-copilot'; Name = 'GitHub Copilot for Azure' }
             @{ Id = 'ms-windows-ai-studio.windows-ai-studio'; Name = 'AI Toolkit for Visual Studio Code' }
@@ -1365,17 +1274,9 @@ function Show-VerificationSummary {
         $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
         Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
 
-        # github.copilot and github.copilot-chat have been consolidated — either presence satisfies both
-        $copilotPairIds = @('github.copilot', 'github.copilot-chat')
-        $copilotPairPresent = [bool]($copilotPairIds | Where-Object { $installedExtensions -contains $_ })
-
         foreach ($extension in $editorInfo.Extensions) {
             $isInstalled = $installedExtensions -contains $extension.Id
             $details = $extension.Id
-            if ($extension.Id -in $copilotPairIds -and -not $isInstalled -and $copilotPairPresent) {
-                $isInstalled = $true
-                $details = "$($extension.Id) (consolidated)"
-            }
             Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $details
         }
     }
@@ -1412,7 +1313,6 @@ if ($Phase -eq 'Phase1') {
     Enable-WindowsFeatures -IsAdmin $isAdmin
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
     Update-PathFromRegistry
-    Install-GitHubCopilotCli
     Install-WorkIqCli
 
     # Register Phase 2 scheduled task (runs at logon as current user, non-elevated)
@@ -1500,4 +1400,4 @@ if ($Phase -eq 'Phase2') {
     Read-Host 'Press Enter to close this window'
 }
 
-try { Stop-Transcript } catch { }
+try { Stop-Transcript } catch { Write-Verbose "Transcript was not active: $($_.Exception.Message)" }

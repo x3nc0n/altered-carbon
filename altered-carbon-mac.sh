@@ -199,7 +199,14 @@ ensure_formula() {
 
     info "Checking $name ($formula)..."
     if brew list --formula "$formula" &>/dev/null; then
-        skip "$name already installed."
+        local outdated_formulae
+        outdated_formulae="$(brew outdated --quiet --formula "$formula")"
+        if grep -Fxq "$formula" <<< "$outdated_formulae"; then
+            brew upgrade --formula "$formula" || { warn "Failed to upgrade $name"; return 1; }
+            ok "$name upgraded."
+        else
+            skip "$name already up to date."
+        fi
     else
         brew install "$formula" || { warn "Failed to install $name"; return 1; }
         ok "$name installed."
@@ -217,10 +224,17 @@ ensure_cask() {
     fi
 
     info "Checking $name ($cask)..."
-    if [[ -n "$app_name" ]] && app_exists "$app_name"; then
-        skip "$name already installed (found in ${APP_EXISTS_LOCATION})."
-    elif brew list --cask "$cask" &>/dev/null; then
-        skip "$name already installed."
+    if brew list --cask "$cask" &>/dev/null; then
+        local outdated_casks
+        outdated_casks="$(brew outdated --quiet --cask --greedy "$cask")"
+        if grep -Fxq "$cask" <<< "$outdated_casks"; then
+            brew upgrade --cask --greedy "$cask" || { warn "Failed to upgrade $name"; return 1; }
+            ok "$name upgraded."
+        else
+            skip "$name already up to date."
+        fi
+    elif [[ -n "$app_name" ]] && app_exists "$app_name"; then
+        skip "$name already installed outside Homebrew (found in ${APP_EXISTS_LOCATION})."
     else
         brew install --cask "$cask" || { warn "Failed to install $name"; return 1; }
         ok "$name installed."
@@ -331,7 +345,7 @@ echo ""
 ensure_cask visual-studio-code "Visual Studio Code" "Visual Studio Code"
 ensure_cask visual-studio-code@insiders "Visual Studio Code Insiders" "Visual Studio Code - Insiders"
 ensure_cask github "GitHub Desktop" "GitHub Desktop"
-ensure_cask docker "Docker Desktop" "Docker"
+ensure_cask docker-desktop "Docker Desktop" "Docker"
 ensure_cask microsoft-edge "Microsoft Edge" "Microsoft Edge"
 ensure_cask microsoft-teams "Microsoft Teams" "Microsoft Teams"
 ensure_cask microsoft-outlook "Microsoft Outlook" "Microsoft Outlook"
@@ -360,7 +374,7 @@ ensure_cask signal "Signal" "Signal"
 ensure_cask brave-browser "Brave Browser" "Brave Browser"
 ensure_cask lm-studio "LM Studio" "LM Studio"
 ensure_cask moonlight "Moonlight" "Moonlight"
-ensure_cask comfyui "ComfyUI" "ComfyUI"
+ensure_cask comfy "ComfyUI" "ComfyUI"
 ensure_cask bitwarden "Bitwarden" "Bitwarden"
 ensure_cask canva "Canva" "Canva"
 ensure_cask parallels "Parallels Desktop" "Parallels Desktop"
@@ -394,27 +408,6 @@ if [[ ${#EXTRA_PACKAGES[@]} -gt 0 ]]; then
     echo ""
 fi
 
-# ── GitHub Copilot CLI ───────────────────────────────────────────────────────
-
-info "Ensuring GitHub Copilot CLI is installed..."
-if command -v gh &>/dev/null; then
-    if gh copilot --version &>/dev/null; then
-        ok "GitHub Copilot CLI is available."
-    elif gh auth status &>/dev/null; then
-        info "  GitHub Copilot CLI not detected. Attempting fallback install..."
-        if gh extension install github/gh-copilot &>/dev/null && gh copilot --version &>/dev/null; then
-            ok "GitHub Copilot CLI installed."
-        else
-            warn "Failed to install GitHub Copilot CLI fallback."
-        fi
-    else
-        warn "GitHub Copilot CLI not detected and GitHub CLI is not authenticated. Run 'gh auth login' first."
-    fi
-else
-    warn "GitHub CLI (gh) not found. GitHub Copilot CLI setup skipped."
-fi
-echo ""
-
 # ── Nerd Font ────────────────────────────────────────────────────────────────
 
 info "Installing Nerd Font '$NERD_FONT'..."
@@ -425,7 +418,7 @@ if command -v oh-my-posh &>/dev/null; then
     if find "$local_font_dir" "$system_font_dir" -iname "*${NERD_FONT}*NerdFont*" -print -quit 2>/dev/null | grep -q .; then
         skip "$NERD_FONT Nerd Font already installed."
     else
-        oh-my-posh font install --user "$NERD_FONT" && ok "$NERD_FONT Nerd Font installed." || warn "Failed to install $NERD_FONT Nerd Font."
+        oh-my-posh font install "$NERD_FONT" && ok "$NERD_FONT Nerd Font installed." || warn "Failed to install $NERD_FONT Nerd Font."
     fi
 else
     warn "oh-my-posh not found. Nerd Font installation skipped."
@@ -437,6 +430,7 @@ echo ""
 VSCODE_EXTENSIONS=(
     "ms-azuretools.vscode-azureresourcegroups|Azure Resources"
     "ms-azuretools.vscode-bicep|Bicep"
+    "github.copilot-chat|GitHub Copilot Chat"
     "ms-azuretools.vscode-azure-github-copilot|GitHub Copilot for Azure"
     "ms-windows-ai-studio.windows-ai-studio|AI Toolkit for VS Code"
     "ms-security.ms-sentinel|Microsoft Sentinel"
@@ -467,23 +461,32 @@ PS_MODULES=(
     "MicrosoftTeams|Microsoft Teams"
     "PnP.PowerShell|PnP PowerShell (SharePoint / M365)"
     "MicrosoftPowerBIMgmt|Power BI Management"
-    "Microsoft365DSC|Microsoft 365 DSC"
-    "Microsoft.Graph.Intune|Microsoft Graph Intune"
-    "MSAL.PS|MSAL.PS (token acquisition)"
 )
 
 if command -v pwsh &>/dev/null; then
-    info "Installing PowerShell modules..."
+    info "Installing or updating PowerShell modules..."
     for entry in "${PS_MODULES[@]}"; do
         mod_name="${entry%%|*}"
         mod_desc="${entry##*|}"
         info "  Checking $mod_desc ($mod_name)..."
-        if pwsh -NoProfile -Command "if (Get-Module -ListAvailable -Name '$mod_name') { exit 0 } else { exit 1 }" 2>/dev/null; then
-            skip "$mod_name already installed."
+        module_result="$(pwsh -NoProfile -Command "\
+\$ErrorActionPreference = 'Stop'
+\$installed = Get-Module -ListAvailable -Name '$mod_name' | Sort-Object Version -Descending | Select-Object -First 1
+\$latest = Find-Module -Name '$mod_name' -Repository PSGallery
+if (\$installed -and \$installed.Version -ge \$latest.Version) {
+    'current'
+} else {
+    Install-Module -Name '$mod_name' -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -AcceptLicense
+    'updated'
+}" 2>/dev/null)" || {
+            warn "Failed to install or update $mod_name."
+            continue
+        }
+
+        if [[ "$module_result" == *"updated"* ]]; then
+            ok "$mod_name installed or updated."
         else
-            pwsh -NoProfile -Command "Install-Module -Name '$mod_name' -Scope CurrentUser -Force -AcceptLicense -ErrorAction SilentlyContinue" 2>/dev/null \
-                && ok "$mod_name installed." \
-                || warn "Failed to install $mod_name (may not be available on macOS)."
+            skip "$mod_name already up to date."
         fi
     done
     echo ""
@@ -956,13 +959,6 @@ else
     printf "${YELLOW}  [MISSING]${NC} %-30s\n" "Ghostty"
 fi
 
-# GitHub Copilot CLI
-if gh copilot --version &>/dev/null; then
-    printf "${GREEN}  [OK]${NC} %-30s %s\n" "GitHub Copilot CLI" "$(gh copilot --version 2>&1 | head -1)"
-else
-    printf "${YELLOW}  [MISSING]${NC} %-30s\n" "GitHub Copilot CLI"
-fi
-
 # VS Code extensions
 for editor in code code-insiders; do
     if command -v "$editor" &>/dev/null; then
@@ -980,8 +976,6 @@ for editor in code code-insiders; do
                 printf "${YELLOW}  [MISSING]${NC}   %-28s %s\n" "$ext_name" "$ext_id"
             fi
         done
-        printf "${GREEN}  [OK]${NC}   %-28s %s\n" "GitHub Copilot" "built-in"
-        printf "${GREEN}  [OK]${NC}   %-28s %s\n" "GitHub Copilot Chat" "built-in"
     fi
 done
 

@@ -109,10 +109,11 @@
           ],
           "foreground": "#011627",
           "leading_diamond": "\ue0b2",
-          "properties": {
+          "options": {
             "charged_icon": "\uf240 ",
             "charging_icon": "\uf0e7 ",
-            "discharging_icon": "\uf242 "
+            "discharging_icon": "\uf242 ",
+            "not_charging_icon": "\uf1e6 "
           },
           "style": "diamond",
           "template": " {{ if not .Error }}{{ .Icon }}{{ .Percentage }}%{{ end }} ",

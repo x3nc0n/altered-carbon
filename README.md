@@ -117,7 +117,6 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 1. Node.js (LTS) *(via Chocolatey when admin, winget fallback)*
 1. GitHub Desktop
 1. GitHub CLI
-1. GitHub Copilot CLI *(via GitHub CLI extension `github/gh-copilot`)*
 1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`)*
 1. oh-my-posh
 1. PowerToys
@@ -143,14 +142,9 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
     1. MicrosoftPowerBIMgmt
     1. Microsoft365DSC
     1. ActiveDirectory
-    1. Microsoft.Graph.Intune
-    1. AzSentinel
-    1. MSAL.PS
-    1. PSKusto
 1. VS Code / VS Code Insiders extensions:
     1. Azure Resources (ID: `ms-azuretools.vscode-azureresourcegroups`)
     1. Bicep (ID: `ms-azuretools.vscode-bicep`)
-    1. GitHub Copilot (ID: `github.copilot`)
     1. GitHub Copilot Chat (ID: `github.copilot-chat`)
     1. GitHub Copilot for Azure (ID: `ms-azuretools.vscode-azure-github-copilot`)
     1. AI Toolkit for Visual Studio Code (ID: `ms-windows-ai-studio.windows-ai-studio`)
@@ -199,7 +193,6 @@ In addition to core apps:
 1. git LFS
 1. Node.js
 1. GitHub CLI
-1. GitHub Copilot CLI *(via GitHub CLI extension `github/gh-copilot`)*
 1. oh-my-posh
 1. NerdFont (installed via oh-my-posh CLI, configurable with `--nerd-font`)
 1. Spotify
@@ -225,9 +218,6 @@ In addition to core apps:
     1. MicrosoftTeams
     1. PnP.PowerShell
     1. MicrosoftPowerBIMgmt
-    1. Microsoft365DSC
-    1. Microsoft.Graph.Intune
-    1. MSAL.PS
 1. VS Code / VS Code Insiders extensions: *(same as Windows)*
 
 #### Personal Apps (included in both modes)
@@ -254,7 +244,7 @@ Work mode includes all personal apps plus work-specific additions. Currently a p
 
 1. oh-my-posh theme in zsh (`~/.zshrc`) and PowerShell (`$PROFILE`), default: `night-owl`
 1. Managed oh-my-posh config stored in `~/.config/altered-carbon/`
-1. Custom theme stored in `~/.config/oh-my-posh/themes/`
+1. The same customized theme used on Windows, including the battery-status segment, stored in `~/.config/oh-my-posh/themes/`
 1. Ghostty config at `~/.config/ghostty/config` updated with selected Nerd Font Mono variant, 14pt font size, and a dark theme (`night-owl` when available, `Catppuccin Frappe` fallback)
 1. VS Code and VS Code Insiders editor font set to selected Nerd Font Mono variant
 1. Finder: show all file extensions, show hidden files, show path bar, show status bar, list view, folders on top
@@ -295,3 +285,5 @@ The script installs tools from the following sources, in order of priority:
 1. Chocolatey (for git and developer tools that need reliable PATH handling)
 1. winget / Microsoft Store
 1. Well-known Internet sources only — direct from publisher website, no third-party or download aggregation sites
+
+On macOS, the script runs `brew update` and upgrades each managed formula or cask when Homebrew reports it is outdated. Applications found outside Homebrew are left untouched. PowerShell Gallery modules are also compared with the current gallery version and updated when needed.
