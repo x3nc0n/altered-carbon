@@ -122,8 +122,12 @@ jobs:
           # Valid winget IDs follow Publisher.Package or are MS Store IDs (alphanumeric).
           $content = Get-Content ./altered-carbon.ps1 -Raw
 
-          # Match @{ Id = '...' patterns
-          $ids = [regex]::Matches($content, "Id\s*=\s*'([^']+)'") | ForEach-Object { $_.Groups[1].Value }
+          # Match package entries explicitly sourced from winget or the Microsoft Store.
+          # This excludes Chocolatey IDs, VS Code extension IDs, and documentation examples.
+          $ids = [regex]::Matches(
+              $content,
+              "(?m)^\s*@\{\s*Id\s*=\s*'([^']+)'.*Source\s*=\s*'(winget|msstore)'"
+          ) | ForEach-Object { $_.Groups[1].Value }
 
           $invalid = @()
           foreach ($id in $ids) {
