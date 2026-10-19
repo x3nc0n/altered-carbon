@@ -39,7 +39,10 @@ param(
     [string] $Phase = 'Auto',
 
     # Skip automatic reboot at end of Phase 1.
-    [switch] $SkipReboot
+    [switch] $SkipReboot,
+
+    # Internal one-shot identifier used by the scheduled Phase 2 action.
+    [guid] $ResumeToken = [guid]::Empty
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +77,102 @@ if ($Phase -eq 'Auto') {
 Write-Host "Running in $Phase mode (admin=$isAdmin)" -ForegroundColor Cyan
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
+
+function Remove-Phase2Task {
+    param([string] $TaskName)
+
+    try {
+        $task = Get-ScheduledTask -TaskPath '\' -ErrorAction Stop |
+            Where-Object TaskName -EQ $TaskName
+        if (-not $task) { return }
+
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction Stop
+        $remaining = Get-ScheduledTask -TaskPath '\' -ErrorAction Stop |
+            Where-Object TaskName -EQ $TaskName
+        if ($remaining) { throw 'The task still exists after removal.' }
+        Write-Host "  Scheduled task '$TaskName' cleaned up." -ForegroundColor Green
+    } catch {
+        throw "Could not remove scheduled task '$TaskName'. No configuration will run. Remove it from Task Scheduler as administrator, then retry with -Phase Phase2. Details: $_"
+    }
+}
+
+function Enter-Phase2Resume {
+    param([guid] $Token)
+
+    $stateDir = Join-Path $env:LOCALAPPDATA 'altered-carbon'
+    $null = New-Item -Path $stateDir -ItemType Directory -Force -ErrorAction Stop
+    $markerPath = Join-Path $stateDir "phase2-$Token.attempted"
+    try {
+        # CreateNew makes the claim durable and prevents concurrent/repeated logons
+        # from executing configuration for the same scheduled attempt.
+        $stream = [System.IO.File]::Open($markerPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    } catch [System.IO.IOException] {
+        if (Test-Path -LiteralPath $markerPath) { return $false }
+        throw
+    }
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-Date).ToString('o'))
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    return $true
+}
+
+function Grant-Phase2TaskAccess {
+    param(
+        [string] $TaskName,
+        [string] $UserSid
+    )
+
+    # An elevated registration must allow its limited user to delete this task.
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $task = $scheduler.GetFolder('\').GetTask($TaskName)
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($task.GetSecurityDescriptor(4))
+    $sid = [System.Security.Principal.SecurityIdentifier]::new($UserSid)
+    $ace = [System.Security.AccessControl.CommonAce]::new(
+        [System.Security.AccessControl.AceFlags]::None,
+        [System.Security.AccessControl.AceQualifier]::AccessAllowed,
+        0x10000000, $sid, $false, $null
+    )
+    $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
+    $task.SetSecurityDescriptor($descriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::Access), 0)
+}
+
+function Test-LegacyOhMyPoshPath {
+    param(
+        [string] $Path,
+        [string[]] $ModuleBase
+    )
+
+    try {
+        $target = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $target.PSIsContainer -or $target.PSProvider.Name -ne 'FileSystem') { return $false }
+        $fullPath = $target.FullName.TrimEnd('\')
+        if ($fullPath -eq [System.IO.Path]::GetPathRoot($target.FullName).TrimEnd('\')) { return $false }
+        $homePath = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+        if ($fullPath -eq $homePath -or $homePath.StartsWith($fullPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        $knownPaths = @($ModuleBase | Where-Object { $_ } | ForEach-Object {
+            [System.IO.Path]::GetFullPath($_).TrimEnd('\')
+        })
+        if ($fullPath -notin $knownPaths) { return $false }
+        $ancestor = $target
+        while ($ancestor) {
+            if ($ancestor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+            $ancestor = $ancestor.Parent
+        }
+        if (Get-ChildItem -LiteralPath $fullPath -Force -Recurse -ErrorAction Stop |
+            Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
+            Select-Object -First 1) { return $false }
+        return $true
+    } catch {
+        return $false
+    }
+}
 
 function Update-PathFromRegistry {
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
@@ -621,6 +720,39 @@ function Install-NvidiaApp {
 # in this session without restarting the terminal.
 # (now handled via Update-PathFromRegistry call in orchestration block)
 
+function Set-WorkNpmRegistry {
+    $registry = 'https://packagefeedproxy.microsoft.io/npm/'
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw 'npm is required to configure the Work-only 1ES package feed.'
+    }
+    $currentRegistry = & npm config get registry --location=user 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read the npm registry configuration.' }
+    if (($currentRegistry | Out-String).Trim().TrimEnd('/') -eq $registry.TrimEnd('/')) {
+        Write-Host '  Skipped: 1ES npm feed registry already configured.' -ForegroundColor Yellow
+        return
+    }
+    $null = & npm config set registry $registry --location=user 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Could not configure the 1ES npm feed (npm exit code $LASTEXITCODE)." }
+    Write-Host '  Done: 1ES npm feed registry configured for the current user.' -ForegroundColor Green
+}
+
+function Install-Agency {
+    $agencyPath = Join-Path $env:APPDATA 'agency\CurrentVersion\agency.exe'
+    if ((Get-Command agency -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $agencyPath -PathType Leaf)) {
+        Write-Host '  Skipped: Agency already installed.' -ForegroundColor Yellow
+        return
+    }
+    Write-Host 'Installing Agency with the documented Microsoft InstallTool...' -ForegroundColor Cyan
+    # Isolate the vendor script so its exit statement cannot terminate Phase 2.
+    & pwsh -NoProfile -Command '$ErrorActionPreference = "Stop"; & ([scriptblock]::Create((Invoke-RestMethod -Uri "https://aka.ms/InstallTool.ps1"))) agency; if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+    if ($LASTEXITCODE -ne 0) { throw "Agency installation failed (exit code $LASTEXITCODE). Check corporate access/authentication and retry Phase 2." }
+    Update-PathFromRegistry
+    if (-not ((Get-Command agency -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $agencyPath -PathType Leaf))) {
+        throw 'Agency installer completed, but agency was not found. Check installer output and corporate access/authentication.'
+    }
+    Write-Host '  Done: Agency installed.' -ForegroundColor Green
+}
+
 # ── Microsoft Work IQ CLI ────────────────────────────────────────────────────
 # Work IQ is distributed as a global npm package and requires Node.js.
 function Install-WorkIqCli {
@@ -859,8 +991,12 @@ function Set-OhMyPoshProfile {
         try {
             if ($env:POSH_PATH -and (Test-Path $env:POSH_PATH)) {
                 try {
-                    Remove-Item $env:POSH_PATH -Force -Recurse -ErrorAction Stop
-                    Write-Host "  Done: removed cached module files from `$env:POSH_PATH." -ForegroundColor Green
+                    if (Test-LegacyOhMyPoshPath -Path $env:POSH_PATH -ModuleBase @($availableOhMyPoshModule | ForEach-Object ModuleBase)) {
+                        Remove-Item -LiteralPath $env:POSH_PATH -Force -Recurse -ErrorAction Stop
+                        Write-Host "  Done: removed cached module files from `$env:POSH_PATH." -ForegroundColor Green
+                    } else {
+                        Write-Warning '  Skipped unsafe or unrecognized POSH_PATH; only a discovered legacy oh-my-posh module directory can be removed.'
+                    }
                 } catch {
                     Write-Warning "  Could not remove `$env:POSH_PATH: $_"
                 }
@@ -1286,6 +1422,21 @@ function Show-VerificationSummary {
 # ── Main Orchestration ────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Retire the logon trigger before any initialization/configuration can fail.
+if ($Phase -eq 'Phase2') {
+    $resumeAllowed = $true
+    try {
+        if ($ResumeToken -ne [guid]::Empty) {
+            $resumeAllowed = Enter-Phase2Resume -Token $ResumeToken
+        }
+    } finally {
+        Remove-Phase2Task -TaskName $taskName
+    }
+    if (-not $resumeAllowed) {
+        throw 'This scheduled Phase 2 attempt has already been consumed. Retry manually with -Work or -Personal and -Phase Phase2 (without -ResumeToken).'
+    }
+}
+
 # Shared init (idempotent, both phases)
 $psModuleDir = Initialize-PSModulePath
 $profileInfo = Initialize-PSProfileDir
@@ -1298,11 +1449,7 @@ if ($Phase -eq 'Phase1') {
     # ── Phase 1: Admin installs + Windows features + schedule Phase 2 ────────
 
     # Clean up any leftover Phase 2 scheduled task from a previous run
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host "  Cleaned up leftover '$taskName' scheduled task from previous run." -ForegroundColor Yellow
-    }
+    Remove-Phase2Task -TaskName $taskName
 
     Install-Chocolatey -IsAdmin $isAdmin
     $chocoSkips = Install-ChocolateyPackages -IsAdmin $isAdmin -CurrentSkipPackages $SkipPackages
@@ -1321,11 +1468,20 @@ if ($Phase -eq 'Phase1') {
         $modeSwitch = if ($Work.IsPresent) { '-Work' } else { '-Personal' }
         $pwshPath   = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
         if (-not $pwshPath) { $pwshPath = 'pwsh' }
-        $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2"
-        $trigger   = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+        $resumeId  = [guid]::NewGuid()
+        $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2 -ResumeToken $resumeId"
+        $userSid   = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $trigger   = New-ScheduledTaskTrigger -AtLogon -User $userSid
+        $principal = New-ScheduledTaskPrincipal -UserId $userSid -LogonType Interactive -RunLevel Limited
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        try {
+            Grant-Phase2TaskAccess -TaskName $taskName -UserSid $userSid
+        } catch {
+            $accessError = $_
+            Remove-Phase2Task -TaskName $taskName
+            throw "Could not grant the Phase 2 user permission to retire its scheduled task: $accessError"
+        }
         Write-Host "  Scheduled task '$taskName' registered for Phase 2 at next logon." -ForegroundColor Green
     }
 
@@ -1339,6 +1495,11 @@ if ($Phase -eq 'Phase1') {
     }
 } elseif ($Phase -eq 'Phase2') {
     # ── Phase 2: User-space config + cleanup ─────────────────────────────────
+    if ($Work.IsPresent) {
+        Set-WorkNpmRegistry
+        Install-Agency
+    }
+
     # Install Spotify (requires non-admin)
     Write-Host 'Installing Spotify (user-space)...' -ForegroundColor Cyan
     $spotifyOutput = winget install --id 'Spotify.Spotify' --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { $_.ToString() }
@@ -1389,9 +1550,6 @@ if ($Phase -eq 'Phase1') {
     Set-FileExplorerOptions
     Show-VerificationSummary
 
-    # Clean up scheduled task
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Host "  Scheduled task '$taskName' cleaned up." -ForegroundColor Green
 }
 
 Write-Host "`nSetup complete." -ForegroundColor Green

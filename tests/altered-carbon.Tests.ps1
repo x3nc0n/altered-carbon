@@ -266,6 +266,10 @@ Describe 'Script Structure' {
         $fnNames | Should -Contain 'Compare-WingetVersions'
         $fnNames | Should -Contain 'Stop-WingetUpgradeProcess'
         $fnNames | Should -Contain 'Invoke-ElevatedFontPromotion'
+        $fnNames | Should -Contain 'Enter-Phase2Resume'
+        $fnNames | Should -Contain 'Remove-Phase2Task'
+        $fnNames | Should -Contain 'Grant-Phase2TaskAccess'
+        $fnNames | Should -Contain 'Test-LegacyOhMyPoshPath'
         $fnNames | Should -Contain 'Get-CommandVersion'
         $fnNames | Should -Contain 'Set-OhMyPoshProfile'
         $fnNames | Should -Contain 'Write-VerificationLine'
@@ -578,6 +582,511 @@ Describe 'Enable-WindowsFeatures' {
         Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
             $Message -like '*feature management is unavailable*'
         }
+    }
+}
+
+Describe 'Work-only npm registry and Agency' -Tag 'WorkTools' {
+    BeforeAll {
+        function npm { param([Parameter(ValueFromRemainingArguments)] [string[]]$Arguments) throw 'Unmocked npm invocation' }
+        function pwsh { param([Parameter(ValueFromRemainingArguments)] [string[]]$Arguments) throw 'Unmocked installer invocation' }
+        $agencyPath = Join-Path $env:APPDATA 'agency\CurrentVersion\agency.exe'
+        $workGuard = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -eq '$Work.IsPresent' -and
+            $node.Extent.Text -match '\bSet-WorkNpmRegistry\b'
+        }, $true)
+        $workGuard.Count | Should -Be 1
+        $runWorkGuard = [scriptblock]::Create($workGuard.Extent.Text)
+    }
+
+    BeforeEach {
+        $script:npmRegistry = 'https://registry.npmjs.org/'
+        $script:npmReadStatus = 0
+        $script:npmWriteStatus = 0
+        $script:agencyInstalled = $false
+        Mock Write-Host {}
+        Mock Get-Command { [pscustomobject]@{ Name = 'npm' } } -ParameterFilter { $Name -eq 'npm' }
+        Mock Get-Command {
+            if ($script:agencyInstalled) { [pscustomobject]@{ Name = 'agency' } }
+        } -ParameterFilter { $Name -eq 'agency' }
+        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -eq $agencyPath }
+        Mock Update-PathFromRegistry {}
+        Mock Invoke-RestMethod { throw 'Network access must remain inside the mocked installer process' }
+        Mock npm {
+            if ($Arguments[1] -eq 'get') {
+                $global:LASTEXITCODE = $script:npmReadStatus
+                $script:npmRegistry
+            } elseif ($Arguments[1] -eq 'set') {
+                $global:LASTEXITCODE = $script:npmWriteStatus
+                if ($script:npmWriteStatus -eq 0) { $script:npmRegistry = $Arguments[3] }
+            } else {
+                throw "Unexpected npm invocation: $Arguments"
+            }
+        }
+        Mock pwsh { $global:LASTEXITCODE = 0; $script:agencyInstalled = $true }
+    }
+
+    It 'gates both operations to Work in Phase 2, not Personal' {
+        $phaseBranch = $workGuard.Parent.Parent
+        $phaseBranch | Should -BeOfType ([System.Management.Automation.Language.IfStatementAst])
+        $phase2Clause = $phaseBranch.Clauses.Where({ $_.Item1.Extent.Text -eq '$Phase -eq ''Phase2''' })
+        $phase2Clause.Count | Should -Be 1
+        $workGuard.Extent.StartOffset | Should -BeGreaterThan $phase2Clause[0].Item2.Extent.StartOffset
+        $workGuard.Extent.EndOffset | Should -BeLessThan $phase2Clause[0].Item2.Extent.EndOffset
+        $calls = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -in @('Set-WorkNpmRegistry', 'Install-Agency')
+        }, $true)
+        $calls.Count | Should -Be 2
+        foreach ($call in $calls) {
+            $call.Extent.StartOffset | Should -BeGreaterThan $workGuard.Extent.StartOffset
+            $call.Extent.EndOffset | Should -BeLessThan $workGuard.Extent.EndOffset
+        }
+        Mock Set-WorkNpmRegistry {}
+        Mock Install-Agency {}
+        $Work = [switch]$false
+        & $runWorkGuard
+        Should -Invoke Set-WorkNpmRegistry -Times 0 -Exactly
+        Should -Invoke Install-Agency -Times 0 -Exactly
+        $Work = [switch]$true
+        & $runWorkGuard
+        Should -Invoke Set-WorkNpmRegistry -Times 1 -Exactly
+        Should -Invoke Install-Agency -Times 1 -Exactly
+    }
+
+    It 'does not start Agency after registry configuration fails' {
+        Mock Set-WorkNpmRegistry { throw 'Registry unavailable' }
+        Mock Install-Agency {}
+        $Work = [switch]$true
+        { & $runWorkGuard } | Should -Throw '*Registry unavailable*'
+        Should -Invoke Install-Agency -Times 0 -Exactly
+    }
+
+    It 'propagates Agency failure from the Work orchestration' {
+        Mock Set-WorkNpmRegistry {}
+        Mock Install-Agency { throw 'Installer denied' }
+        $Work = [switch]$true
+        { & $runWorkGuard } | Should -Throw '*Installer denied*'
+    }
+
+    It 'sets only the current-user npm registry and is idempotent on a second run' {
+        Set-WorkNpmRegistry
+        Set-WorkNpmRegistry
+        Should -Invoke npm -Times 2 -Exactly -ParameterFilter {
+            ($Arguments -join ' ') -eq 'config get registry --location=user'
+        }
+        Should -Invoke npm -Times 1 -Exactly -ParameterFilter {
+            ($Arguments -join ' ') -eq 'config set registry https://packagefeedproxy.microsoft.io/npm/ --location=user'
+        }
+        Should -Invoke npm -Times 3 -Exactly
+    }
+
+    It 'accepts an existing registry without a trailing slash' {
+        $script:npmRegistry = " https://packagefeedproxy.microsoft.io/npm `n"
+        Set-WorkNpmRegistry
+        Should -Invoke npm -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*already configured*' }
+    }
+
+    It 'fails before invoking npm when it is missing' {
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'npm' }
+        { Set-WorkNpmRegistry } | Should -Throw '*npm is required*'
+        Should -Invoke npm -Times 0 -Exactly
+    }
+
+    It 'fails a nonzero registry read without attempting a write' {
+        $script:npmReadStatus = 17
+        { Set-WorkNpmRegistry } | Should -Throw '*Could not read the npm registry*'
+        Should -Invoke npm -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Done:*' }
+    }
+
+    It 'does not accept an apparently matching registry from a failed read' {
+        $script:npmRegistry = 'https://packagefeedproxy.microsoft.io/npm/'
+        $script:npmReadStatus = 17
+        { Set-WorkNpmRegistry } | Should -Throw '*Could not read the npm registry*'
+        Should -Invoke Write-Host -Times 0
+    }
+
+    It 'fails a nonzero registry write without reporting success' {
+        $script:npmWriteStatus = 23
+        { Set-WorkNpmRegistry } | Should -Throw '*Could not configure the 1ES npm feed*npm exit code 23*'
+        Should -Invoke npm -Times 2 -Exactly
+        Should -Invoke Write-Host -Times 0
+    }
+
+    It 'skips Agency when its command already exists' {
+        $script:agencyInstalled = $true
+        Install-Agency
+        Should -Invoke pwsh -Times 0 -Exactly
+        Should -Invoke Update-PathFromRegistry -Times 0 -Exactly
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*Skipped: Agency already installed*' }
+    }
+
+    It 'skips Agency at its per-user executable even when PATH is stale' {
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $agencyPath -and $PathType -eq 'Leaf' }
+        Install-Agency
+        Should -Invoke pwsh -Times 0 -Exactly
+        Should -Invoke Update-PathFromRegistry -Times 0 -Exactly
+    }
+
+    It 'isolates the documented vendor installer and refreshes PATH before detection' {
+        Mock Update-PathFromRegistry { $script:agencyInstalled = $true }
+        Mock pwsh { $global:LASTEXITCODE = 0 }
+        Install-Agency
+        Should -Invoke pwsh -Times 1 -Exactly -ParameterFilter {
+            $Arguments[0] -eq '-NoProfile' -and $Arguments[1] -eq '-Command' -and
+            $Arguments[2] -match 'https://aka\.ms/InstallTool\.ps1' -and
+            $Arguments[2] -match '\)\) agency;' -and $Arguments[2] -match 'exit \$LASTEXITCODE'
+        }
+        Should -Invoke Update-PathFromRegistry -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*Done: Agency installed*' }
+    }
+
+    It 'accepts the installed executable when the new command is not yet on PATH' {
+        $script:installerCompleted = $false
+        Mock pwsh { $global:LASTEXITCODE = 0; $script:installerCompleted = $true }
+        Mock Test-Path { $script:installerCompleted } -ParameterFilter { $LiteralPath -eq $agencyPath }
+        Install-Agency
+        Should -Invoke Update-PathFromRegistry -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*Done: Agency installed*' }
+    }
+
+    It 'fails a nonzero installer without refreshing PATH or reporting success' {
+        Mock pwsh { $global:LASTEXITCODE = 31 }
+        { Install-Agency } | Should -Throw '*Agency installation failed*exit code 31*corporate access/authentication*'
+        Should -Invoke Update-PathFromRegistry -Times 0 -Exactly
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Done:*' }
+    }
+
+    It 'rejects installer success if neither the command nor executable can be found' {
+        Mock pwsh { $global:LASTEXITCODE = 0 }
+        { Install-Agency } | Should -Throw '*installer completed, but agency was not found*'
+        Should -Invoke Update-PathFromRegistry -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Done:*' }
+    }
+}
+
+Describe 'Standalone Copilot CLI removal' -Tag 'BootstrapSafety' {
+    BeforeAll {
+        function gh { throw 'Verification must not invoke gh subcommands' }
+        function copilot { throw 'Verification must not invoke standalone Copilot' }
+        function code { 'github.copilot-chat' }
+        function code-insiders { 'github.copilot-chat' }
+    }
+    BeforeEach {
+        Mock Get-CommandVersion { '1.2.3' }
+        Mock Get-Command { $null } -ParameterFilter { $Name -in @('code', 'code-insiders') }
+        Mock Write-VerificationLine {}
+        Mock Write-Host {}
+    }
+
+    It 'has no standalone installer, package, presence probe or command invocation' {
+        $functionDefs.Name | Should -Not -Contain 'Install-GitHubCopilotCli'
+        $scriptContent | Should -Not -Match '(?i)GitHub Copilot CLI|@github/copilot|gh-copilot|Install-GitHubCopilotCli'
+        $packageDefinition = $ast.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $_.Left.Extent.Text -eq '$corePackages'
+        }
+        $packages = & ([scriptblock]::Create($packageDefinition.Right.Extent.Text))
+        $packages.Id | Should -Contain 'GitHub.cli'
+        $packages.Id | Should -Not -Contain 'GitHub.Copilot'
+        $commands = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true)
+        foreach ($command in $commands) {
+            $command.GetCommandName() | Should -Not -Be 'copilot'
+            $command.Extent.Text | Should -Not -Match '(?i)\bgh\s+(copilot|extension)\b|(?:Get-Command|Get-CommandVersion).*-Command\s+[''"]?copilot\b'
+            if ($command.GetCommandName() -in @('Get-Command', 'Get-CommandVersion')) {
+                $arguments = $command.CommandElements | Where-Object {
+                    $_ -is [System.Management.Automation.Language.StringConstantExpressionAst]
+                }
+                $arguments.Value | Should -Not -Contain 'copilot'
+            }
+        }
+    }
+
+    It 'verifies GitHub CLI without probing or reporting standalone Copilot' {
+        Show-VerificationSummary
+        Should -Invoke Get-CommandVersion -Times 1 -Exactly -ParameterFilter { $Command -eq 'gh' }
+        Should -Invoke Get-CommandVersion -Times 0 -Exactly -ParameterFilter { $Command -match 'copilot' }
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'GitHub CLI' -and $Installed -and $Details -eq '1.2.3'
+        }
+        Should -Invoke Write-VerificationLine -Times 0 -Exactly -ParameterFilter { $Label -match 'Copilot.*CLI' }
+        $scriptContent | Should -Match "Id\s*=\s*'GitHub\.cli'"
+        $scriptContent | Should -Match "Id\s*=\s*'github\.copilot-chat'"
+    }
+
+    It 'still verifies the current Copilot Chat extension in both editors without retired or synthetic results' {
+        Mock Get-Command { [pscustomobject]@{ Name = $Name } } -ParameterFilter { $Name -in @('code', 'code-insiders') }
+        Show-VerificationSummary
+        Should -Invoke Write-VerificationLine -Times 0 -Exactly -ParameterFilter {
+            $Label -eq '  GitHub Copilot'
+        }
+        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
+            $Label -eq '  GitHub Copilot Chat' -and $Installed
+        }
+        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
+            $Details -eq 'github.copilot-chat' -and $Installed
+        }
+    }
+}
+
+Describe 'Phase 2 one-shot resume safety' -Tag 'BootstrapSafety' {
+    BeforeAll {
+        $resumeGuard = $ast.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -eq '$Phase -eq ''Phase2'''
+        } | Select-Object -First 1
+        $resumeGuard | Should -Not -BeNullOrEmpty
+        $runGuard = [scriptblock]::Create($resumeGuard.Extent.Text + "`nInitialize-PSModulePath")
+        $sandbox = Join-Path $PSScriptRoot ".sandbox\resume-$([guid]::NewGuid())"
+        $oldLocalAppData = $env:LOCALAPPDATA
+        $null = New-Item -Path $sandbox -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $env:LOCALAPPDATA = $sandbox
+        $script:Phase = 'Phase2'
+        $script:ResumeToken = [guid]::NewGuid()
+        $script:taskName = 'altered-carbon-test-only'
+        Mock Write-Host {}
+        Mock Initialize-PSModulePath { 'configuration reached' }
+        Mock Get-ScheduledTask { }
+        Mock Unregister-ScheduledTask {}
+    }
+
+    AfterAll {
+        $env:LOCALAPPDATA = $oldLocalAppData
+        Remove-Item -LiteralPath $sandbox -Recurse -Force
+    }
+
+    It 'durably claims an attempt and refuses it after functions are reloaded' {
+        Enter-Phase2Resume -Token $ResumeToken | Should -BeTrue
+        $marker = Join-Path $sandbox "altered-carbon\phase2-$ResumeToken.attempted"
+        $timestamp = Get-Content -LiteralPath $marker -Raw
+        { [datetime]::Parse($timestamp) } | Should -Not -Throw
+        Invoke-Expression ($functionDefs | Where-Object Name -EQ 'Enter-Phase2Resume').Extent.Text
+        Enter-Phase2Resume -Token $ResumeToken | Should -BeFalse
+        Get-Content -LiteralPath $marker -Raw | Should -Be $timestamp
+        Enter-Phase2Resume -Token ([guid]::NewGuid()) | Should -BeTrue
+    }
+
+    It 'removes and verifies the task before allowing initialization' {
+        $script:taskReads = 0
+        Mock Get-ScheduledTask {
+            $script:taskReads++
+            if ($script:taskReads -eq 1) { [pscustomobject]@{ TaskName = 'altered-carbon-test-only' } }
+        }
+        Mock Initialize-PSModulePath {
+            $script:taskReads | Should -Be 2
+            Test-Path (Join-Path $sandbox "altered-carbon\phase2-$ResumeToken.attempted") | Should -BeTrue
+        }
+        & $runGuard
+        Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            $TaskName -eq 'altered-carbon-test-only' -and $TaskPath -eq '\' -and -not $Confirm -and $ErrorAction -eq 'Stop'
+        }
+        Should -Invoke Initialize-PSModulePath -Times 1 -Exactly
+    }
+
+    It 'fails loudly and blocks initialization if deletion is denied' {
+        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'altered-carbon-test-only' } }
+        Mock Unregister-ScheduledTask { throw 'Access denied' }
+        { & $runGuard } | Should -Throw '*Could not remove scheduled task*Access denied*'
+        Should -Invoke Initialize-PSModulePath -Times 0
+        Enter-Phase2Resume -Token $ResumeToken | Should -BeFalse
+    }
+
+    It 'blocks initialization when unregister returns but the task remains' {
+        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'altered-carbon-test-only' } }
+        { & $runGuard } | Should -Throw '*task still exists after removal*'
+        Should -Invoke Initialize-PSModulePath -Times 0
+    }
+
+    It 'fails closed if task enumeration fails' {
+        Mock Get-ScheduledTask { throw 'Scheduler unavailable' }
+        { & $runGuard } | Should -Throw '*Could not remove scheduled task*Scheduler unavailable*'
+        Should -Invoke Initialize-PSModulePath -Times 0
+    }
+
+    It 'still retires the task on duplicate attempts without configuring again' {
+        $null = Enter-Phase2Resume -Token $ResumeToken
+        Mock Remove-Phase2Task {}
+        { & $runGuard } | Should -Throw '*already been consumed*'
+        Should -Invoke Remove-Phase2Task -Times 1 -Exactly
+        Should -Invoke Initialize-PSModulePath -Times 0
+    }
+
+    It 'still retires the task if durable claim creation fails' {
+        Mock Enter-Phase2Resume { throw 'Disk unavailable' }
+        Mock Remove-Phase2Task {}
+        { & $runGuard } | Should -Throw '*Disk unavailable*'
+        Should -Invoke Remove-Phase2Task -Times 1 -Exactly
+        Should -Invoke Initialize-PSModulePath -Times 0
+    }
+
+    It 'does not retry configuration on the next logon after initialization fails' {
+        Mock Initialize-PSModulePath { throw 'Initialization failed' }
+        { & $runGuard } | Should -Throw '*Initialization failed*'
+        { & $runGuard } | Should -Throw '*already been consumed*'
+        Should -Invoke Initialize-PSModulePath -Times 1 -Exactly
+    }
+
+    It 'allows manual Phase 2 without claiming a scheduled token' {
+        $script:ResumeToken = [guid]::Empty
+        Mock Enter-Phase2Resume { throw 'Must not claim manual runs' }
+        & $runGuard | Should -Be 'configuration reached'
+        Should -Invoke Enter-Phase2Resume -Times 0
+    }
+}
+
+Describe 'Phase 2 scheduled task ACL preservation' -Tag 'BootstrapSafety' {
+    It 'preserves existing ACEs and grants the limited user generic-all including deletion' {
+        $script:originalSddl = 'O:SYG:SYD:P(A;;FA;;;SY)(A;;FR;;;BA)'
+        $script:writtenSddl = $null
+        $script:taskStub = [pscustomobject]@{}
+        $taskStub | Add-Member ScriptMethod GetSecurityDescriptor {
+            param($sections)
+            $sections | Should -Be 4
+            return $script:originalSddl
+        }
+        $taskStub | Add-Member ScriptMethod SetSecurityDescriptor {
+            param($sddl, $flags)
+            $flags | Should -Be 0
+            $script:writtenSddl = $sddl
+        }
+        $folder = [pscustomobject]@{} | Add-Member ScriptMethod GetTask {
+            param($name)
+            $name | Should -Be 'altered-carbon-test-only'
+            return $script:taskStub
+        } -PassThru
+        $scheduler = [pscustomobject]@{ Folder = $folder }
+        $scheduler | Add-Member ScriptMethod Connect {}
+        $scheduler | Add-Member ScriptMethod GetFolder {
+            param($path)
+            $path | Should -Be '\'
+            return $this.Folder
+        }
+        Mock New-Object { $scheduler } -ParameterFilter { $ComObject -eq 'Schedule.Service' }
+
+        $userSid = 'S-1-5-21-111-222-333-1001'
+        Grant-Phase2TaskAccess -TaskName 'altered-carbon-test-only' -UserSid $userSid
+
+        $before = [System.Security.AccessControl.RawSecurityDescriptor]::new($originalSddl)
+        $after = [System.Security.AccessControl.RawSecurityDescriptor]::new($writtenSddl)
+        $after.DiscretionaryAcl.Count | Should -Be ($before.DiscretionaryAcl.Count + 1)
+        $after.ControlFlags | Should -Be $before.ControlFlags
+        for ($i = 0; $i -lt $before.DiscretionaryAcl.Count; $i++) {
+            $beforeBytes = [byte[]]::new($before.DiscretionaryAcl[$i].BinaryLength)
+            $afterBytes = [byte[]]::new($after.DiscretionaryAcl[$i].BinaryLength)
+            $before.DiscretionaryAcl[$i].GetBinaryForm($beforeBytes, 0)
+            $after.DiscretionaryAcl[$i].GetBinaryForm($afterBytes, 0)
+            [Convert]::ToBase64String($afterBytes) | Should -Be ([Convert]::ToBase64String($beforeBytes))
+            $after.DiscretionaryAcl[$i].AccessMask | Should -Be $before.DiscretionaryAcl[$i].AccessMask
+            $after.DiscretionaryAcl[$i].SecurityIdentifier.Value | Should -Be $before.DiscretionaryAcl[$i].SecurityIdentifier.Value
+        }
+        $grant = $after.DiscretionaryAcl[$after.DiscretionaryAcl.Count - 1]
+        $grant.SecurityIdentifier.Value | Should -Be $userSid
+        $grant.AccessMask | Should -Be 0x10000000
+        $grant.AceQualifier | Should -Be ([System.Security.AccessControl.AceQualifier]::AccessAllowed)
+    }
+}
+
+Describe 'Legacy POSH_PATH deletion safety' -Tag 'BootstrapSafety' {
+    BeforeAll {
+        function Get-InstalledModule {
+            param($Name, $ErrorAction)
+            throw 'Get-InstalledModule must be mocked'
+        }
+        $sandbox = Join-Path $PSScriptRoot ".sandbox\posh-$([guid]::NewGuid())"
+        $modulePath = Join-Path $sandbox 'home\Documents\PowerShell\Modules\oh-my-posh\7.0.0'
+        $oldHome = $env:USERPROFILE
+        $oldPoshPath = $env:POSH_PATH
+        $null = New-Item -Path $modulePath -ItemType Directory -Force
+        Set-Content (Join-Path $modulePath 'oh-my-posh.psd1') '@{}'
+    }
+    BeforeEach {
+        $env:USERPROFILE = Join-Path $sandbox 'home'
+    }
+    AfterAll {
+        $env:USERPROFILE = $oldHome
+        $env:POSH_PATH = $oldPoshPath
+        Remove-Item -LiteralPath $sandbox -Recurse -Force
+    }
+
+    It 'rejects roots, home, ancestors, unrecognized directories, files and missing paths' {
+        $unsafePaths = @(
+            [System.IO.Path]::GetPathRoot($sandbox),
+            $env:USERPROFILE,
+            $sandbox,
+            (Split-Path $modulePath -Parent),
+            (Join-Path $modulePath 'oh-my-posh.psd1'),
+            (Join-Path $sandbox 'missing'),
+            '',
+            'HKCU:\Software'
+        )
+        foreach ($unsafe in $unsafePaths) {
+            Test-LegacyOhMyPoshPath -Path $unsafe -ModuleBase @($modulePath) | Should -BeFalse -Because "'$unsafe' is not safe to delete"
+        }
+        foreach ($unsafe in @([System.IO.Path]::GetPathRoot($sandbox), $env:USERPROFILE, $sandbox)) {
+            Test-LegacyOhMyPoshPath -Path $unsafe -ModuleBase @($unsafe) | Should -BeFalse
+        }
+        Test-LegacyOhMyPoshPath -Path $modulePath -ModuleBase @() | Should -BeFalse
+    }
+
+    It 'allows only an exact discovered module directory including normalized trailing separators' {
+        Test-LegacyOhMyPoshPath -Path $modulePath -ModuleBase @($modulePath) | Should -BeTrue
+        Test-LegacyOhMyPoshPath -Path "$modulePath\" -ModuleBase @("$modulePath\") | Should -BeTrue
+        $unversioned = Split-Path $modulePath -Parent
+        Test-LegacyOhMyPoshPath -Path $unversioned -ModuleBase @($unversioned) | Should -BeTrue
+        Test-LegacyOhMyPoshPath -Path $modulePath -ModuleBase @((Split-Path $modulePath -Parent)) | Should -BeFalse
+    }
+
+    It 'rejects a reparse point on the target, an ancestor or any descendant' {
+        foreach ($location in @('target', 'parent', 'child')) {
+            $parent = [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::Directory; Parent = $null }
+            $target = [pscustomobject]@{
+                PSIsContainer = $true; PSProvider = @{ Name = 'FileSystem' }
+                FullName = $modulePath; Attributes = [System.IO.FileAttributes]::Directory; Parent = $parent
+            }
+            if ($location -eq 'target') { $target.Attributes = [System.IO.FileAttributes]::ReparsePoint }
+            if ($location -eq 'parent') { $parent.Attributes = [System.IO.FileAttributes]::ReparsePoint }
+            Mock Get-Item { $target }
+            Mock Get-ChildItem {
+                if ($location -eq 'child') { [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint } }
+            }
+            Test-LegacyOhMyPoshPath -Path $modulePath -ModuleBase @($modulePath) | Should -BeFalse -Because "$location reparse points must block deletion"
+        }
+    }
+
+    It 'fails closed when descendant enumeration is denied' {
+        Mock Get-ChildItem { throw 'Access denied' }
+        Test-LegacyOhMyPoshPath -Path $modulePath -ModuleBase @($modulePath) | Should -BeFalse
+    }
+
+    It 'uses the guard before recursive literal-path deletion and leaves unsafe paths alone' {
+        Mock Get-Module { [pscustomobject]@{ ModuleBase = $modulePath } } -ParameterFilter {
+            $ListAvailable -and $Name -eq 'oh-my-posh'
+        }
+        Mock Get-InstalledModule { $null }
+        Mock Test-Path { $true }
+        Mock Remove-Item {}
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        # Stop immediately after the migration block, before any profile configuration.
+        Mock Set-Content { throw 'test stop before profile writes' }
+        Mock Get-Content { '' }
+        foreach ($path in @($env:USERPROFILE, $sandbox, (Split-Path $modulePath -Parent), $modulePath)) {
+            $env:POSH_PATH = $path
+            { Set-OhMyPoshProfile -ThemeName 'night-owl' -ProfileDir $sandbox -ProfileFile (Join-Path $sandbox 'profile.ps1') } |
+                Should -Throw '*test stop before profile writes*'
+        }
+        Should -Invoke Remove-Item -Times 1 -Exactly -ParameterFilter {
+            $LiteralPath -eq $modulePath -and $Recurse -and $Force -and $ErrorAction -eq 'Stop'
+        }
+        Should -Invoke Remove-Item -Times 1 -Exactly
+        Should -Invoke Write-Warning -Times 3 -Exactly -ParameterFilter { $Message -like '*Skipped unsafe*' }
     }
 }
 

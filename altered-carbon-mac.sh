@@ -241,6 +241,45 @@ ensure_cask() {
     fi
 }
 
+configure_work_npm_registry() {
+    local registry="https://packagefeedproxy.microsoft.io/npm/"
+    local current_registry=""
+    if ! command -v npm &>/dev/null; then
+        fail "npm is required to configure the Work-only 1ES package feed."
+        return 1
+    fi
+    if ! current_registry="$(npm config get registry --location=user 2>/dev/null)"; then
+        fail "Could not read the npm registry configuration."
+        return 1
+    fi
+    if [[ "${current_registry%/}" == "${registry%/}" ]]; then
+        skip "1ES npm feed registry already configured."
+        return 0
+    fi
+    if ! npm config set registry "$registry" --location=user; then
+        fail "Could not configure the 1ES npm feed."
+        return 1
+    fi
+    ok "1ES npm feed registry configured for the current user."
+}
+
+install_agency() {
+    if command -v agency &>/dev/null; then
+        skip "Agency already installed."
+        return 0
+    fi
+    info "Installing Agency with the documented Microsoft InstallTool..."
+    if ! curl -sSfL https://aka.ms/InstallTool.sh | sh -s agency; then
+        fail "Agency installation failed. Check corporate access/authentication and rerun --work."
+        return 1
+    fi
+    if command -v agency &>/dev/null; then
+        ok "Agency installed."
+    else
+        warn "Agency installer completed. Restart your terminal session to put agency on PATH before rerunning --work."
+    fi
+}
+
 ensure_vscode_ext() {
     local editor="$1"
     local ext_id="$2"
@@ -392,9 +431,8 @@ echo ""
 if [[ "$MODE" == "work" ]]; then
     info "Installing work-only packages..."
     echo ""
-    # Placeholder — add work-only packages here as needed.
-    # Example: ensure_cask intune-company-portal "Intune Company Portal"
-    skip "No work-only packages configured yet."
+    configure_work_npm_registry || exit 1
+    install_agency || exit 1
     echo ""
 fi
 

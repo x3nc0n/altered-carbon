@@ -17,6 +17,10 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 
 > **Tip:** Run as Administrator for full functionality (Chocolatey installs, Hyper-V, WSL 2).
 
+Windows uses two phases: elevated installation, then non-elevated configuration at the next logon after reboot. The reboot still requires confirmation; `-SkipReboot` leaves it to you. Phase 2 removes its logon task **before** initialization or configuration, so a configuration error does not retry at every login. New tasks grant the current user permission to remove that task.
+
+Each scheduled attempt also records a durable one-shot marker in `%LOCALAPPDATA%\altered-carbon`. If task cleanup fails, the script stops with an error rather than claiming success or running configuration. Remove `altered-carbon-phase2` from Task Scheduler as administrator if directed, then retry from a non-elevated shell with `.\altered-carbon.ps1 -Work -Phase Phase2` (or `-Personal`). Do not supply the internal `-ResumeToken` on a manual retry.
+
 ### macOS (Shell)
 
 ```bash
@@ -86,6 +90,8 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 | `-NerdFont` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
 | `-SkipPackages` | No | _(none)_ | winget package IDs to exclude from the default list |
 | `-ExtraPackages` | No | _(none)_ | Additional `@{Id='...'; Name='...'}` hashtables to install |
+| `-Phase` | No | `Auto` | `Phase1` for installation; `Phase2` for manual configuration/retry; `Auto` selects by elevation |
+| `-SkipReboot` | No | Off | Leave reboot to the user after Phase 1 |
 
 \* One of `-Work` or `-Personal` must be specified.
 
@@ -116,7 +122,7 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 1. git *(via Chocolatey when admin, winget fallback)*
 1. Node.js (LTS) *(via Chocolatey when admin, winget fallback)*
 1. GitHub Desktop
-1. GitHub CLI
+1. GitHub CLI *(includes Copilot CLI; no separate installation or verification)*
 1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`)*
 1. oh-my-posh
 1. PowerToys
@@ -167,6 +173,13 @@ In addition to core apps:
 1. Adobe Lightroom
 1. Xbox
 
+#### Work Mode Only (`-Work`)
+
+1. Sets the current user's npm registry to the 1ES package feed proxy (`https://packagefeedproxy.microsoft.io/npm/`), only when it differs.
+1. Installs Agency through Microsoft's documented InstallTool (`https://aka.ms/InstallTool.ps1`, product `agency`), unless Agency is already installed.
+
+These steps run in non-elevated Phase 2. They do not set HTTP proxy options, copy authentication tokens, or change Personal-mode configuration. Corporate network access and any required authentication must already be available; failures stop with guidance to retry Phase 2.
+
 #### Configuration Applied
 
 1. Windows Terminal Preview as default terminal
@@ -192,7 +205,7 @@ In addition to core apps:
 1. git
 1. git LFS
 1. Node.js
-1. GitHub CLI
+1. GitHub CLI *(includes Copilot CLI; no separate installation or verification)*
 1. oh-my-posh
 1. NerdFont (installed via oh-my-posh CLI, configurable with `--nerd-font`)
 1. Spotify
@@ -238,7 +251,12 @@ In addition to core apps:
 
 #### Work Mode Only (`--work`)
 
-Work mode includes all personal apps plus work-specific additions. Currently a placeholder for apps like Intune Company Portal.
+Work mode includes all personal apps plus:
+
+1. The current user's npm registry set to the 1ES package feed proxy (`https://packagefeedproxy.microsoft.io/npm/`), only when it differs.
+1. Agency installed through Microsoft's documented InstallTool (`https://aka.ms/InstallTool.sh`, product `agency`), unless already installed.
+
+These Work-only steps do not set HTTP proxy options or copy authentication tokens. Corporate network access and any required authentication must already be available. Personal runs do not configure the work feed or install Agency.
 
 #### Configuration Applied
 

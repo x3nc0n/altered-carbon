@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Work-only 1ES npm feed registry configuration at user scope and Agency installation through the documented Microsoft InstallTool. Existing Agency installations are skipped; authentication and HTTP proxy settings are left untouched.
+
+### Changed
+- Windows and macOS now rely on Copilot CLI being included with GitHub CLI instead of separately installing or upgrading the legacy `github/gh-copilot` extension.
+- Removed standalone Copilot CLI presence/version checks and post-install verification; GitHub CLI installation and verification and editor Copilot configuration are unchanged.
+
+### Fixed
+- Windows Phase 2 retires its scheduled task before initialization/configuration and uses a durable one-shot attempt marker to prevent repeated configuration after failures. Cleanup failures stop the run with manual recovery guidance; new tasks grant their user permission to remove them.
+- Legacy oh-my-posh cache deletion now accepts only discovered module directories, rejecting filesystem roots, user-profile ancestors, and reparse points instead of recursively deleting an unchecked `POSH_PATH`.
+
 ## [1.1.0] - 2026-10-02
 
 ### Changed
