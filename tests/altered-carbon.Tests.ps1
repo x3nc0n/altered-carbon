@@ -824,8 +824,11 @@ Describe 'Standalone Copilot CLI removal' -Tag 'BootstrapSafety' {
         Should -Invoke Write-VerificationLine -Times 0 -Exactly -ParameterFilter {
             $Label -eq '  GitHub Copilot'
         }
-        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
-            $Label -eq '  GitHub Copilot Chat' -and $Installed
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq '  GitHub Copilot Chat extension for VS Code' -and $Installed
+        }
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq '  GitHub Copilot Chat extension for VS Code Insiders' -and $Installed
         }
         Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
             $Details -eq 'github.copilot-chat' -and $Installed
@@ -833,12 +836,272 @@ Describe 'Standalone Copilot CLI removal' -Tag 'BootstrapSafety' {
     }
 }
 
+Describe 'Editor Copilot Chat package verification' -Tag 'CopilotVerification' {
+    BeforeAll {
+        function code {
+            param([Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
+            Invoke-TestEditor -Editor 'code' -Arguments $Arguments
+        }
+        function code-insiders {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '', Justification = 'Test double for the editor CLI command.')]
+            param([Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
+            Invoke-TestEditor -Editor 'code-insiders' -Arguments $Arguments
+        }
+        function Invoke-TestEditor {
+            param([string] $Editor, [string[]] $Arguments)
+            $script:editorCalls.Add(@{ Editor = $Editor; Arguments = $Arguments })
+            switch ($Arguments[0]) {
+                '--list-extensions' {
+                    if ($script:listThrows) { throw 'listing unavailable' }
+                    $global:LASTEXITCODE = $script:listExitCode
+                    $script:listedExtensions
+                }
+                '--locate-extension' {
+                    if ($script:locateThrows) { throw 'locate unavailable' }
+                    $global:LASTEXITCODE = $script:locateExitCode
+                    $script:locatedPaths
+                }
+                '--install-extension' {
+                    if ($script:installThrows) { throw 'installation denied' }
+                    $global:LASTEXITCODE = $script:installExitCode
+                    'mock installer diagnostic'
+                }
+                default { throw "Unexpected editor invocation: $Arguments" }
+            }
+        }
+        $copilotSandbox = Join-Path $PSScriptRoot ".sandbox\copilot-$([guid]::NewGuid())"
+        $null = New-Item -Path $copilotSandbox -ItemType Directory -Force
+        $script:manifestPath = Join-Path $copilotSandbox 'package.json'
+    }
+
+    AfterAll {
+        Remove-Item -LiteralPath $copilotSandbox -Recurse -Force
+    }
+
+    Context '<EditorLabel>' -ForEach @(
+        @{ Editor = 'code'; EditorLabel = 'VS Code' }
+        @{ Editor = 'code-insiders'; EditorLabel = 'VS Code Insiders' }
+    ) {
+        BeforeEach {
+            $script:selectedEditor = $Editor
+            $script:expectedLabel = "  GitHub Copilot Chat extension for $EditorLabel"
+            $script:expectedInstallLabel = "GitHub Copilot Chat extension for $EditorLabel (github.copilot-chat)"
+            $script:editorCalls = [System.Collections.Generic.List[hashtable]]::new()
+            $script:listedExtensions = @(
+                'ms-azuretools.vscode-azureresourcegroups'
+                'ms-azuretools.vscode-bicep'
+                'ms-azuretools.vscode-azure-github-copilot'
+                'ms-windows-ai-studio.windows-ai-studio'
+                'ms-security.ms-sentinel'
+            )
+            $script:locatedPaths = @($copilotSandbox)
+            $script:listExitCode = 0
+            $script:locateExitCode = 0
+            $script:installExitCode = 0
+            $script:listThrows = $false
+            $script:locateThrows = $false
+            $script:installThrows = $false
+            '{"publisher":"GitHub","name":"copilot-chat","version":"0.69.0"}' |
+                Set-Content -LiteralPath $manifestPath
+            Mock Get-Command {
+                if ($Name -eq $script:selectedEditor) { [pscustomobject]@{ Name = $Name } }
+            } -ParameterFilter { $Name -in @('code', 'code-insiders') }
+            Mock Get-CommandVersion { '1.2.3' }
+            Mock Write-VerificationLine {}
+            Mock Write-Host {}
+            Mock Write-Warning {}
+        }
+
+        It 'accepts a listed user extension without locating or reinstalling it' {
+            $script:listedExtensions += 'github.copilot-chat'
+            Show-VerificationSummary
+            Install-VSCodeExtensions
+            Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+                $Label -eq $script:expectedLabel -and $Installed -and $Details -eq 'github.copilot-chat'
+            }
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+                $Object -eq "  Skipped: $script:expectedInstallLabel already installed."
+            }
+            @($script:editorCalls | Where-Object { $_.Arguments[0] -ne '--list-extensions' }).Count | Should -Be 0
+        }
+
+        It 'verifies an editor-included exact package and skips reinstalling it' {
+            Show-VerificationSummary
+            Install-VSCodeExtensions
+            Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+                $Label -eq $script:expectedLabel -and $Installed -and
+                $Details -eq 'github.copilot-chat (included with editor, version 0.69.0; presence only)'
+            }
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+                $Object -eq "  Skipped: $script:expectedInstallLabel - github.copilot-chat (included with editor, version 0.69.0; presence only)."
+            }
+            @($script:editorCalls | Where-Object { $_.Arguments[0] -eq '--install-extension' }).Count | Should -Be 0
+            @($script:editorCalls | Where-Object {
+                $_.Editor -eq $script:selectedEditor -and
+                ($_.Arguments -join ' ') -eq '--locate-extension github.copilot-chat'
+            }).Count | Should -Be 2
+            Should -Invoke Write-Warning -Times 0 -Exactly
+        }
+
+        It 'reports genuinely missing Chat separately from Copilot CLI and installs the exact extension' {
+            $script:locatedPaths = @()
+            $script:listedExtensions += 'github.copilot'
+            Show-VerificationSummary
+            Install-VSCodeExtensions
+            Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+                $Label -eq $script:expectedLabel -and -not $Installed -and
+                $Details -eq "github.copilot-chat; not found or could not be verified. Check Extensions in $EditorLabel; this is not Copilot CLI"
+            }
+            @($script:editorCalls | Where-Object {
+                $_.Editor -eq $script:selectedEditor -and
+                ($_.Arguments -join ' ') -eq '--install-extension github.copilot-chat --force'
+            }).Count | Should -Be 1
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+                $Object -eq "  Done: $script:expectedInstallLabel"
+            }
+        }
+
+        It 'rejects <Fixture> rather than claiming an included Chat package' -ForEach @(
+            @{ Fixture = 'wrong publisher'; Manifest = '{"publisher":"other","name":"copilot-chat","version":"1.0"}' }
+            @{ Fixture = 'legacy extension'; Manifest = '{"publisher":"github","name":"copilot","version":"1.0"}' }
+            @{ Fixture = 'missing version'; Manifest = '{"publisher":"github","name":"copilot-chat"}' }
+            @{ Fixture = 'malformed manifest'; Manifest = '{not JSON' }
+            @{ Fixture = 'missing manifest'; Manifest = $null }
+            @{ Fixture = 'relative package path'; Manifest = '{}'; RelativePath = $true }
+        ) {
+            if ($null -eq $Manifest) {
+                Remove-Item -LiteralPath $manifestPath
+            } else {
+                Set-Content -LiteralPath $manifestPath -Value $Manifest
+            }
+            if ($RelativePath) { $script:locatedPaths = @('relative-extension-directory') }
+            Get-VSCodeCopilotDetails -Editor $Editor | Should -BeNullOrEmpty
+            Show-VerificationSummary
+            Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+                $Label -eq $script:expectedLabel -and -not $Installed -and
+                $Details -like 'github.copilot-chat; not found or could not be verified.*'
+            }
+        }
+
+        It 'rejects a <Failure> locate even with a valid manifest path' -ForEach @(
+            @{ Failure = 'nonzero'; ExitCode = 17; Throws = $false }
+            @{ Failure = 'throwing'; ExitCode = 0; Throws = $true }
+        ) {
+            $script:locateExitCode = $ExitCode
+            $script:locateThrows = $Throws
+            Get-VSCodeCopilotDetails -Editor $Editor | Should -BeNullOrEmpty
+            Show-VerificationSummary
+            Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+                $Label -eq $script:expectedLabel -and -not $Installed
+            }
+        }
+
+        It 'warns on a <Failure> list without claiming absence or installing extensions' -ForEach @(
+            @{ Failure = 'nonzero'; ExitCode = 23; Throws = $false; Diagnostic = 'extension listing exited with code 23' }
+            @{ Failure = 'throwing'; ExitCode = 0; Throws = $true; Diagnostic = 'listing unavailable' }
+        ) {
+            $script:listExitCode = $ExitCode
+            $script:listThrows = $Throws
+            $script:listedExtensions += 'github.copilot-chat'
+            Show-VerificationSummary
+            Install-VSCodeExtensions
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -eq "Could not verify extensions for ${EditorLabel}: $Diagnostic"
+            }
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -eq "Could not check extensions for ${EditorLabel}: $Diagnostic"
+            }
+            Should -Invoke Write-VerificationLine -Times 0 -Exactly -ParameterFilter { $Label -like '* extension for *' }
+            @($script:editorCalls | Where-Object { $_.Arguments[0] -ne '--list-extensions' }).Count | Should -Be 0
+            Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { $Object -like '*Done:*' }
+        }
+
+        It 'reports a <Failure> install with editor and ID but never Done' -ForEach @(
+            @{ Failure = 'nonzero'; ExitCode = 31; Throws = $false; Diagnostic = 'exit code 31: mock installer diagnostic' }
+            @{ Failure = 'throwing'; ExitCode = 0; Throws = $true; Diagnostic = 'installation denied' }
+        ) {
+            $script:locatedPaths = @()
+            $script:installExitCode = $ExitCode
+            $script:installThrows = $Throws
+            Install-VSCodeExtensions
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -eq "Could not install ${script:expectedInstallLabel}: $Diagnostic"
+            }
+            Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { $Object -like '*Done:*' }
+        }
+    }
+}
+
+Describe 'Phase 2 Spotify outcomes' -Tag 'SpotifyVerification' {
+    BeforeAll {
+        function winget {
+            param([Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
+            throw "Unmocked Spotify command: $Arguments"
+        }
+        $spotifyAssignment = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$spotifyOutput'
+        }, $true)
+        $spotifyOutcome = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -eq '$LASTEXITCODE -eq 0' -and
+            $node.Extent.Text -match 'Done: Spotify installed'
+        }, $true)
+        $spotifyAssignment.Count | Should -Be 1
+        $spotifyOutcome.Count | Should -Be 1
+        # Execute only the isolated Spotify command and its outcome handler.
+        $script:runSpotify = [scriptblock]::Create($spotifyAssignment.Extent.Text + "`n" + $spotifyOutcome.Extent.Text)
+        foreach ($constant in $wingetConstants.GetEnumerator()) {
+            Set-Variable -Name $constant.Key -Value $constant.Value
+        }
+    }
+
+    BeforeEach {
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock winget {
+            $global:LASTEXITCODE = $script:spotifyExitCode
+            'mock Spotify output'
+        }
+    }
+
+    It 'skips the confirmed no-applicable-upgrade outcome without warning or a redundant presence probe' {
+        $script:spotifyExitCode = -1978335189
+        & $runSpotify
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+            $Object -eq '  Skipped: Spotify is already up to date.'
+        }
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { $Object -like '*Done:*' }
+        Should -Invoke Write-Warning -Times 0 -Exactly
+        Should -Invoke winget -Times 1 -Exactly
+        Should -Invoke winget -Times 1 -Exactly -ParameterFilter {
+            ($Arguments -join ' ') -eq 'install --id Spotify.Spotify --source winget --accept-source-agreements --accept-package-agreements --silent'
+        }
+    }
+
+    It 'still reports a successful installation as Done' {
+        $script:spotifyExitCode = 0
+        & $runSpotify
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq '  Done: Spotify installed.' }
+        Should -Invoke Write-Warning -Times 0 -Exactly
+    }
+
+    It 'does not suppress genuine unexpected Spotify failures' {
+        $script:spotifyExitCode = 42
+        & $runSpotify
+        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+            $Message -eq '  winget exited with code 42 for Spotify'
+        }
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { $Object -match 'Done:|Skipped:' }
+    }
+}
+
 Describe 'Phase 2 one-shot resume safety' -Tag 'BootstrapSafety' {
     BeforeAll {
-        $resumeGuard = $ast.EndBlock.Statements | Where-Object {
-            $_ -is [System.Management.Automation.Language.IfStatementAst] -and
-            $_.Clauses[0].Item1.Extent.Text -eq '$Phase -eq ''Phase2'''
-        } | Select-Object -First 1
+        $resumeGuard = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -eq '$Phase -eq ''Phase2'''
+        }, $false) | Select-Object -First 1
         $resumeGuard | Should -Not -BeNullOrEmpty
         $runGuard = [scriptblock]::Create($resumeGuard.Extent.Text + "`nInitialize-PSModulePath")
         $sandbox = Join-Path $PSScriptRoot ".sandbox\resume-$([guid]::NewGuid())"
@@ -1119,20 +1382,342 @@ Describe 'Set-OhMyPoshProfile' {
 }
 
 Describe 'Set-FileExplorerOptions' {
-    It 'creates the Run as different user registry path before setting the policy value' {
-        Mock Test-Path { $false } -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
+    BeforeEach {
+        Mock Test-Path { $false }
         Mock New-Item {}
         Mock Set-ItemProperty {}
+        Mock Remove-ItemProperty {}
+        Mock Remove-Item {}
+        Mock Start-Process {}
+        Mock Write-Host {}
         Mock Write-Warning {}
+    }
 
+    It 'preserves all four unrelated Explorer preferences on repeated runs' {
+        Set-FileExplorerOptions
         Set-FileExplorerOptions
 
-        Should -Invoke New-Item -Times 1 -Exactly -ParameterFilter { $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' }
-        Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
-            $Path -eq 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -and
-            $Name -eq 'ShowRunAsDifferentUserInStart' -and
-            $Value -eq 1
+        foreach ($preference in @(
+            @{ Key = 'Advanced'; Name = 'HideFileExt'; Value = 0 }
+            @{ Key = 'Advanced'; Name = 'Hidden'; Value = 1 }
+            @{ Key = 'Advanced'; Name = 'ShowSuperHidden'; Value = 1 }
+            @{ Key = 'CabinetState'; Name = 'FullPath'; Value = 1 }
+        )) {
+            Should -Invoke Set-ItemProperty -Times 2 -Exactly -ParameterFilter {
+                $Path -eq "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\$($preference.Key)" -and
+                $Name -eq $preference.Name -and $Value -eq $preference.Value
+            }
         }
+        Should -Invoke Set-ItemProperty -Times 8 -Exactly
+        Should -Invoke Write-Warning -Times 0
+    }
+
+    It 'neither creates nor changes nor removes existing run-as policy, and opens no misleading Settings page' {
+        Set-FileExplorerOptions
+        Should -Invoke New-Item -Times 0
+        Should -Invoke Remove-ItemProperty -Times 0
+        Should -Invoke Remove-Item -Times 0
+        Should -Invoke Start-Process -Times 0
+        Should -Invoke Set-ItemProperty -Times 0 -ParameterFilter {
+            $Path -like '*\Policies\*' -or $Name -eq 'ShowRunAsDifferentUserInStart'
+        }
+        ($functionDefs | Where-Object Name -EQ 'Set-FileExplorerOptions').Extent.Text |
+            Should -Not -Match 'ShowRunAsDifferentUserInStart|ms-settings:'
+    }
+
+    It 'warns without falsely claiming success when an unrelated Explorer write is denied' {
+        Mock Set-ItemProperty { throw 'Explorer preference denied' }
+        { Set-FileExplorerOptions } | Should -Not -Throw
+        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+            $Message -like '*Failed to configure File Explorer options*Explorer preference denied*'
+        }
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Done:*' }
+    }
+}
+
+Describe 'Persistent setup reports' -Tag 'SetupReports' {
+    BeforeAll {
+        $sandbox = Join-Path $PSScriptRoot ".sandbox\reports-$([guid]::NewGuid())"
+        $script:reportLocalAppData = $env:LOCALAPPDATA
+        $null = New-Item -Path $sandbox -ItemType Directory -Force
+    }
+    BeforeEach {
+        $env:LOCALAPPDATA = $sandbox
+        $script:verificationResults = [System.Collections.Generic.List[object]]::new()
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Start-Process {}
+    }
+    AfterAll {
+        $env:LOCALAPPDATA = $script:reportLocalAppData
+        $script:verificationResults = $null
+        Remove-Item -LiteralPath $sandbox -Recurse -Force
+    }
+
+    It 'collects accurate presence results without retaining console indentation' {
+        Write-VerificationLine -Label '  present tool' -Installed $true -Details 'v1'
+        Write-VerificationLine -Label '  missing tool' -Installed $false -Details 'not verified'
+        $verificationResults.Count | Should -Be 2
+        $verificationResults[0].Check | Should -Be 'present tool'
+        $verificationResults[0].Status | Should -Be 'OK'
+        $verificationResults[0].Details | Should -Be 'v1'
+        $verificationResults[1].Status | Should -Be 'MISSING / NOT VERIFIED'
+        $verificationResults[1].Details | Should -Be 'not verified'
+    }
+
+    It 'persists a completed report at its documented path even with missing optional checks' {
+        $path = Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\.altered-carbon-test.log' -Results @(
+            [pscustomobject]@{ Check = 'optional tool'; Status = 'MISSING / NOT VERIFIED'; Details = 'not installed' }
+        )
+        $path | Should -Be (Join-Path $sandbox 'altered-carbon\reports\.altered-carbon-test-Phase2.html')
+        Test-Path -LiteralPath $path -PathType Leaf | Should -BeTrue
+        $html = Get-Content -LiteralPath $path -Raw
+        $html | Should -Match '<h2>Completed</h2>'
+        $html | Should -Match 'MISSING / NOT VERIFIED'
+        $html | Should -Match 'not that every optional installation succeeded'
+        $html | Should -Match ([regex]::Escape('C:\logs\.altered-carbon-test.log'))
+        $html | Should -Not -Match '<h2>Failure</h2>'
+        Should -Invoke Start-Process -Times 0
+    }
+
+    It 'escapes phase, transcript, error, and every verification cell as HTML text' {
+        $payload = '<script>alert("x" & ''y'')</script>'
+        $path = Write-SetupReport -Phase 'Phase2 & review' -TranscriptPath 'C:\logs\a&b.log' -FailureMessage $payload -Results @(
+            [pscustomobject]@{ Check = $payload; Status = $payload; Details = $payload }
+        )
+        $html = Get-Content -LiteralPath $path -Raw
+        $html | Should -Match '<h2>Failed / incomplete</h2>'
+        $html | Should -Match 'Phase2 &amp; review'
+        $html | Should -Match 'a&amp;b\.log'
+        $html | Should -Not -Match ([regex]::Escape($payload))
+        [regex]::Matches($html, '&lt;script&gt;').Count | Should -Be 4
+        $html | Should -Match 'without -ResumeToken'
+        $html | Should -Match 'Phase1 as administrator'
+    }
+
+    It 'persists early <RunPhase> failures with explicit absent-verification guidance' -ForEach @(
+        @{ RunPhase = 'Phase1' }
+        @{ RunPhase = 'Phase2' }
+    ) {
+        $path = Write-SetupReport -Phase $RunPhase -TranscriptPath 'C:\logs\early.log' -FailureMessage 'Initialization failed'
+        $html = Get-Content -LiteralPath $path -Raw
+        $html | Should -Match '<h2>Failed / incomplete</h2>'
+        $html | Should -Match '<pre>Initialization failed</pre>'
+        $html | Should -Match 'No verification results were collected'
+        $html | Should -Not -Match '<h2>Completed</h2>'
+    }
+
+    It 'keeps the report when browser launch fails and prints a manual-open path' {
+        $path = Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\browser.log'
+        Mock Start-Process { throw 'No HTML association' }
+        { Open-SetupReport -Path $path } | Should -Not -Throw
+        Test-Path -LiteralPath $path | Should -BeTrue
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+            $FilePath -eq $path -and $ErrorAction -eq 'Stop'
+        }
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -eq "Setup report saved: $path" }
+        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+            $Message -like "*Open '$path' manually*No HTML association*"
+        }
+    }
+
+    It 'requests the saved report in the default browser without promising a visible tab' {
+        Open-SetupReport -Path 'C:\reports\existing.html'
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+            $FilePath -eq 'C:\reports\existing.html' -and $ErrorAction -eq 'Stop'
+        }
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*if no page appears*manually*' }
+        Should -Invoke Write-Warning -Times 0
+    }
+
+    It 'propagates <Operation> failures instead of returning a false saved path' -ForEach @(
+        @{ Operation = 'directory creation' }
+        @{ Operation = 'file write' }
+    ) {
+        if ($Operation -eq 'directory creation') {
+            Mock New-Item { throw 'Report storage denied' }
+        } else {
+            Mock Set-Content { throw 'Report storage denied' }
+        }
+        { Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\denied.log' } |
+            Should -Throw '*Report storage denied*'
+        Should -Invoke Start-Process -Times 0
+    }
+
+    It 'can save repeatedly without appending HTML or losing other runs and phases' {
+        $first = Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\first.log'
+        $second = Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\second.log'
+        $failed = Write-SetupReport -Phase Phase1 -TranscriptPath 'C:\logs\first.log' -FailureMessage 'early failure'
+        Write-SetupReport -Phase Phase2 -TranscriptPath 'C:\logs\first.log' | Should -Be $first
+        foreach ($path in @($first, $second, $failed)) { Test-Path -LiteralPath $path | Should -BeTrue }
+        [regex]::Matches((Get-Content -LiteralPath $first -Raw), '<!doctype html>').Count | Should -Be 1
+        Get-Content -LiteralPath $failed -Raw | Should -Match '<h2>Failed / incomplete</h2>'
+    }
+}
+
+Describe 'Report finalization and original failure preservation' -Tag 'SetupReports' {
+    BeforeAll {
+        # Replace only the orchestration body. Execute the real catch/finally/rethrow
+        # without installs, scheduler, profile, registry, or transcript mutations.
+        $mainTry = $ast.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.TryStatementAst] -and
+            $_.Body.Extent.Text -match 'Test-WingetAvailable'
+        } | Select-Object -First 1
+        $mainTry | Should -Not -BeNullOrEmpty
+        $finalThrow = $ast.EndBlock.Statements[-1]
+        $finalThrow.Extent.Text | Should -Be 'if ($runFailure) { throw $runFailure }'
+        $finalizationCode = '$runFailure = $null' + "`n" +
+            $mainTry.Extent.Text.Replace($mainTry.Body.Extent.Text, '{ Invoke-TestOrchestration }') +
+            "`n" + $finalThrow.Extent.Text
+        $script:runFinalization = [scriptblock]::Create($finalizationCode)
+        $script:openReportBody = (Get-Command Open-SetupReport).ScriptBlock
+        function Invoke-TestOrchestration { throw 'Must be mocked' }
+        $sandbox = Join-Path $PSScriptRoot ".sandbox\finalization-$([guid]::NewGuid())"
+        $null = New-Item -Path $sandbox -ItemType Directory -Force
+    }
+    BeforeEach {
+        $script:Phase = 'Phase2'
+        $script:logFile = 'C:\logs\finalization.log'
+        $script:verificationResults = [System.Collections.Generic.List[object]]::new()
+        $script:originalFailure = [System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new('Original orchestration failure'),
+            'OriginalFailure', [System.Management.Automation.ErrorCategory]::OperationStopped, $null
+        )
+        Mock Invoke-TestOrchestration {}
+        Mock Write-SetupReport { 'C:\reports\saved.html' }
+        Mock Open-SetupReport {}
+        Mock Stop-Transcript {}
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Write-Verbose {}
+    }
+    AfterAll {
+        $script:verificationResults = $null
+        Remove-Item -LiteralPath $sandbox -Recurse -Force
+    }
+
+    It 'saves collected Phase2 results before opening and stopping the transcript' {
+        Mock Invoke-TestOrchestration { Write-VerificationLine -Label 'tool' -Installed $true -Details 'v2' }
+        Mock Open-SetupReport {
+            Should -Invoke Write-SetupReport -Times 1 -Exactly
+            Should -Invoke Stop-Transcript -Times 0
+        }
+        { & $runFinalization } | Should -Not -Throw
+        Should -Invoke Write-SetupReport -Times 1 -Exactly -ParameterFilter {
+            $Phase -eq 'Phase2' -and $TranscriptPath -eq $logFile -and
+            -not $FailureMessage -and $Results.Count -eq 1 -and
+            $Results[0].Check -eq 'tool' -and $Results[0].Status -eq 'OK'
+        }
+        Should -Invoke Open-SetupReport -Times 1 -Exactly -ParameterFilter { $Path -eq 'C:\reports\saved.html' }
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*Setup complete*' }
+    }
+
+    It 'does not call Phase1 handoff full setup completion or create a completed report' {
+        $script:Phase = 'Phase1'
+        { & $runFinalization } | Should -Not -Throw
+        Should -Invoke Write-SetupReport -Times 0
+        Should -Invoke Open-SetupReport -Times 0
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Setup complete*' }
+    }
+
+    It 'saves an incomplete report and rethrows the original <RunPhase> error record' -ForEach @(
+        @{ RunPhase = 'Phase1' }
+        @{ RunPhase = 'Phase2' }
+    ) {
+        $script:Phase = $RunPhase
+        Mock Invoke-TestOrchestration { throw $script:originalFailure }
+        $caught = $null
+        try { & $runFinalization } catch { $caught = $_ }
+        $caught | Should -Not -BeNullOrEmpty
+        [object]::ReferenceEquals($caught.Exception, $originalFailure.Exception) | Should -BeTrue
+        $caught.FullyQualifiedErrorId | Should -Be 'OriginalFailure'
+        Should -Invoke Write-SetupReport -Times 1 -Exactly -ParameterFilter {
+            $Phase -eq $RunPhase -and $FailureMessage -eq 'Original orchestration failure' -and $Results.Count -eq 0
+        }
+        Should -Invoke Open-SetupReport -Times 1 -Exactly
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Setup complete*' }
+    }
+
+    It 'fails a previously successful run if report persistence fails, without opening or claiming completion' {
+        Mock Write-SetupReport { throw 'Report disk full' }
+        { & $runFinalization } | Should -Throw '*Report disk full*'
+        Should -Invoke Open-SetupReport -Times 0
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*Could not save*Report disk full*' }
+        Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Setup complete*' }
+    }
+
+    It 'does not change the original <Outcome> outcome when the browser cannot launch' -ForEach @(
+        @{ Outcome = 'successful'; OperationFails = $false }
+        @{ Outcome = 'failed'; OperationFails = $true }
+    ) {
+        Mock Start-Process { throw 'Browser unavailable' }
+        Mock Open-SetupReport { & $script:openReportBody -Path $Path }
+        if ($OperationFails) { Mock Invoke-TestOrchestration { throw $script:originalFailure } }
+        $caught = $null
+        try { & $runFinalization } catch { $caught = $_ }
+        if ($OperationFails) {
+            [object]::ReferenceEquals($caught.Exception, $originalFailure.Exception) | Should -BeTrue
+        } else {
+            $caught | Should -BeNullOrEmpty
+        }
+        Should -Invoke Write-SetupReport -Times 1 -Exactly
+        Should -Invoke Start-Process -Times 1 -Exactly
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*manually*Browser unavailable*' }
+        Should -Invoke Write-Warning -Times 0 -ParameterFilter { $Message -like '*Could not save*' }
+    }
+
+    It 'preserves the original error when reporting and transcript shutdown also fail' {
+        Mock Invoke-TestOrchestration { throw $script:originalFailure }
+        Mock Write-SetupReport { throw 'Secondary report failure' }
+        Mock Stop-Transcript { throw 'Secondary transcript failure' }
+        $caught = $null
+        try { & $runFinalization } catch { $caught = $_ }
+        [object]::ReferenceEquals($caught.Exception, $originalFailure.Exception) | Should -BeTrue
+        $caught.FullyQualifiedErrorId | Should -Be 'OriginalFailure'
+        Should -Invoke Open-SetupReport -Times 0
+        Should -Invoke Stop-Transcript -Times 1 -Exactly
+        Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*Secondary report failure*' }
+        Should -Invoke Write-Verbose -Times 1 -ParameterFilter { $Message -like '*Secondary transcript failure*' }
+    }
+
+    It 'tolerates an inactive transcript after successful report saving' {
+        Mock Stop-Transcript { throw 'Not transcribing' }
+        { & $runFinalization } | Should -Not -Throw
+        Should -Invoke Write-Verbose -Times 1 -ParameterFilter { $Message -like '*Not transcribing*' }
+    }
+
+    It 'returns the correct native exit status for <Scenario>' -ForEach @(
+        @{ Scenario = 'success'; OperationFails = $false; ReportFails = $false; ExpectedExit = 0; ExpectedError = '' }
+        @{ Scenario = 'orchestration failure'; OperationFails = $true; ReportFails = $false; ExpectedExit = 1; ExpectedError = 'ORIGINAL_SENTINEL' }
+        @{ Scenario = 'report failure'; OperationFails = $false; ReportFails = $true; ExpectedExit = 1; ExpectedError = 'REPORT_SENTINEL' }
+        @{ Scenario = 'both failures'; OperationFails = $true; ReportFails = $true; ExpectedExit = 1; ExpectedError = 'ORIGINAL_SENTINEL' }
+    ) {
+        $operationBody = if ($OperationFails) { "throw 'ORIGINAL_SENTINEL'" } else { '' }
+        $reportBody = if ($ReportFails) { "throw 'REPORT_SENTINEL'" } else { "'saved.html'" }
+        $fixture = @"
+`$ErrorActionPreference = 'Stop'
+`$Phase = 'Phase2'
+`$logFile = 'test.log'
+`$script:verificationResults = [System.Collections.Generic.List[object]]::new()
+function Invoke-TestOrchestration { $operationBody }
+function Write-SetupReport { $reportBody }
+function Open-SetupReport {}
+function Stop-Transcript { throw 'TRANSCRIPT_SENTINEL' }
+$finalizationCode
+"@
+        $fixturePath = Join-Path $sandbox "$([guid]::NewGuid()).ps1"
+        Set-Content -LiteralPath $fixturePath -Value $fixture -Encoding UTF8
+        $output = & pwsh -NoProfile -File $fixturePath 2>&1
+        $LASTEXITCODE | Should -Be $ExpectedExit
+        if ($ExpectedError) {
+            ($output -join "`n") | Should -Match $ExpectedError
+        }
+        Remove-Item -LiteralPath $fixturePath -Force
     }
 }
 

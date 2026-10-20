@@ -21,6 +21,10 @@ Windows uses two phases: elevated installation, then non-elevated configuration 
 
 Each scheduled attempt also records a durable one-shot marker in `%LOCALAPPDATA%\altered-carbon`. If task cleanup fails, the script stops with an error rather than claiming success or running configuration. Remove `altered-carbon-phase2` from Task Scheduler as administrator if directed, then retry from a non-elevated shell with `.\altered-carbon.ps1 -Work -Phase Phase2` (or `-Personal`). Do not supply the internal `-ResumeToken` on a manual retry.
 
+Phase 2 saves a local HTML report under `%LOCALAPPDATA%\altered-carbon\reports` and requests that your default browser open it. The saved path is printed even if browser launch fails; a successful launch request does not guarantee a visible browser tab. Reports include verification results and the transcript location (`%USERPROFILE%\.altered-carbon-*.log`). Previously the summary existed only in the console, with no report page to open.
+
+Handled orchestration failures in either phase also produce an **incomplete** report, close the transcript, and exit with an error. Phase 1 success means Phase 2 is still pending, not that all setup finished. A completed report means execution reached the end; optional operations may still have warnings, and verification checks presence only. Review the transcript as well. Forced termination, power loss, and failures before orchestration starts cannot guarantee a report. Reports/logs can contain personal paths or diagnostic details; review before sharing. Old logs, reports, and one-shot markers are retained, not automatically deleted.
+
 ### macOS (Shell)
 
 ```bash
@@ -35,7 +39,7 @@ Each scheduled attempt also records a durable one-shot marker in `%LOCALAPPDATA%
 
 ## Release Notes
 
-- Current release notes draft: `releases/v1.0.0.md`
+- Current release: [v1.2.0](https://github.com/x3nc0n/altered-carbon/releases/tag/v1.2.0)
 - Changelog: `CHANGELOG.md`
 
 ## Examples
@@ -156,6 +160,8 @@ Each scheduled attempt also records a durable one-shot marker in `%LOCALAPPDATA%
     1. AI Toolkit for Visual Studio Code (ID: `ms-windows-ai-studio.windows-ai-studio`)
     1. Microsoft Sentinel (ID: `ms-security.ms-sentinel`)
 
+Windows checks GitHub Copilot Chat separately for VS Code and VS Code Insiders. Some releases include this extension with the editor, so it does not appear in `--list-extensions` (which lists user extensions). Setup also checks `--locate-extension github.copilot-chat` and its package identity before reporting it present or skipping installation. The summary names the editor channel and extension ID; it checks presence, not sign-in, enablement, or subscription status. A missing editor extension is unrelated to Copilot CLI included with GitHub CLI.
+
 #### Personal Mode Only (`-Personal`)
 
 In addition to core apps:
@@ -191,7 +197,8 @@ These steps run in non-elevated Phase 2. They do not set HTTP proxy options, cop
     1. Show file extensions
     1. Show hidden and system files
     1. Show full path in title bar
-    1. Show option to run as different user in Start
+
+Setup no longer changes the **Run as different user** Start-menu policy or removes an existing value. [Microsoft documents this policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-startmenu#showrunasdifferentuserinstart) as applying only to supported Start applications, not a general File Explorer menu switch. Managed policy keys may deny writes even under HKCU; a registry value alone does not verify GUI behavior. For supported desktop apps, use Shift+right-click on the application's taskbar jump-list entry instead. If Start-menu policy is required, have your administrator manage it through Group Policy/MDM; the bootstrap does not bypass that policy.
 
 ### macOS (`altered-carbon-mac.sh`)
 

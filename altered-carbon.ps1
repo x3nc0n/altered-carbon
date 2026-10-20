@@ -930,6 +930,29 @@ function Install-PSModules {
 }
 
 # ── VS Code Extensions ─────────────────────────────────────────────────────────
+function Get-VSCodeCopilotDetails {
+    param([string] $Editor)
+
+    # Built-in extensions are omitted by --list-extensions. Resolve through the
+    # selected editor so portable and versioned installations work as well.
+    try {
+        $extensionPaths = @(& $Editor --locate-extension github.copilot-chat 2>$null)
+        if ($LASTEXITCODE -ne 0) { return $null }
+        foreach ($extensionPath in $extensionPaths) {
+            if (-not [System.IO.Path]::IsPathRooted([string]$extensionPath)) { continue }
+            $manifestPath = Join-Path ([string]$extensionPath) 'package.json'
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ("$($manifest.publisher).$($manifest.name)" -ieq 'github.copilot-chat' -and $manifest.version) {
+                return "github.copilot-chat (included with editor, version $($manifest.version); presence only)"
+            }
+        }
+    } catch {
+        Write-Verbose "Could not locate GitHub Copilot Chat extension for ${Editor}: $_"
+    }
+    return $null
+}
+
 # Install useful extensions into both VS Code and VS Code Insiders.
 function Install-VSCodeExtensions {
     $vsCodeExtensions = @(
@@ -952,15 +975,35 @@ function Install-VSCodeExtensions {
         }
 
         Write-Host "Installing VS Code extensions ($editor)..." -ForegroundColor Cyan
-        $installedExts = & $editor --list-extensions 2>$null
+        $editorLabel = if ($editor -eq 'code') { 'VS Code' } else { 'VS Code Insiders' }
+        try {
+            $installedExts = @(& $editor --list-extensions 2>$null)
+            if ($LASTEXITCODE -ne 0) { throw "extension listing exited with code $LASTEXITCODE" }
+        } catch {
+            Write-Warning "Could not check extensions for ${editorLabel}: $_"
+            continue
+        }
 
         foreach ($ext in $vsCodeExtensions) {
+            $extensionLabel = "$($ext.Name) extension for $editorLabel ($($ext.Id))"
+            if ($ext.Id -eq 'github.copilot-chat' -and $installedExts -notcontains $ext.Id) {
+                $copilotDetails = Get-VSCodeCopilotDetails -Editor $editor
+                if ($copilotDetails) {
+                    Write-Host "  Skipped: $extensionLabel - $copilotDetails." -ForegroundColor Yellow
+                    continue
+                }
+            }
             if ($installedExts -contains $ext.Id) {
-                Write-Host "  Skipped: $($ext.Name) already installed." -ForegroundColor Yellow
+                Write-Host "  Skipped: $extensionLabel already installed." -ForegroundColor Yellow
             } else {
-                Write-Host "  Installing $($ext.Name)..." -ForegroundColor Cyan
-                & $editor --install-extension $ext.Id --force 2>&1 | Out-Null
-                Write-Host "  Done: $($ext.Name)" -ForegroundColor Green
+                Write-Host "  Installing $extensionLabel..." -ForegroundColor Cyan
+                try {
+                    $installOutput = @(& $editor --install-extension $ext.Id --force 2>&1)
+                    if ($LASTEXITCODE -ne 0) { throw "exit code ${LASTEXITCODE}: $($installOutput -join ' ')" }
+                    Write-Host "  Done: $extensionLabel" -ForegroundColor Green
+                } catch {
+                    Write-Warning "Could not install ${extensionLabel}: $_"
+                }
             }
         }
 
@@ -1306,19 +1349,6 @@ function Set-FileExplorerOptions {
         Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'Hidden' -Value 1
         Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'ShowSuperHidden' -Value 1
         Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState' -Name 'FullPath' -Value 1
-        $runAsKey = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
-        $runAsName = 'ShowRunAsDifferentUserInStart'
-        try {
-            if (-not (Test-Path $runAsKey)) {
-                New-Item -Path $runAsKey -Force | Out-Null
-            }
-            Set-ItemProperty -Path $runAsKey -Name $runAsName -Value 1 -Force
-        } catch {
-            Write-Warning "  Could not enable 'Run as different user' in Start menu. This setting may require admin rights or Group Policy access."
-            Write-Host "  To enable manually, open Group Policy Editor (gpedit.msc) and go to: User Configuration > Administrative Templates > Start Menu and Taskbar > Show 'Run as different user' command on Start. Or, open System Settings: " -ForegroundColor Yellow
-            Write-Host "  ms-settings:personalization-start" -ForegroundColor Cyan
-            Write-Host "  (Copy and paste the above URI into the Run dialog [Win+R] or a browser address bar.)" -ForegroundColor Yellow
-        }
         Write-Host '  Done: File Explorer options configured.' -ForegroundColor Green
     } catch {
         Write-Warning "  Failed to configure File Explorer options: $_"
@@ -1355,6 +1385,14 @@ function Write-VerificationLine {
         [bool] $Installed,
         [string] $Details
     )
+
+    if ($null -ne $script:verificationResults) {
+        $script:verificationResults.Add([pscustomobject]@{
+            Check = $Label.Trim()
+            Status = if ($Installed) { 'OK' } else { 'MISSING / NOT VERIFIED' }
+            Details = $Details
+        })
+    }
 
     if ($Installed) {
         $suffix = if ($Details) { " - $Details" } else { '' }
@@ -1407,14 +1445,148 @@ function Show-VerificationSummary {
             continue
         }
 
-        $installedExtensions = & $editorInfo.Editor --list-extensions 2>$null
         Write-VerificationLine -Label $editorInfo.Label -Installed $true -Details 'CLI available'
+        try {
+            $installedExtensions = @(& $editorInfo.Editor --list-extensions 2>$null)
+            if ($LASTEXITCODE -ne 0) { throw "extension listing exited with code $LASTEXITCODE" }
+        } catch {
+            Write-Warning "Could not verify extensions for $($editorInfo.Label): $_"
+            Write-VerificationLine -Label "$($editorInfo.Label) extensions" -Installed $false -Details 'Extension listing failed; see transcript'
+            continue
+        }
 
         foreach ($extension in $editorInfo.Extensions) {
             $isInstalled = $installedExtensions -contains $extension.Id
             $details = $extension.Id
-            Write-VerificationLine -Label ("  " + $extension.Name) -Installed $isInstalled -Details $details
+            if ($extension.Id -eq 'github.copilot-chat' -and -not $isInstalled) {
+                $copilotDetails = Get-VSCodeCopilotDetails -Editor $editorInfo.Editor
+                if ($copilotDetails) {
+                    $isInstalled = $true
+                    $details = $copilotDetails
+                } else {
+                    $details += "; not found or could not be verified. Check Extensions in $($editorInfo.Label); this is not Copilot CLI"
+                }
+            }
+            Write-VerificationLine -Label ("  " + $extension.Name + " extension for " + $editorInfo.Label) -Installed $isInstalled -Details $details
         }
+    }
+}
+
+function Write-SetupReport {
+    param(
+        [string] $Phase,
+        [string] $TranscriptPath,
+        [string] $FailureMessage,
+        [object[]] $Results = @()
+    )
+
+    $reportDir = Join-Path $env:LOCALAPPDATA 'altered-carbon\reports'
+    $null = New-Item -Path $reportDir -ItemType Directory -Force -ErrorAction Stop
+    $reportPath = Join-Path $reportDir ("{0}-{1}.html" -f [System.IO.Path]::GetFileNameWithoutExtension($TranscriptPath), $Phase)
+    $status = if ($FailureMessage) { 'Failed / incomplete' } else { 'Completed' }
+    $encodedPhase = [System.Net.WebUtility]::HtmlEncode($Phase)
+    $encodedLog = [System.Net.WebUtility]::HtmlEncode($TranscriptPath)
+    $encodedFailure = [System.Net.WebUtility]::HtmlEncode($FailureMessage)
+    $checks = if ($Results.Count) {
+        ($Results | Select-Object Check, Status, Details | ConvertTo-Html -Fragment) -join "`n"
+    } else {
+        '<p>No verification results were collected. Configuration may not have started or completed.</p>'
+    }
+    $failure = if ($FailureMessage) {
+        "<h2>Failure</h2><pre>$encodedFailure</pre><p>Resolve the error, then retry manually in a non-elevated shell with -Work or -Personal and -Phase Phase2, without -ResumeToken. For Phase1 failures, retry Phase1 as administrator instead.</p>"
+    } else { '' }
+    $html = @"
+        <!doctype html>
+        <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>altered-carbon $encodedPhase — $status</title>
+        <script>
+        (() => {
+          const param = new URLSearchParams(window.location.search).get("scoutTheme");
+          const theme = param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        })();
+        </script>
+        <style>
+        :root {
+          color-scheme: light;
+          --cp-bg: #f7f4ef;
+          --cp-bg-elevated: #fcfbf8;
+          --cp-surface: #ffffff;
+          --cp-surface-soft: #f5f5f5;
+          --cp-border: #dedede;
+          --cp-border-strong: #919191;
+          --cp-text: #242424;
+          --cp-text-muted: #5c5c5c;
+          --cp-text-soft: #6f6f6f;
+          --cp-accent: #b11f4b;
+          --cp-accent-hover: #9a1a41;
+          --cp-accent-soft: rgba(177, 31, 75, 0.08);
+          --cp-accent-fg: #ffffff;
+          --cp-success: #16a34a;
+          --cp-danger: #dc2626;
+          --cp-warning: #f59e0b;
+          --cp-link: #0078d4;
+          --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+          --cp-overlay: rgba(255, 255, 255, 0.8);
+          --cp-panel: rgba(255, 255, 255, 0.86);
+          --cp-panel-strong: rgba(255, 255, 255, 0.96);
+          --cp-sheen: rgba(255, 255, 255, 0.55);
+          --cp-highlight: rgba(177, 31, 75, 0.12);
+        }
+        html[data-theme="dark"] {
+          color-scheme: dark;
+          --cp-bg: #3d3b3a;
+          --cp-bg-elevated: #343231;
+          --cp-surface: #292929;
+          --cp-surface-soft: #2e2e2e;
+          --cp-border: #474747;
+          --cp-border-strong: #5f5f5f;
+          --cp-text: #dedede;
+          --cp-text-muted: #919191;
+          --cp-text-soft: #b0b0b0;
+          --cp-accent: #fd8ea1;
+          --cp-accent-hover: #fb7b91;
+          --cp-accent-soft: rgba(253, 142, 161, 0.14);
+          --cp-accent-fg: #1a1a1a;
+          --cp-success: #4ade80;
+          --cp-danger: #f87171;
+          --cp-warning: #fbbf24;
+          --cp-link: #4da6ff;
+          --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+          --cp-overlay: rgba(41, 41, 41, 0.88);
+          --cp-panel: rgba(41, 41, 41, 0.72);
+          --cp-panel-strong: rgba(41, 41, 41, 0.96);
+          --cp-sheen: rgba(255, 255, 255, 0.04);
+          --cp-highlight: rgba(253, 142, 161, 0.12);
+        }
+        body { margin: 0; padding: 32px; background: var(--cp-bg); color: var(--cp-text); font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif; }
+        main { max-width: 1080px; margin: auto; padding: 24px; border: 1px solid var(--cp-border); border-radius: 16px; background: var(--cp-surface); }
+        h1, h2 { color: var(--cp-accent); }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid var(--cp-border); padding: 8px; text-align: left; overflow-wrap: anywhere; }
+        pre, code { font-family: Consolas, "Courier New", Courier, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+        </style></head><body><main>
+        <h1>altered-carbon: $encodedPhase</h1><h2>$status</h2>
+        <p>Finished: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Completed means orchestration reached the end, not that every optional installation succeeded. Review missing checks and transcript warnings.</p>
+        $failure
+        <h2>Verification (presence only)</h2>$checks
+        <h2>Transcript</h2><p><code>$encodedLog</code></p>
+        <p>The transcript contains installation output and warnings. If transcript startup failed, this path may not exist. This local report may contain personal paths; review before sharing.</p>
+        </main></body></html>
+"@
+    Set-Content -LiteralPath $reportPath -Value $html -Encoding UTF8 -ErrorAction Stop
+    return $reportPath
+}
+
+function Open-SetupReport {
+    param([string] $Path)
+
+    Write-Host "Setup report saved: $Path" -ForegroundColor Cyan
+    try {
+        Start-Process -FilePath $Path -ErrorAction Stop | Out-Null
+        Write-Host 'Report open requested in your default browser; if no page appears, open the saved path manually.' -ForegroundColor Cyan
+    } catch {
+        Write-Warning "Could not open the setup report. Open '$Path' manually. Details: $_"
     }
 }
 
@@ -1422,6 +1594,9 @@ function Show-VerificationSummary {
 # ── Main Orchestration ────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+$script:verificationResults = [System.Collections.Generic.List[object]]::new()
+$runFailure = $null
+try {
 # Retire the logon trigger before any initialization/configuration can fail.
 if ($Phase -eq 'Phase2') {
     $resumeAllowed = $true
@@ -1509,6 +1684,8 @@ if ($Phase -eq 'Phase1') {
         Write-Host '  Skipped: Spotify already running.' -ForegroundColor Yellow
     } elseif ($LASTEXITCODE -eq $WINGET_PACKAGE_ALREADY_INSTALLED) {
         Write-Host '  Skipped: Spotify is already installed.' -ForegroundColor Yellow
+    } elseif ($LASTEXITCODE -eq $WINGET_NO_APPLICABLE_UPGRADE) {
+        Write-Host '  Skipped: Spotify is already up to date.' -ForegroundColor Yellow
     } elseif ($LASTEXITCODE -eq $WINGET_SHELLEXEC_INSTALL_FAILED) {
         $spotifyInstalled = $false
         $spotifyVersionInfo = Get-WingetVersionInfo -Lines (
@@ -1552,10 +1729,28 @@ if ($Phase -eq 'Phase1') {
 
 }
 
-Write-Host "`nSetup complete." -ForegroundColor Green
-
-if ($Phase -eq 'Phase2') {
-    Read-Host 'Press Enter to close this window'
+} catch {
+    $runFailure = $_
+    Write-Warning "$Phase failed: $($_.Exception.Message)"
+    Write-Warning "See transcript: $logFile"
+} finally {
+    try {
+        if ($Phase -eq 'Phase2' -or $runFailure) {
+            try {
+                $failureMessage = if ($runFailure) { $runFailure.Exception.Message } else { '' }
+                $reportPath = Write-SetupReport -Phase $Phase -TranscriptPath $logFile -FailureMessage $failureMessage -Results @($script:verificationResults.ToArray())
+                Open-SetupReport -Path $reportPath
+                if (-not $runFailure) {
+                    Write-Host "`nSetup complete. Review the report and transcript for warnings." -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Could not save the setup report: $_. See transcript: $logFile"
+                if (-not $runFailure) { $runFailure = $_ }
+            }
+        }
+    } finally {
+        try { Stop-Transcript } catch { Write-Verbose "Transcript was not active: $($_.Exception.Message)" }
+    }
 }
 
-try { Stop-Transcript } catch { Write-Verbose "Transcript was not active: $($_.Exception.Message)" }
+if ($runFailure) { throw $runFailure }
