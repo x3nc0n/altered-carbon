@@ -15,9 +15,15 @@ Scripts that (re)install and configure developer tools on a fresh machine. Suppo
 .\altered-carbon.ps1 -Personal
 ```
 
-> **Tip:** Run as Administrator for full functionality (Chocolatey installs, Hyper-V, WSL 2).
+> **Before resetting:** Save this repository (including `night-owl.omp.json`) and your personal files, SSH/GPG keys, unsynced settings, and recovery information somewhere off this machine. This script reinstalls tools; it is not a data, credential, license, or sign-in backup.
 
-Windows uses two phases: elevated installation, then non-elevated configuration at the next logon after reboot. The reboot still requires confirmation; `-SkipReboot` leaves it to you. Phase 2 removes its logon task **before** initialization or configuration, so a configuration error does not retry at every login. New tasks grant the current user permission to remove that task.
+Run the Windows commands above **as Administrator under your own Windows account**, not another administrator's account. A fresh Windows PowerShell 5.1 session can run Phase 1; App Installer (`winget`) and internet access must already be available. If Windows blocks the downloaded script, review it and use `Unblock-File .\altered-carbon.ps1` and a process-scoped execution policy as needed; do not change machine policy.
+
+Windows uses two phases: elevated installation, then non-elevated configuration in the installed PowerShell 7 at the next logon after reboot. Phase 2 requires PowerShell **7.6+** for the [current Microsoft365DSC prerequisites](https://microsoft365dsc.com/user-guide/get-started/prerequisites/); Windows PowerShell 5.1 is only the initial bootstrap host, not a supported host for all installed modules. Microsoft365DSC's dependency initialization and any RSAT/LCM setup remain separate workload-specific steps.
+
+`Auto` always starts Phase 1 rather than silently skipping installation from a non-admin shell. Explicit Phase 1 requires elevation; Phase 2 rejects it. The reboot still requires confirmation; `-SkipReboot` leaves it to you. Keep the script and theme at the same local path through reboot. The scheduled handoff retains your mode, theme, font, and skip list. A manual Phase 2 retry must supply those options again.
+
+Phase 2 removes its logon task **before** initialization or configuration, so a configuration error does not retry at every login. New tasks grant the current user permission to remove that task.
 
 Each scheduled attempt also records a durable one-shot marker in `%LOCALAPPDATA%\altered-carbon`. If task cleanup fails, the script stops with an error rather than claiming success or running configuration. Remove `altered-carbon-phase2` from Task Scheduler as administrator if directed, then retry from a non-elevated shell with `.\altered-carbon.ps1 -Work -Phase Phase2` (or `-Personal`). Do not supply the internal `-ResumeToken` on a manual retry.
 
@@ -39,7 +45,7 @@ Handled orchestration failures in either phase also produce an **incomplete** re
 
 ## Release Notes
 
-- Current release: [v1.2.0](https://github.com/x3nc0n/altered-carbon/releases/tag/v1.2.0)
+- Current release: [v1.3.0](https://github.com/x3nc0n/altered-carbon/releases/tag/v1.3.0)
 - Changelog: `CHANGELOG.md`
 
 ## Examples
@@ -94,7 +100,7 @@ Handled orchestration failures in either phase also produce an **incomplete** re
 | `-NerdFont` | No | `CodeNewRoman` | Nerd Font installed via oh-my-posh and set in terminals/editors |
 | `-SkipPackages` | No | _(none)_ | winget package IDs to exclude from the default list |
 | `-ExtraPackages` | No | _(none)_ | Additional `@{Id='...'; Name='...'}` hashtables to install |
-| `-Phase` | No | `Auto` | `Phase1` for installation; `Phase2` for manual configuration/retry; `Auto` selects by elevation |
+| `-Phase` | No | `Auto` | `Phase1` (also `Auto`) for elevated installation; `Phase2` for non-elevated manual configuration/retry |
 | `-SkipReboot` | No | Off | Leave reboot to the user after Phase 1 |
 
 \* One of `-Work` or `-Personal` must be specified.
@@ -123,18 +129,19 @@ Handled orchestration failures in either phase also produce an **incomplete** re
 1. Windows Terminal Preview
 1. PowerShell (7)
 1. PowerShell Preview (7)
-1. git *(via Chocolatey when admin, winget fallback)*
-1. Node.js (LTS) *(via Chocolatey when admin, winget fallback)*
+1. git *(via winget)*
+1. Node.js (LTS) *(via winget)*
 1. GitHub Desktop
-1. GitHub CLI *(includes Copilot CLI; no separate installation or verification)*
-1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`)*
+1. GitHub CLI
+1. GitHub Copilot CLI *(standalone `GitHub.Copilot` winget package)*
+1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`, installed/updated in non-elevated Phase 2)*
 1. oh-my-posh
 1. PowerToys
 1. NerdFont (installed via oh-my-posh CLI, configurable with `-NerdFont` parameter)
 1. Spotify
 1. Azure CLI (Az CLI)
 1. 7zip
-1. WinSCP
+1. WinSCP *(free publisher package `WinSCP.WinSCP`, not the paid Store edition)*
 1. Logitech G Hub
 1. Logitech Options+
 1. Yealink USB Connect
@@ -160,7 +167,9 @@ Handled orchestration failures in either phase also produce an **incomplete** re
     1. AI Toolkit for Visual Studio Code (ID: `ms-windows-ai-studio.windows-ai-studio`)
     1. Microsoft Sentinel (ID: `ms-security.ms-sentinel`)
 
-Windows checks GitHub Copilot Chat separately for VS Code and VS Code Insiders. Some releases include this extension with the editor, so it does not appear in `--list-extensions` (which lists user extensions). Setup also checks `--locate-extension github.copilot-chat` and its package identity before reporting it present or skipping installation. The summary names the editor channel and extension ID; it checks presence, not sign-in, enablement, or subscription status. A missing editor extension is unrelated to Copilot CLI included with GitHub CLI.
+Windows checks GitHub Copilot Chat separately for VS Code and VS Code Insiders. Some releases include this extension with the editor, so it does not appear in `--list-extensions` (which lists user extensions). Setup also checks `--locate-extension github.copilot-chat` and its package identity before reporting it present or skipping installation. The summary names the editor channel and extension ID; it checks presence, not sign-in, enablement, or subscription status. A missing editor extension is unrelated to standalone Copilot CLI.
+
+GitHub CLI's [`gh copilot`](https://github.com/cli/cli/blob/trunk/pkg/cmd/copilot/copilot.go) can download Copilot on first interactive use; it does not bundle the standalone binary. Windows installs and verifies the standalone CLI explicitly so it is ready without a first-use download. Sign-in and a suitable subscription are still required.
 
 #### Personal Mode Only (`-Personal`)
 
@@ -198,6 +207,8 @@ These steps run in non-elevated Phase 2. They do not set HTTP proxy options, cop
     1. Show hidden and system files
     1. Show full path in title bar
 
+Windows Terminal supports per-user fonts, so font setup no longer requests a second elevation just to copy fonts into the Windows directory. Restart Terminal after installation if font discovery has not refreshed. On a fresh install, setup creates an explicit PowerShell Preview profile when Terminal has not generated its dynamic profiles yet.
+
 Setup no longer changes the **Run as different user** Start-menu policy or removes an existing value. [Microsoft documents this policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-startmenu#showrunasdifferentuserinstart) as applying only to supported Start applications, not a general File Explorer menu switch. Managed policy keys may deny writes even under HKCU; a registry value alone does not verify GUI behavior. For supported desktop apps, use Shift+right-click on the application's taskbar jump-list entry instead. If Start-menu policy is required, have your administrator manage it through Group Policy/MDM; the bootstrap does not bypass that policy.
 
 ### macOS (`altered-carbon-mac.sh`)
@@ -212,7 +223,7 @@ Setup no longer changes the **Run as different user** Start-menu policy or remov
 1. git
 1. git LFS
 1. Node.js
-1. GitHub CLI *(includes Copilot CLI; no separate installation or verification)*
+1. GitHub CLI *(`gh copilot` can offer an interactive first-use download; standalone `copilot` is not provisioned by the macOS script)*
 1. oh-my-posh
 1. NerdFont (installed via oh-my-posh CLI, configurable with `--nerd-font`)
 1. Spotify
@@ -297,18 +308,8 @@ If you already have content in your existing `$PROFILE`, the script will migrate
 
 ## Package Managers
 
-The script uses **two** package managers, each for what it does best:
+Windows uses **winget / Microsoft Store** for applications, **npm** for Work IQ, **PowerShell Gallery** for modules, and publisher tools for fonts and Agency. Chocolatey is no longer bootstrapped just to install git and Node.js; existing Chocolatey installations are left untouched. PATH is refreshed from the registry before downstream tools run. Package versions are intentionally unpinned: each run requests the current package/channel or compares the installed module version with the gallery.
 
-| Manager | Used For | Why |
-|---|---|---|
-| **Chocolatey** | `git`, `Node.js` (+ Git Credential Manager) | Reliable PATH integration — VS Code, GitHub Desktop, and other tools find `git.exe` and `node.exe` immediately without a session restart |
-| **winget** | Everything else | Built-in on Windows 11, handles Microsoft Store apps, broad catalogue |
-
-Chocolatey is bootstrapped automatically when running as Administrator. On non-admin runs the script falls back to winget for git and Node.js.
-
-The script installs tools from the following sources, in order of priority:
-1. Chocolatey (for git and developer tools that need reliable PATH handling)
-1. winget / Microsoft Store
-1. Well-known Internet sources only — direct from publisher website, no third-party or download aggregation sites
+Hyper-V is edition-dependent. Its absence on Windows Home does not prevent enabling the WSL prerequisite features. Run `wsl --install` after reboot to install WSL and a Linux distribution; the script only enables Windows features.
 
 On macOS, the script runs `brew update` and upgrades each managed formula or cask when Homebrew reports it is outdated. Applications found outside Homebrew are left untouched. PowerShell Gallery modules are also compared with the current gallery version and updated when needed.

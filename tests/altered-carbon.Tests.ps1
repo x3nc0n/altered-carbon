@@ -234,7 +234,13 @@ Describe 'Package Data Integrity' {
     }
 
     It 'defines a custom install location for Blizzard Battle.net' {
-        $scriptContent | Should -Match "Id\s*=\s*'Blizzard\.BattleNet'.*Location\s*=\s*'C:\\Program Files \(x86\)\\Battle\.net'"
+        $definition = $ast.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $_.Left.Extent.Text -eq '$personalPackages'
+        }
+        $packages = & ([scriptblock]::Create($definition.Right.Extent.Text))
+        ($packages | Where-Object Id -eq 'Blizzard.BattleNet').Location |
+            Should -Be (Join-Path ${env:ProgramFiles(x86)} 'Battle.net')
     }
 
     It 'has no duplicate package IDs within the same list' {
@@ -265,7 +271,6 @@ Describe 'Script Structure' {
         $fnNames | Should -Contain 'Get-WingetVersionInfo'
         $fnNames | Should -Contain 'Compare-WingetVersions'
         $fnNames | Should -Contain 'Stop-WingetUpgradeProcess'
-        $fnNames | Should -Contain 'Invoke-ElevatedFontPromotion'
         $fnNames | Should -Contain 'Enter-Phase2Resume'
         $fnNames | Should -Contain 'Remove-Phase2Task'
         $fnNames | Should -Contain 'Grant-Phase2TaskAccess'
@@ -283,8 +288,9 @@ Describe 'Script Structure' {
         $scriptContent | Should -Match 'Get-Command\s+winget'
     }
 
-    It 'handles non-admin Chocolatey gracefully' {
-        $scriptContent | Should -Match 'Chocolatey requires admin'
+    It 'does not bootstrap an unnecessary second package manager' {
+        $functionDefs.Name | Should -Not -Contain 'Install-Chocolatey'
+        $functionDefs.Name | Should -Not -Contain 'Install-ChocolateyPackages'
     }
 
     It 'marks Active Directory as an RSAT-provided module' {
@@ -331,6 +337,33 @@ Describe 'Package List Logic' {
     }
 }
 
+Describe 'Bootstrap phase preflight' {
+    It 'rejects the wrong elevation before any setup runs' -ForEach @(
+        @{ RunPhase = 'Phase1'; Admin = $false; ErrorText = '*Phase1 requires an elevated shell*' }
+        @{ RunPhase = 'Phase2'; Admin = $true; ErrorText = '*Phase2 must run in a non-elevated shell*' }
+    ) {
+        $guard = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.Text -like "*throw '$($ErrorText.Trim('*'))*"
+        }, $true) | Select-Object -First 1
+        $guard | Should -Not -BeNullOrEmpty
+        $Phase = $RunPhase
+        $isAdmin = $Admin
+        { & ([scriptblock]::Create($guard.Extent.Text)) } | Should -Throw $ErrorText
+    }
+
+    It 'starts Auto in installation rather than silently skipping packages' {
+        $detection = $ast.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -eq '$Phase -eq ''Auto'''
+        }
+        $Phase = 'Auto'
+        $isAdmin = $false
+        . ([scriptblock]::Create($detection.Extent.Text))
+        $Phase | Should -Be 'Phase1'
+    }
+}
+
 Describe 'Install-WingetPackages' {
     BeforeEach {
         $script:corePackages = @()
@@ -353,6 +386,15 @@ Describe 'Install-WingetPackages' {
                 $line
             }
         }
+    }
+
+    It 'does not probe or install explicitly skipped git and Node.js packages' {
+        $script:corePackages = @(
+            @{ Id = 'Git.Git'; Name = 'git'; Source = 'winget' }
+            @{ Id = 'OpenJS.NodeJS.LTS'; Name = 'Node.js (LTS)'; Source = 'winget' }
+        )
+        Install-WingetPackages -Personal $false -SkipPackages @('Git.Git', 'OpenJS.NodeJS.LTS')
+        $script:wingetCalls.Count | Should -Be 0
     }
 
     AfterEach {
@@ -577,11 +619,127 @@ Describe 'Enable-WindowsFeatures' {
 
         Enable-WindowsFeatures -IsAdmin $true
 
-        Should -Invoke Get-WindowsOptionalFeature -Times 1 -Exactly
+        Should -Invoke Get-WindowsOptionalFeature -Times 3 -Exactly
         Should -Invoke Enable-WindowsOptionalFeature -Times 0 -Exactly
-        Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+        Should -Invoke Write-Warning -Times 3 -Exactly -ParameterFilter {
             $Message -like '*feature management is unavailable*'
         }
+    }
+
+    It 'still enables WSL features when Hyper-V is unavailable on Windows Home' {
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Get-WindowsOptionalFeature {
+            if ($FeatureName -eq 'Microsoft-Hyper-V-All') { throw 'Feature name is unknown' }
+            [pscustomobject]@{ State = 'Disabled' }
+        }
+        Mock Enable-WindowsOptionalFeature {}
+
+        Enable-WindowsFeatures -IsAdmin $true
+
+        Should -Invoke Enable-WindowsOptionalFeature -Times 2 -Exactly
+        Should -Invoke Enable-WindowsOptionalFeature -Times 1 -Exactly -ParameterFilter {
+            $FeatureName -eq 'Microsoft-Windows-Subsystem-Linux' -and $NoRestart
+        }
+        Should -Invoke Enable-WindowsOptionalFeature -Times 1 -Exactly -ParameterFilter {
+            $FeatureName -eq 'VirtualMachinePlatform' -and $NoRestart
+        }
+    }
+
+    It 'does not re-enable features that are already enabled or pending reboot' {
+        Mock Write-Host {}
+        Mock Get-WindowsOptionalFeature {
+            [pscustomobject]@{ State = if ($FeatureName -eq 'VirtualMachinePlatform') { 'EnablePending' } else { 'Enabled' } }
+        }
+        Mock Enable-WindowsOptionalFeature {}
+        Enable-WindowsFeatures -IsAdmin $true
+        Should -Invoke Enable-WindowsOptionalFeature -Times 0
+    }
+}
+
+Describe 'Phase 2 custom-option handoff' {
+    It 'round-trips custom values and skip arrays in <Mode> mode without executing their contents' -ForEach @(
+        @{ Mode = 'Work'; IsPersonal = $false }
+        @{ Mode = 'Personal'; IsPersonal = $true }
+    ) {
+        $fixturePath = Join-Path $TestDrive "user's bootstrap.ps1"
+        Set-Content -LiteralPath $fixturePath -Value @'
+param([switch]$Work, [switch]$Personal, $Phase, $ResumeToken, $OmpTheme, $NerdFont, [string[]]$SkipPackages)
+[pscustomobject]@{ Work = $Work.IsPresent; Personal = $Personal.IsPresent; Phase = $Phase; Token = $ResumeToken; Theme = $OmpTheme; Font = $NerdFont; Skip = $SkipPackages }
+'@
+        $token = [guid]::NewGuid()
+        $theme = "user's theme; throw 'not code'"
+        $arguments = Get-Phase2TaskArguments -ScriptPath $fixturePath -Personal $IsPersonal -ThemeName $theme -FontName 'FiraCode' -SkipPackages @('Spotify.Spotify', 'Git.Git') -Token $token
+        $command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($arguments -split ' ')[-1]))
+        $result = & ([scriptblock]::Create($command))
+        $result.Work | Should -Be (-not $IsPersonal)
+        $result.Personal | Should -Be $IsPersonal
+        $result.Phase | Should -Be 'Phase2'
+        $result.Token | Should -Be $token.ToString()
+        $result.Theme | Should -Be $theme
+        $result.Font | Should -Be 'FiraCode'
+        $result.Skip.Count | Should -Be 2
+        $result.Skip | Should -Contain 'Spotify.Spotify'
+        $result.Skip | Should -Contain 'Git.Git'
+    }
+
+    It 'accepts an empty skip list' {
+        $arguments = Get-Phase2TaskArguments -ScriptPath 'C:\bootstrap.ps1' -ThemeName 'night-owl' -FontName 'CodeNewRoman' -Token ([guid]::NewGuid())
+        $command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($arguments -split ' ')[-1]))
+        $command | Should -Not -Match '-SkipPackages'
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($command, [ref]$null, [ref]$errors)
+        $errors.Count | Should -Be 0
+    }
+}
+
+Describe 'Fresh Windows Terminal configuration' {
+    BeforeAll {
+        $oldLocalAppData = $env:LOCALAPPDATA
+    }
+    BeforeEach {
+        $env:LOCALAPPDATA = Join-Path $TestDrive ([guid]::NewGuid().ToString())
+        $packagePath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_test'
+        $null = New-Item -Path $packagePath -ItemType Directory -Force
+        $settingsPath = Join-Path $packagePath 'LocalState\settings.json'
+        $previewPath = Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe'
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $previewPath }
+        Mock Write-Host {}
+        Mock Write-Warning {}
+    }
+    AfterAll {
+        $env:LOCALAPPDATA = $oldLocalAppData
+    }
+
+    It 'creates a usable Preview default before Terminal has ever been opened and remains idempotent' {
+        Set-WindowsTerminalConfig -FontFaceName 'CodeNewRoman Nerd Font'
+        Set-WindowsTerminalConfig -FontFaceName 'CodeNewRoman Nerd Font'
+        $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+        $settings.profiles.list.Count | Should -Be 1
+        $settings.defaultProfile | Should -Be $settings.profiles.list[0].guid
+        $settings.profiles.list[0].commandline | Should -Be "`"$previewPath`""
+        $settings.profiles.defaults.font.face | Should -Be 'CodeNewRoman Nerd Font'
+        Should -Invoke Write-Warning -Times 0
+    }
+
+    It 'preserves existing font options and reuses a discovered Preview profile' {
+        $null = New-Item -Path (Split-Path $settingsPath) -ItemType Directory -Force
+        Set-Content -LiteralPath $settingsPath -Value @'
+{
+  // Terminal settings support comments.
+  "profiles": {
+    "defaults": { "font": { "size": 14, "weight": "bold" } },
+    "list": [{ "name": "PowerShell Preview", "source": "Windows.Terminal.PowershellCore", "guid": "{test-preview}" }]
+  }
+}
+'@
+        Set-WindowsTerminalConfig -FontFaceName 'FiraCode Nerd Font'
+        $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+        $settings.profiles.list.Count | Should -Be 1
+        $settings.defaultProfile | Should -Be '{test-preview}'
+        $settings.profiles.defaults.font.size | Should -Be 14
+        $settings.profiles.defaults.font.weight | Should -Be 'bold'
+        $settings.profiles.defaults.font.face | Should -Be 'FiraCode Nerd Font'
     }
 }
 
@@ -767,7 +925,7 @@ Describe 'Work-only npm registry and Agency' -Tag 'WorkTools' {
     }
 }
 
-Describe 'Standalone Copilot CLI removal' -Tag 'BootstrapSafety' {
+Describe 'Standalone Copilot CLI provisioning' -Tag 'BootstrapSafety' {
     BeforeAll {
         function gh { throw 'Verification must not invoke gh subcommands' }
         function copilot { throw 'Verification must not invoke standalone Copilot' }
@@ -781,41 +939,48 @@ Describe 'Standalone Copilot CLI removal' -Tag 'BootstrapSafety' {
         Mock Write-Host {}
     }
 
-    It 'has no standalone installer, package, presence probe or command invocation' {
+    It 'provisions the standalone package without the retired gh-copilot extension' {
         $functionDefs.Name | Should -Not -Contain 'Install-GitHubCopilotCli'
-        $scriptContent | Should -Not -Match '(?i)GitHub Copilot CLI|@github/copilot|gh-copilot|Install-GitHubCopilotCli'
+        $scriptContent | Should -Not -Match '(?i)@github/copilot|gh-copilot|Install-GitHubCopilotCli'
         $packageDefinition = $ast.EndBlock.Statements | Where-Object {
             $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
             $_.Left.Extent.Text -eq '$corePackages'
         }
         $packages = & ([scriptblock]::Create($packageDefinition.Right.Extent.Text))
         $packages.Id | Should -Contain 'GitHub.cli'
-        $packages.Id | Should -Not -Contain 'GitHub.Copilot'
+        $packages.Id | Should -Contain 'GitHub.Copilot'
         $commands = $ast.FindAll({ param($node)
             $node -is [System.Management.Automation.Language.CommandAst]
         }, $true)
         foreach ($command in $commands) {
             $command.GetCommandName() | Should -Not -Be 'copilot'
-            $command.Extent.Text | Should -Not -Match '(?i)\bgh\s+(copilot|extension)\b|(?:Get-Command|Get-CommandVersion).*-Command\s+[''"]?copilot\b'
-            if ($command.GetCommandName() -in @('Get-Command', 'Get-CommandVersion')) {
-                $arguments = $command.CommandElements | Where-Object {
-                    $_ -is [System.Management.Automation.Language.StringConstantExpressionAst]
-                }
-                $arguments.Value | Should -Not -Contain 'copilot'
-            }
+            $command.Extent.Text | Should -Not -Match '(?i)\bgh\s+(copilot|extension)\b'
         }
     }
 
-    It 'verifies GitHub CLI without probing or reporting standalone Copilot' {
+    It 'verifies GitHub CLI and Copilot CLI independently' {
         Show-VerificationSummary
         Should -Invoke Get-CommandVersion -Times 1 -Exactly -ParameterFilter { $Command -eq 'gh' }
-        Should -Invoke Get-CommandVersion -Times 0 -Exactly -ParameterFilter { $Command -match 'copilot' }
+        Should -Invoke Get-CommandVersion -Times 1 -Exactly -ParameterFilter { $Command -eq 'copilot' }
         Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
             $Label -eq 'GitHub CLI' -and $Installed -and $Details -eq '1.2.3'
         }
-        Should -Invoke Write-VerificationLine -Times 0 -Exactly -ParameterFilter { $Label -match 'Copilot.*CLI' }
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'GitHub Copilot CLI' -and $Installed -and $Details -eq '1.2.3'
+        }
         $scriptContent | Should -Match "Id\s*=\s*'GitHub\.cli'"
         $scriptContent | Should -Match "Id\s*=\s*'github\.copilot-chat'"
+    }
+
+    It 'reports a missing standalone Copilot even when GitHub CLI is present' {
+        Mock Get-CommandVersion { $null } -ParameterFilter { $Command -eq 'copilot' }
+        Show-VerificationSummary
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'GitHub Copilot CLI' -and -not $Installed
+        }
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'GitHub CLI' -and $Installed
+        }
     }
 
     It 'still verifies the current Copilot Chat extension in both editors without retired or synthetic results' {
@@ -1094,6 +1259,58 @@ Describe 'Phase 2 Spotify outcomes' -Tag 'SpotifyVerification' {
         }
         Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { $Object -match 'Done:|Skipped:' }
     }
+
+    It 'honors an explicit Spotify skip during Phase 2' {
+        $skipGuard = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -eq '''Spotify.Spotify'' -notin $SkipPackages'
+        }, $true)
+        $skipGuard.Count | Should -Be 1
+        $SkipPackages = @('Spotify.Spotify')
+        & ([scriptblock]::Create($skipGuard.Extent.Text))
+        Should -Invoke winget -Times 0
+    }
+}
+
+Describe 'Per-user Nerd Font setup' {
+    BeforeAll {
+        function oh-my-posh { param([Parameter(ValueFromRemainingArguments)] [string[]]$Arguments) }
+    }
+    BeforeEach {
+        Mock Write-Host {}
+        Mock Get-Command { [pscustomobject]@{ Name = 'oh-my-posh' } } -ParameterFilter { $Name -eq 'oh-my-posh' }
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [pscustomobject]@{} }
+        Mock Start-Process { throw 'Font setup must not elevate' }
+        Mock Copy-Item { throw 'Font setup must not promote fonts into Windows Fonts' }
+        Mock oh-my-posh { $global:LASTEXITCODE = 0 }
+    }
+
+    It 'reuses installed per-user fonts without requesting elevation or reinstalling' {
+        Mock Get-ItemProperty {
+            [pscustomobject]@{
+                'CodeNewRoman Nerd Font Regular (TrueType)' = 'regular.ttf'
+                'CodeNewRoman Nerd Font Mono Regular (TrueType)' = 'mono.ttf'
+            }
+        } -ParameterFilter { $Path -like 'HKCU:*' }
+
+        $font = Install-NerdFont -FontName 'CodeNewRoman'
+        $font.Face | Should -Be 'CodeNewRoman Nerd Font'
+        $font.Mono | Should -Be 'CodeNewRoman Nerd Font Mono'
+        Should -Invoke oh-my-posh -Times 0
+        Should -Invoke Start-Process -Times 0
+        Should -Invoke Copy-Item -Times 0
+    }
+
+    It 'installs a missing font in the current user session without promotion' {
+        $font = Install-NerdFont -FontName 'FiraCode'
+        $font.Face | Should -Be 'FiraCode Nerd Font'
+        Should -Invoke oh-my-posh -Times 1 -Exactly -ParameterFilter {
+            ($Arguments -join ' ') -eq 'font install FiraCode'
+        }
+        Should -Invoke Start-Process -Times 0
+        Should -Invoke Copy-Item -Times 0
+    }
 }
 
 Describe 'Phase 2 one-shot resume safety' -Tag 'BootstrapSafety' {
@@ -1201,6 +1418,17 @@ Describe 'Phase 2 one-shot resume safety' -Tag 'BootstrapSafety' {
         Mock Enter-Phase2Resume { throw 'Must not claim manual runs' }
         & $runGuard | Should -Be 'configuration reached'
         Should -Invoke Enter-Phase2Resume -Times 0
+    }
+
+    It 'retires the logon task before checking Phase 2 host and elevation requirements' {
+        $contextGuards = $ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -like '$Phase -eq ''Phase2'' -and*'
+        }, $true)
+        $contextGuards.Count | Should -Be 2
+        foreach ($guard in $contextGuards) {
+            $guard.Extent.StartOffset | Should -BeGreaterThan $resumeGuard.Extent.EndOffset
+        }
     }
 }
 

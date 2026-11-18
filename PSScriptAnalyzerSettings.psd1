@@ -12,10 +12,6 @@
         # which is the documented usage pattern from oh-my-posh.
         'PSAvoidUsingInvokeExpression'
 
-        # ConvertTo-SecureString is not used, but the bootstrapping pattern
-        # (downloading Chocolatey install.ps1) triggers this heuristic.
-        'PSAvoidUsingConvertToSecureStringWithPlainText'
-
         # The script is intentionally a monolithic bootstrap — not a module.
         'PSUseShouldProcessForStateChangingFunctions'
 

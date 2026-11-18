@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-18
+
+### Changed
+- Windows uses winget for git and Node.js LTS instead of bootstrapping Chocolatey for two packages. Existing Chocolatey installations are not removed.
+- Windows installs and verifies the standalone `GitHub.Copilot` package: GitHub CLI's `gh copilot` downloads it on demand, rather than bundling the executable.
+- Windows installs the free `WinSCP.WinSCP` package instead of the paid Microsoft Store edition.
+- Work IQ installation/update now runs in non-elevated Phase 2, after Work-mode npm registry configuration.
+- Font setup accepts current-user Nerd Fonts directly, removing unnecessary system-wide promotion and extra elevation prompts.
+- Bootstrap CI/release jobs use current checkout/artifact action majors. Tests remain on Pester 5, and failed tests now fail the CI job.
+
+### Fixed
+- Scheduled Phase 2 preserves custom theme, font, and skip options across reboot, including quoted paths and argument values.
+- `-SkipPackages` is honored for git, Node.js, and Phase 2 Spotify installation.
+- Auto starts installation instead of silently running configuration only from a non-admin shell. Explicit phases validate elevation; Phase 2 requires PowerShell 7.6+ for current module prerequisites.
+- Terminal configuration creates an explicit PowerShell Preview default on first run before dynamic profiles exist, preserves font size/weight, and uses the publisher's correct Preview delegation identities.
+- Windows Home's unavailable Hyper-V feature no longer prevents enabling WSL prerequisite features; already enabled/pending features are left alone.
+- Battle.net's install path uses the Windows environment rather than assuming a `C:` system drive.
+
 ## [1.2.0] - 2026-10-20
 
 ### Added

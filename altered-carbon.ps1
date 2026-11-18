@@ -32,7 +32,7 @@ param(
     [hashtable[]] $ExtraPackages = @(),
 
     # Execution phase for run-once workflow.
-    # Auto (default): detect based on admin status and scheduled-task marker.
+    # Auto (default): start installation; Phase2 is explicitly scheduled after reboot.
     # Phase1: admin installs + register Phase2 task + reboot.
     # Phase2: user-space config + cleanup.
     [ValidateSet('Auto','Phase1','Phase2')]
@@ -46,6 +46,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not ($Work.IsPresent -or $Personal.IsPresent)) {
+    throw 'Specify either -Work or -Personal.'
+}
 
 # winget exit codes that require explicit handling for idempotent installs.
 $WINGET_NO_APPLICABLE_UPGRADE = -1978335189  # 0x8A15002B
@@ -68,11 +71,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 $taskName = 'altered-carbon-phase2'
 
 if ($Phase -eq 'Auto') {
-    if ($isAdmin) {
-        $Phase = 'Phase1'
-    } else {
-        $Phase = 'Phase2'
-    }
+    $Phase = 'Phase1'
 }
 Write-Host "Running in $Phase mode (admin=$isAdmin)" -ForegroundColor Cyan
 
@@ -139,6 +138,28 @@ function Grant-Phase2TaskAccess {
     )
     $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
     $task.SetSecurityDescriptor($descriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::Access), 0)
+}
+
+function Get-Phase2TaskArguments {
+    param(
+        [string] $ScriptPath,
+        [bool] $Personal,
+        [string] $ThemeName,
+        [string] $FontName,
+        [string[]] $SkipPackages,
+        [guid] $Token
+    )
+
+    $modeSwitch = if ($Personal) { '-Personal' } else { '-Work' }
+    $command = "& '$($ScriptPath.Replace("'", "''"))' $modeSwitch -Phase Phase2 -ResumeToken '$Token'" +
+        " -OmpTheme '$($ThemeName.Replace("'", "''"))' -NerdFont '$($FontName.Replace("'", "''"))'"
+    if ($SkipPackages.Count) {
+        $quotedSkips = $SkipPackages | ForEach-Object { "'$($_.Replace("'", "''"))'" }
+        $command += " -SkipPackages @($($quotedSkips -join ','))"
+    }
+    # EncodedCommand preserves spaces, quotes, and array arguments across logon.
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    return "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
 }
 
 function Test-LegacyOhMyPoshPath {
@@ -294,42 +315,6 @@ function Stop-WingetUpgradeProcess {
     Start-Sleep -Seconds $WaitSeconds
 }
 
-function Invoke-ElevatedFontPromotion {
-    # Write a small helper script to a temp file and run it elevated so that
-    # per-user Nerd Font files are copied to the system Fonts directory and
-    # registered in HKLM, making them visible to Windows Terminal (UWP).
-    # Uses a temp file to avoid newline-in-argument issues on Windows when
-    # passing multi-line scripts to pwsh -Command.
-    [CmdletBinding()]
-    param(
-        # The regex pattern (already single-quote–escaped) that identifies the
-        # target font entries in the Windows font registry.
-        [string] $NfPattern
-    )
-
-    $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString('N') + '.ps1')
-    Set-Content -Path $tmpScript -Encoding UTF8 -Value (
-        '$hkcuReg = ''HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-        '$hklmReg = ''HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts''' + "`r`n" +
-        '$entries = (Get-ItemProperty $hkcuReg).PSObject.Properties | Where-Object { $_.Name -match ''Nerd Font'' -and $_.Name -match ''' + $NfPattern + ''' }' + "`r`n" +
-        'foreach ($e in $entries) {' + "`r`n" +
-        '    $srcFile = $e.Value' + "`r`n" +
-        '    $destName = Split-Path $srcFile -Leaf' + "`r`n" +
-        '    Copy-Item $srcFile (Join-Path $env:SystemRoot ''Fonts'' $destName) -Force -ErrorAction SilentlyContinue' + "`r`n" +
-        '    Set-ItemProperty -Path $hklmReg -Name $e.Name -Value $destName -Force' + "`r`n" +
-        '}'
-    )
-    try {
-        Start-Process pwsh -ArgumentList "-NoProfile -File `"$tmpScript`"" -Verb RunAs -Wait -ErrorAction Stop
-        Write-Host '  Done: fonts promoted to system-wide.' -ForegroundColor Green
-    } catch {
-        Write-Warning '  Could not elevate to promote fonts. Windows Terminal may not see per-user fonts.'
-        Write-Host '  Re-run this script as Administrator to fix this.' -ForegroundColor Yellow
-    } finally {
-        Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
-    }
-}
-
 # ── Custom PSModulePath Setup ───────────────────────────────────────────────
 function Initialize-PSModulePath {
     # Create a hidden .psmodule folder in the user's profile and set PSModulePath to it
@@ -380,111 +365,10 @@ function Test-WingetAvailable {
     }
 }
 
-# ── Chocolatey ────────────────────────────────────────────────────────────────
-# Chocolatey provides more reliable PATH handling and version management for
-# developer tools like git. Used alongside winget, not as a full replacement.
-function Install-Chocolatey {
-    param([bool] $IsAdmin)
-
-    Write-Host 'Bootstrapping Chocolatey...' -ForegroundColor Cyan
-
-    if (Get-Command choco -ErrorAction SilentlyContinue) {
-        Write-Host '  Skipped: Chocolatey already installed.' -ForegroundColor Yellow
-    } elseif ($IsAdmin) {
-        try {
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-            Update-PathFromRegistry
-            Write-Host '  Done: Chocolatey installed.' -ForegroundColor Green
-        }
-        catch {
-            Write-Warning "  Failed to install Chocolatey: $_"
-        }
-    } else {
-        Write-Warning '  Chocolatey requires admin privileges. Re-run script as Administrator to install.'
-    }
-}
-
-# ── Chocolatey Packages ──────────────────────────────────────────────────────
-# Git and Node.js benefit most from Chocolatey: they're immediately on PATH
-# and available to downstream tools without a session restart.
-function Install-ChocolateyPackages {
-    param([bool] $IsAdmin, [string[]] $CurrentSkipPackages)
-
-    # Command is the expected binary name — used to verify the install is healthy.
-    $chocoPackages = @(
-        @{ Id = 'git';        Name = 'git';           Command = 'git' }
-        @{ Id = 'nodejs-lts'; Name = 'Node.js (LTS)'; Command = 'node' }
-    )
-
-    $newSkips = @()
-
-    if (Get-Command choco -ErrorAction SilentlyContinue) {
-        foreach ($pkg in $chocoPackages) {
-            Write-Host "Checking $($pkg.Name) ($($pkg.Id)) [choco]..." -ForegroundColor Cyan
-
-            $chocoList = choco list --exact $pkg.Id --limit-output 2>&1
-            if ($chocoList -match [regex]::Escape($pkg.Id)) {
-                # Verify the binary actually exists — winget uninstall can remove
-                # files that Chocolatey installed, leaving stale choco metadata.
-                $cmdInfo = if ($pkg.Command) { Get-Command $pkg.Command -ErrorAction SilentlyContinue } else { $null }
-                $isHealthy = (-not $pkg.Command) -or (
-                    $cmdInfo -and $cmdInfo.Source -notmatch 'Microsoft\\WindowsApps'
-                )
-                if ($isHealthy -and $IsAdmin) {
-                    Write-Host "  Upgrading $($pkg.Name) via Chocolatey (no-op if already latest)..." -ForegroundColor Cyan
-                    choco upgrade $pkg.Id -y --no-progress
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Host "  Done: $($pkg.Name) is up to date." -ForegroundColor Green
-                    } else {
-                        Write-Warning "  choco exited with code $LASTEXITCODE upgrading $($pkg.Name)"
-                    }
-                } elseif ($isHealthy) {
-                    Write-Host "  Skipped: $($pkg.Name) already installed via Chocolatey (run as admin to upgrade)." -ForegroundColor Yellow
-                } elseif ($IsAdmin) {
-                    Write-Host "  $($pkg.Name) metadata found but binary missing or shadowed. Reinstalling..." -ForegroundColor Cyan
-                    choco install $pkg.Id -y --force --no-progress
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Host "  Done: $($pkg.Name) reinstalled via Chocolatey." -ForegroundColor Green
-                    } else {
-                        Write-Warning "  choco exited with code $LASTEXITCODE reinstalling $($pkg.Name)"
-                    }
-                } else {
-                    Write-Host "  $($pkg.Name) choco install is broken (binary missing). Will fall back to winget. Re-run as admin to repair." -ForegroundColor Yellow
-                }
-            } else {
-                Write-Host "  Installing $($pkg.Name) via Chocolatey..." -ForegroundColor Cyan
-                choco install $pkg.Id -y --no-progress
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "  Done: $($pkg.Name) installed via Chocolatey." -ForegroundColor Green
-                } else {
-                    Write-Warning "  choco exited with code $LASTEXITCODE for $($pkg.Name)"
-                }
-            }
-        }
-
-        Update-PathFromRegistry
-
-        # Skip packages already handled by Chocolatey.
-        if (Get-Command git -ErrorAction SilentlyContinue) {
-            $newSkips += 'Git.Git'
-        }
-        if (Get-Command node -ErrorAction SilentlyContinue) {
-            $newSkips += 'OpenJS.NodeJS.LTS'
-        }
-    } else {
-        Write-Host 'Chocolatey not available — git and Node.js will be installed via winget as fallback.' -ForegroundColor Yellow
-    }
-
-    return $newSkips
-}
-
 # ── Installations ─────────────────────────────────────────────────────────────
 
 # Core packages — installed in both Work and Personal modes.
-# git and Node.js are installed via Chocolatey above when available; they
-# remain here as winget fallbacks and are auto-skipped when choco handled them.
+# Keep one package manager so skip requests and upgrades use the same path.
 $corePackages = @(
     @{ Id = 'Microsoft.VisualStudioCode';          Name = 'Visual Studio Code';      Source = 'winget' }
     @{ Id = 'Microsoft.VisualStudioCode.Insiders'; Name = 'Visual Studio Code Insiders'; Source = 'winget' }
@@ -495,12 +379,13 @@ $corePackages = @(
     @{ Id = 'OpenJS.NodeJS.LTS';                   Name = 'Node.js (LTS)';           Source = 'winget' }
     @{ Id = 'GitHub.GitHubDesktop';                Name = 'GitHub Desktop';          Source = 'winget' }
     @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI';              Source = 'winget' }
+    @{ Id = 'GitHub.Copilot';                      Name = 'GitHub Copilot CLI';       Source = 'winget' }
     @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh';              Source = 'winget' }
     @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys';               Source = 'winget' }
     @{ Id = 'Spotify.Spotify';                     Name = 'Spotify';                 Source = 'winget' }
     @{ Id = 'Microsoft.AzureCLI';                  Name = 'Azure CLI (Az CLI)';      Source = 'winget' }
     @{ Id = '7zip.7zip';                           Name = '7zip';                    Source = 'winget' }
-    @{ Id = '9P0PQ8B65N8X';                         Name = 'WinSCP';                  Source = 'msstore' }
+    @{ Id = 'WinSCP.WinSCP';                       Name = 'WinSCP';                  Source = 'winget' }
     @{ Id = 'Logitech.GHUB';                       Name = 'Logitech G Hub';          Source = 'winget' }
     @{ Id = 'Logitech.OptionsPlus';                Name = 'Logitech Options+';       Source = 'winget' }
     @{ Id = 'Yealink.YealinkUSBConnect';           Name = 'Yealink USB Connect';     Source = 'winget' }
@@ -512,7 +397,7 @@ $corePackages = @(
 $personalPackages = @(
     @{ Id = 'Valve.Steam';                                  Name = 'Steam';                  Source = 'winget' }
     @{ Id = 'Discord.Discord';                              Name = 'Discord';                Source = 'winget' }
-    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net';             Source = 'winget'; Location = 'C:\Program Files (x86)\Battle.net' }
+    @{ Id = 'Blizzard.BattleNet';                           Name = 'Battle.net';             Source = 'winget'; Location = (Join-Path ${env:ProgramFiles(x86)} 'Battle.net') }
     @{ Id = 'OpenWhisperSystems.Signal';                    Name = 'Signal';                 Source = 'winget' }
     @{ Id = 'Google.Chrome';                                Name = 'Google Chrome';          Source = 'winget' }
     @{ Id = 'Brave.Brave';                                  Name = 'Brave Browser';          Source = 'winget' }
@@ -661,39 +546,21 @@ function Enable-WindowsFeatures {
     Write-Host 'Enabling Windows features (Hyper-V and WSL 2)...' -ForegroundColor Cyan
 
     if ($IsAdmin) {
-        try {
-            $hypervState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop
-            $wslState = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction Stop
-            $vmPlatformState = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
-        } catch {
-            Write-Warning "  Windows optional feature management is unavailable on this system ($($_.Exception.Message)). Skipping Hyper-V and WSL 2 configuration."
-            return
-        }
-
-        # Enable Hyper-V
-        if ($hypervState -and $hypervState.State -eq 'Enabled') {
-            Write-Host '  Skipped: Hyper-V already enabled.' -ForegroundColor Yellow
-        } else {
+        foreach ($feature in @('Microsoft-Hyper-V-All', 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform')) {
             try {
-                Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop | Out-Null
-                Write-Host '  Done: Hyper-V enabled (reboot required).' -ForegroundColor Green
+                $state = Get-WindowsOptionalFeature -Online -FeatureName $feature -ErrorAction Stop
+                if ($state.State -in @('Enabled', 'EnablePending')) {
+                    Write-Host "  Skipped: $feature already enabled or pending reboot." -ForegroundColor Yellow
+                    continue
+                }
+                Enable-WindowsOptionalFeature -Online -FeatureName $feature -All -NoRestart -ErrorAction Stop | Out-Null
+                Write-Host "  Done: $feature enabled (reboot required)." -ForegroundColor Green
             } catch {
-                Write-Warning "  Failed to enable Hyper-V: $_"
+                # Hyper-V is unavailable on Home editions; WSL must still run.
+                Write-Warning "  Windows optional feature management is unavailable for ${feature}: $_"
             }
         }
-
-        # Enable WSL 2
-        if ($wslState -and $wslState.State -eq 'Enabled' -and $vmPlatformState -and $vmPlatformState.State -eq 'Enabled') {
-            Write-Host '  Skipped: WSL 2 features already enabled.' -ForegroundColor Yellow
-        } else {
-            try {
-                Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -All -NoRestart -ErrorAction Stop | Out-Null
-                Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop | Out-Null
-                Write-Host '  Done: WSL 2 features enabled (reboot required). Run "wsl --install" after reboot to complete setup.' -ForegroundColor Green
-            } catch {
-                Write-Warning "  Failed to enable WSL 2: $_"
-            }
-        }
+        Write-Host '  Run "wsl --install" after reboot to install WSL and a Linux distribution.' -ForegroundColor Cyan
     } else {
         Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
     }
@@ -785,10 +652,7 @@ function Install-WorkIqCli {
 # ── Nerd Font ────────────────────────────────────────────────────────────────
 # oh-my-posh ships a CLI to install Nerd Fonts from the official nerd-fonts releases.
 function Install-NerdFont {
-    param(
-        [string] $FontName,
-        [bool] $IsAdmin
-    )
+    param([string] $FontName)
 
     Write-Host "Installing Nerd Font '$FontName'..." -ForegroundColor Cyan
 
@@ -796,9 +660,8 @@ function Install-NerdFont {
     $fontFaceMono = $null
 
     if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-        # Check font registry to see if already installed (prefer HKLM for WT compat).
+        # Windows Terminal supports both system-wide and per-user fonts.
         $nfPattern = '(' + [regex]::Escape($FontName) + '|' + ($FontName -creplace '([a-z])([A-Z])', '$1\s*$2') + ')'
-        $nfPatternEscaped = $nfPattern -replace "'", "''"
         $fontInstalledScope = $null   # 'Machine' or 'User' or $null
         foreach ($scope in @(
             @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; Scope = 'Machine' },
@@ -811,20 +674,12 @@ function Install-NerdFont {
             }
         }
 
-        if ($fontInstalledScope -eq 'Machine') {
-            Write-Host "  Skipped: $FontName Nerd Font already installed system-wide." -ForegroundColor Yellow
-        } elseif ($fontInstalledScope -eq 'User') {
-            Write-Host "  $FontName Nerd Font installed per-user — promoting to system-wide for Windows Terminal compatibility..." -ForegroundColor Cyan
-            Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
+        if ($fontInstalledScope) {
+            Write-Host "  Skipped: $FontName Nerd Font already installed ($fontInstalledScope)." -ForegroundColor Yellow
         } else {
             & oh-my-posh font install $FontName
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  Done: $FontName Nerd Font installed." -ForegroundColor Green
-
-                if (-not $IsAdmin) {
-                    Write-Host "  Promoting per-user fonts to system-wide for Windows Terminal..." -ForegroundColor Cyan
-                    Invoke-ElevatedFontPromotion -NfPattern $nfPatternEscaped
-                }
             } else {
                 Write-Warning "  oh-my-posh font install exited with code $LASTEXITCODE for $FontName"
             }
@@ -1247,13 +1102,6 @@ function Set-WindowsTerminalConfig {
                 Where-Object { $_.name -match 'Preview' -and $_.source -eq 'Windows.Terminal.PowershellCore' } |
                 Select-Object -First 1 -ExpandProperty guid
         }
-        if (-not $pwshPreviewGuid) {
-            if ($wt.profiles -and $wt.profiles.list) {
-                $pwshPreviewGuid = $wt.profiles.list |
-                    Where-Object { $_.source -eq 'Windows.Terminal.PowershellCore' } |
-                    Select-Object -First 1 -ExpandProperty guid
-            }
-        }
         if ($pwshPreviewGuid) {
             if ($wt.PSObject.Properties['defaultProfile']) {
                 $wt.defaultProfile = $pwshPreviewGuid
@@ -1263,9 +1111,6 @@ function Set-WindowsTerminalConfig {
             }
             Write-Host "    Default profile set to $pwshPreviewGuid" -ForegroundColor Green
         }
-        else {
-            Write-Warning "    Could not find PowerShell Preview/Core profile in $wtLabel — defaultProfile unchanged."
-        }
 
         if (-not $wt.profiles) {
             $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{ defaults = [PSCustomObject]@{} }) -Force
@@ -1273,7 +1118,39 @@ function Set-WindowsTerminalConfig {
         if (-not $wt.profiles.defaults) {
             $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
-        $fontObj = [PSCustomObject]@{ face = $FontFaceName }
+        $previewPath = Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe'
+        if (Test-Path -LiteralPath $previewPath -PathType Leaf) {
+            if (-not $wt.profiles) {
+                $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{}) -Force
+            }
+            if (-not $wt.profiles.PSObject.Properties['list']) {
+                $wt.profiles | Add-Member -NotePropertyName 'list' -NotePropertyValue @() -Force
+            }
+            $previewProfile = $wt.profiles.list | Where-Object {
+                $_.name -match 'Preview' -and $_.source -eq 'Windows.Terminal.PowershellCore'
+            } | Select-Object -First 1
+            if (-not $previewProfile) {
+                $previewProfile = $wt.profiles.list | Where-Object {
+                    $_.guid -eq '{0b446d97-a5ad-4b6d-8a01-d7b609521269}'
+                } | Select-Object -First 1
+            }
+            if (-not $previewProfile) {
+                $previewProfile = [PSCustomObject]@{
+                    guid = '{0b446d97-a5ad-4b6d-8a01-d7b609521269}'
+                    name = 'PowerShell Preview (altered-carbon)'
+                    commandline = "`"$previewPath`""
+                }
+                $wt.profiles.list = @($wt.profiles.list) + $previewProfile
+            }
+            $wt | Add-Member -NotePropertyName 'defaultProfile' -NotePropertyValue $previewProfile.guid -Force
+            Write-Host "    Default profile set to PowerShell Preview ($($previewProfile.guid))." -ForegroundColor Green
+        } elseif (-not $pwshPreviewGuid) {
+            Write-Warning "    PowerShell Preview was not found in $wtLabel or on disk; defaultProfile unchanged."
+        }
+
+        $fontObj = $wt.profiles.defaults.font
+        if (-not $fontObj) { $fontObj = [PSCustomObject]@{} }
+        $fontObj | Add-Member -NotePropertyName 'face' -NotePropertyValue $FontFaceName -Force
         if ($wt.profiles.defaults.PSObject.Properties['font']) {
             $wt.profiles.defaults.font = $fontObj
         }
@@ -1281,7 +1158,7 @@ function Set-WindowsTerminalConfig {
             $wt.profiles.defaults | Add-Member -NotePropertyName 'font' -NotePropertyValue $fontObj -Force
         }
 
-        $wt | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsPath -Encoding UTF8
+        $wt | ConvertTo-Json -Depth 100 | Set-Content $wtSettingsPath -Encoding UTF8
         Write-Host "    Done: $wtSettingsPath" -ForegroundColor Green
     }
 }
@@ -1294,8 +1171,8 @@ function Set-DefaultTerminal {
         if (-not (Test-Path $regPath)) {
             New-Item -Path $regPath -Force | Out-Null
         }
-        Set-ItemProperty -Path $regPath -Name 'DelegationConsole'  -Value '{06171993-2EB2-4CB9-8A6E-492235E1EAFC}'
-        Set-ItemProperty -Path $regPath -Name 'DelegationTerminal' -Value '{86633F1F-6C40-4FA7-B9A0-E7E6D27C4B72}'
+        Set-ItemProperty -Path $regPath -Name 'DelegationConsole'  -Value '{06EC847C-C0A5-46B8-92CB-7C92F6E35CD5}'
+        Set-ItemProperty -Path $regPath -Name 'DelegationTerminal' -Value '{86633F1F-6454-40EC-89CE-DA4EBA977EE2}'
         Write-Host '  Done: default terminal set.' -ForegroundColor Green
     }
     catch {
@@ -1336,7 +1213,7 @@ function Set-VSCodeFont {
             $settings | Add-Member -NotePropertyName 'editor.fontFamily' -NotePropertyValue $fontValue -Force
         }
 
-        $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsPath -Encoding UTF8
+        $settings | ConvertTo-Json -Depth 100 | Set-Content $settingsPath -Encoding UTF8
         Write-Host "  Done: $label font configured." -ForegroundColor Green
     }
 }
@@ -1417,6 +1294,9 @@ function Show-VerificationSummary {
 
     $ghVersion = Get-CommandVersion -Command 'gh'
     Write-VerificationLine -Label 'GitHub CLI' -Installed ([bool]$ghVersion) -Details $ghVersion
+
+    $copilotVersion = Get-CommandVersion -Command 'copilot'
+    Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed ([bool]$copilotVersion) -Details $copilotVersion
 
     $workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
     Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion
@@ -1597,6 +1477,9 @@ function Open-SetupReport {
 $script:verificationResults = [System.Collections.Generic.List[object]]::new()
 $runFailure = $null
 try {
+if ($Phase -eq 'Phase1' -and -not $isAdmin) {
+    throw 'Phase1 requires an elevated shell. Run this script as Administrator with -Work or -Personal.'
+}
 # Retire the logon trigger before any initialization/configuration can fail.
 if ($Phase -eq 'Phase2') {
     $resumeAllowed = $true
@@ -1610,6 +1493,13 @@ if ($Phase -eq 'Phase2') {
     if (-not $resumeAllowed) {
         throw 'This scheduled Phase 2 attempt has already been consumed. Retry manually with -Work or -Personal and -Phase Phase2 (without -ResumeToken).'
     }
+}
+
+if ($Phase -eq 'Phase2' -and $isAdmin) {
+    throw 'Phase2 must run in a non-elevated shell for user-space installers and configuration.'
+}
+if ($Phase -eq 'Phase2' -and $PSVersionTable.PSVersion -lt [version]'7.6') {
+    throw 'Phase2 requires PowerShell 7.6 or newer for current Microsoft365DSC and PnP.PowerShell modules. Update Microsoft.PowerShell, then retry Phase2 from pwsh.'
 }
 
 # Shared init (idempotent, both phases)
@@ -1626,25 +1516,22 @@ if ($Phase -eq 'Phase1') {
     # Clean up any leftover Phase 2 scheduled task from a previous run
     Remove-Phase2Task -TaskName $taskName
 
-    Install-Chocolatey -IsAdmin $isAdmin
-    $chocoSkips = Install-ChocolateyPackages -IsAdmin $isAdmin -CurrentSkipPackages $SkipPackages
-    $SkipPackages += $chocoSkips
+    $phase2Skips = @($SkipPackages)
     # Spotify requires non-admin install — skip in Phase 1
     $SkipPackages += 'Spotify.Spotify'
     Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND -UpgradeVersionNotNewerExitCode $WINGET_UPGRADE_VERSION_NOT_NEWER
     Enable-WindowsFeatures -IsAdmin $isAdmin
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
     Update-PathFromRegistry
-    Install-WorkIqCli
 
     # Register Phase 2 scheduled task (runs at logon as current user, non-elevated)
     $scriptPath = $MyInvocation.MyCommand.Path
     if ($scriptPath -and ($Work.IsPresent -or $Personal.IsPresent)) {
-        $modeSwitch = if ($Work.IsPresent) { '-Work' } else { '-Personal' }
         $pwshPath   = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
-        if (-not $pwshPath) { $pwshPath = 'pwsh' }
+        if (-not $pwshPath) { throw 'PowerShell 7 is required to resume Phase2. Install Microsoft.PowerShell, then rerun Phase1.' }
         $resumeId  = [guid]::NewGuid()
-        $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument "-NoProfile -File `"$scriptPath`" $modeSwitch -Phase Phase2 -ResumeToken $resumeId"
+        $resumeArguments = Get-Phase2TaskArguments -ScriptPath $scriptPath -Personal $Personal.IsPresent -ThemeName $OmpTheme -FontName $NerdFont -SkipPackages $phase2Skips -Token $resumeId
+        $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument $resumeArguments
         $userSid   = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $trigger   = New-ScheduledTaskTrigger -AtLogon -User $userSid
         $principal = New-ScheduledTaskPrincipal -UserId $userSid -LogonType Interactive -RunLevel Limited
@@ -1674,8 +1561,11 @@ if ($Phase -eq 'Phase1') {
         Set-WorkNpmRegistry
         Install-Agency
     }
+    Update-PathFromRegistry
+    Install-WorkIqCli
 
     # Install Spotify (requires non-admin)
+    if ('Spotify.Spotify' -notin $SkipPackages) {
     Write-Host 'Installing Spotify (user-space)...' -ForegroundColor Cyan
     $spotifyOutput = winget install --id 'Spotify.Spotify' --source winget --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { $_.ToString() }
     if ($LASTEXITCODE -eq 0) {
@@ -1712,8 +1602,9 @@ if ($Phase -eq 'Phase1') {
     } else {
         Write-Warning "  winget exited with code $LASTEXITCODE for Spotify"
     }
+    }
 
-    $fontInfo = Install-NerdFont -FontName $NerdFont -IsAdmin $isAdmin
+    $fontInfo = Install-NerdFont -FontName $NerdFont
     $fontFace     = $fontInfo.Face
     $fontFaceMono = $fontInfo.Mono
 
