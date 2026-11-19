@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-19
+
+### Added
+- Squad CLI through the official native packages on Windows (`bradygaster.Squad`) and macOS (`bradygaster/squad/squad`).
+- GitHub Copilot desktop app through Microsoft Store on Windows and Homebrew on macOS, with verification separate from Copilot CLI and editor extensions.
+- Podman engine/CLI and Podman Desktop on both platforms, with independent verification and documented manual machine onboarding.
+- Regression tests for package identity, desktop app verification, tapped-cask upgrades, skip options, and idempotent reruns.
+
+### Changed
+- macOS installs Podman and Podman Desktop instead of Docker Desktop by default. Existing Docker installations, images, containers, and contexts are left untouched.
+
+### Fixed
+- Windows package detection matches exact package IDs and avoids name-based fallback for identity-sensitive packages.
+- Homebrew tapped casks upgrade when outdated output uses either the short or fully qualified token, and accept either spelling in skip options.
+
 ## [1.3.0] - 2026-11-18
 
 ### Changed

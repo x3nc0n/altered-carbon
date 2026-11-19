@@ -134,6 +134,9 @@ Handled orchestration failures in either phase also produce an **incomplete** re
 1. GitHub Desktop
 1. GitHub CLI
 1. GitHub Copilot CLI *(standalone `GitHub.Copilot` winget package)*
+1. GitHub Copilot App *(desktop, Microsoft Store product `XPDCK2L0R6V76J`; separate from the CLI and editor extensions)*
+1. Squad CLI *(`@bradygaster/squad-cli`, via official winget package `bradygaster.Squad`)*
+1. Podman engine/CLI *(`RedHat.Podman`)* and Podman Desktop *(`RedHat.Podman-Desktop`)*
 1. Microsoft Work IQ CLI *(via npm package `@microsoft/workiq`, installed/updated in non-elevated Phase 2)*
 1. oh-my-posh
 1. PowerToys
@@ -218,12 +221,14 @@ Setup no longer changes the **Run as different user** Start-menu policy or remov
 1. Visual Studio Code
 1. Visual Studio Code Insiders
 1. GitHub Desktop
-1. Docker Desktop
+1. Podman engine/CLI *(`podman` formula)* and Podman Desktop *(`podman-desktop` cask)*
 1. PowerShell (7)
 1. git
 1. git LFS
 1. Node.js
 1. GitHub CLI *(`gh copilot` can offer an interactive first-use download; standalone `copilot` is not provisioned by the macOS script)*
+1. GitHub Copilot App *(desktop, `github-copilot-app` cask; separate from the CLI and editor extensions)*
+1. Squad CLI *(`@bradygaster/squad-cli`, via official Homebrew cask `bradygaster/squad/squad`)*
 1. oh-my-posh
 1. NerdFont (installed via oh-my-posh CLI, configurable with `--nerd-font`)
 1. Spotify
@@ -307,6 +312,16 @@ If you already have content in your existing `$PROFILE`, the script will migrate
 > **Note:** You may need to restart your PowerShell session for the new `PSModulePath` to take effect everywhere.
 
 ## Package Managers
+
+The [GitHub Copilot desktop app](https://github.com/github/app#install) is installed through the verified [Microsoft Store product](https://apps.microsoft.com/detail/xpdck2l0r6v76j) on Windows (`winget install --id XPDCK2L0R6V76J --exact --source msstore`) and the [Homebrew cask](https://formulae.brew.sh/cask/github-copilot-app) on macOS (`brew install --cask github-copilot-app`). These packages select the appropriate architecture. Existing user/system Windows uninstall registrations must match both the desktop product name and GitHub publisher for verification; the CLI alone does not satisfy it. macOS checks the `GitHub Copilot.app` bundle. Sign-in remains manual. Skip with `-SkipPackages 'XPDCK2L0R6V76J'` or `--skip github-copilot-app`.
+
+Squad uses the author's [official native installation commands](https://github.com/bradygaster/squad/blob/dev/README.md#2-install-squad): `winget install --id bradygaster.Squad --exact` on Windows and `brew install --cask bradygaster/squad/squad` on macOS, through the existing unattended install/upgrade helpers (not npm). It is included in both modes. Skip it with `-SkipPackages 'bradygaster.Squad'` or `--skip bradygaster/squad/squad` (`--skip squad` also works). Windows installs it in Phase 1 and verifies `squad --version` in Phase 2, including the saved report; macOS checks it in the final summary. Native packages include their own Node.js runtime.
+
+The [upstream installation guide](https://github.github.io/squad/docs/get-started/installation/) notes that WinGet publication can lag a release and only one Squad channel can own the command. If the stable package is unavailable or conflicts with an existing preview, insider, or npm installation, review the warning and resolve the installation manually before retrying; setup does not switch channels or fall back to npm. GitHub Copilot CLI and its sign-in are separate prerequisites for running agent teams; on macOS, provision standalone Copilot separately. Project initialization and upgrades remain explicit, per-repository actions; setup does not run them.
+
+Podman and Podman Desktop replace the former macOS Docker Desktop default and are core packages on both platforms. Windows uses [`RedHat.Podman`](https://github.com/microsoft/winget-pkgs/tree/master/manifests/r/RedHat/Podman) and the [documented `RedHat.Podman-Desktop` package](https://podman-desktop.io/docs/installation/windows-install); macOS uses the documented [`brew install podman`](https://podman.io/docs/installation) and [`brew install --cask podman-desktop`](https://podman-desktop.io/docs/installation/macos-install) commands. Upstream documents Homebrew as an alternative, not its recommended installation method; avoid mixing Homebrew and upstream Podman installers.
+
+Setup does **not** uninstall existing Docker software, delete/migrate images or containers, change Docker contexts/sockets, or create/start Podman machines. CLI/Desktop presence checks do not prove a running engine. After installation, complete Podman's prerequisites/onboarding for your platform, then explicitly create/start a machine (`podman machine init`, `podman machine start`) and check `podman info`. On Windows, feature enablement alone is insufficient: finish WSL runtime installation/update or configure Hyper-V as documented before initializing a machine. Skip engine and desktop separately with `-SkipPackages 'RedHat.Podman','RedHat.Podman-Desktop'` or `--skip podman --skip podman-desktop`.
 
 Windows uses **winget / Microsoft Store** for applications, **npm** for Work IQ, **PowerShell Gallery** for modules, and publisher tools for fonts and Agency. Chocolatey is no longer bootstrapped just to install git and Node.js; existing Chocolatey installations are left untouched. PATH is refreshed from the registry before downstream tools run. Package versions are intentionally unpinned: each run requests the current package/channel or compares the installed module version with the gallery.
 

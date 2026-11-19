@@ -107,7 +107,9 @@ assert_array_contains() {
     local item
 
     eval "for item in \"\${$array_name[@]}\"; do
-        [[ \"\$item\" == \"$expected\" ]] && return 0
+        if [[ \"\$item\" == \"$expected\" ]]; then
+            return 0
+        fi
     done"
 
     fail_test "$message (missing: $expected)"
@@ -120,7 +122,9 @@ assert_array_not_contains() {
     local item
 
     eval "for item in \"\${$array_name[@]}\"; do
-        [[ \"\$item\" == \"$unexpected\" ]] && fail_test \"$message (found: $unexpected)\"
+        if [[ \"\$item\" == \"$unexpected\" ]]; then
+            fail_test \"$message (found: $unexpected)\"
+        fi
     done"
 }
 
@@ -260,6 +264,77 @@ test_ensure_formula_upgrades_outdated_package() {
     assert_array_contains "ok:GitHub CLI upgraded." EVENTS "Successful formula upgrade must be reported"
 }
 
+test_tapped_cask_upgrades_when_outdated_uses_short_or_full_token() {
+    local token
+    BREW_LIST_CASK_STATUS=0
+    for token in squad bradygaster/squad/squad; do
+        BREW_CALLS=()
+        EVENTS=()
+        BREW_OUTDATED_CASK_OUTPUT="$token"
+
+        ensure_cask "bradygaster/squad/squad" "Squad CLI"
+
+        assert_array_contains "upgrade --cask --greedy bradygaster/squad/squad" BREW_CALLS "Tapped cask upgrades must preserve the official tap"
+        assert_array_contains "ok:Squad CLI upgraded." EVENTS "Outdated short or fully-qualified token must trigger upgrade"
+        assert_array_not_contains "skip:Squad CLI already up to date." EVENTS "Outdated tapped casks must not be skipped"
+    done
+}
+
+test_tapped_cask_current_and_similar_tokens_do_not_trigger_install_or_upgrade() {
+    local outdated
+    BREW_LIST_CASK_STATUS=0
+    for outdated in "" squad-tools other-squad bradygaster/squad/squad-extra; do
+        BREW_CALLS=()
+        EVENTS=()
+        BREW_OUTDATED_CASK_OUTPUT="$outdated"
+
+        ensure_cask "bradygaster/squad/squad" "Squad CLI"
+
+        assert_eq "1" "${#BREW_CALLS[@]}" "Current tapped cask must not be installed or upgraded"
+        assert_eq "list --cask bradygaster/squad/squad" "${BREW_CALLS[0]}" "Installed lookup must preserve official tap identity"
+        assert_array_contains "skip:Squad CLI already up to date." EVENTS "Only exact outdated tokens should cause upgrade"
+    done
+}
+
+test_tapped_cask_respects_short_and_full_skip_tokens() {
+    local token
+    for token in squad bradygaster/squad/squad; do
+        SKIP_PACKAGES=("$token")
+        BREW_CALLS=()
+        EVENTS=()
+
+        ensure_cask "bradygaster/squad/squad" "Squad CLI"
+
+        assert_array_empty BREW_CALLS "Either Squad skip spelling must prevent all package operations"
+        assert_array_contains "skip:Squad CLI (skipped by --skip)" EVENTS "Either Squad skip spelling must be reported"
+    done
+}
+
+test_new_desktop_bundles_skip_external_installs_but_upgrade_homebrew_owned_apps() {
+    local entry cask app
+    for entry in "github-copilot-app|GitHub Copilot" "podman-desktop|Podman Desktop"; do
+        cask="${entry%%|*}"
+        app="${entry#*|}"
+        mkdir -p "$APP_USER_DIR/$app.app"
+        BREW_LIST_CASK_STATUS=1
+        BREW_CALLS=()
+        EVENTS=()
+
+        ensure_cask "$cask" "$app" "$app"
+
+        assert_eq "1" "${#BREW_CALLS[@]}" "External desktop app must not be reinstalled"
+        assert_array_contains "skip:$app already installed outside Homebrew (found in ~/Applications)." EVENTS "External desktop app location must be reported"
+
+        BREW_LIST_CASK_STATUS=0
+        BREW_OUTDATED_CASK_OUTPUT="$cask"
+        BREW_CALLS=()
+
+        ensure_cask "$cask" "$app" "$app"
+
+        assert_array_contains "upgrade --cask --greedy $cask" BREW_CALLS "Homebrew-owned desktop app must be upgraded despite existing bundle"
+    done
+}
+
 test_install_stages_keep_github_cli_and_editor_copilot_without_standalone_cli() {
     local install_source call
 
@@ -283,12 +358,35 @@ PY
     assert_array_contains "install gh" BREW_CALLS "GitHub CLI must still be installed"
     assert_array_contains "install --cask github-copilot-for-xcode" BREW_CALLS "Xcode Copilot must remain installed"
     assert_array_contains "install --cask visual-studio-code" BREW_CALLS "VS Code must remain installed"
+    assert_array_contains "install --cask github-copilot-app" BREW_CALLS "Copilot desktop app must be installed separately from CLI"
+    assert_array_contains "install --cask bradygaster/squad/squad" BREW_CALLS "Squad must use the official tap"
+    assert_array_contains "install podman" BREW_CALLS "Podman CLI must be installed"
+    assert_array_contains "install --cask podman-desktop" BREW_CALLS "Podman Desktop must be installed separately from CLI"
     for call in "${BREW_CALLS[@]}"; do
         case "$call" in
-            *" github-copilot-for-xcode") ;;
+            *" github-copilot-for-xcode"|*" github-copilot-app") ;;
             *copilot*) fail_test "standalone Copilot package operation: $call" ;;
         esac
     done
+
+    BREW_LIST_CASK_STATUS=0
+    BREW_CALLS=()
+    EVENTS=()
+    eval "$install_source" >"$TEST_SANDBOX_ROOT/current-install-output"
+    for call in "${BREW_CALLS[@]}"; do
+        case "$call" in
+            install*|upgrade*) fail_test "current package must not be reinstalled or upgraded: $call" ;;
+        esac
+    done
+    assert_array_contains "skip:Squad CLI already up to date." EVENTS "Core-stage Squad must remain idempotent"
+    assert_array_contains "skip:GitHub Copilot App already up to date." EVENTS "Core-stage Copilot desktop must remain idempotent"
+    assert_array_contains "skip:Podman already up to date." EVENTS "Core-stage Podman CLI must remain idempotent"
+    assert_array_contains "skip:Podman Desktop already up to date." EVENTS "Core-stage Podman desktop must remain idempotent"
+
+    BREW_CALLS=()
+    BREW_OUTDATED_CASK_OUTPUT="squad"
+    eval "$install_source" >"$TEST_SANDBOX_ROOT/outdated-install-output"
+    assert_array_contains "upgrade --cask --greedy bradygaster/squad/squad" BREW_CALLS "Core-stage tapped Squad must upgrade on Homebrew short-token output"
 }
 
 test_verification_executes_github_cli_and_editor_checks_without_standalone_copilot() {
@@ -317,6 +415,8 @@ PY
     java() { mock_version "java $*"; }
     oh-my-posh() { mock_version "oh-my-posh $*"; }
     docker() { mock_version "docker $*"; }
+    podman() { mock_version "podman $*"; }
+    squad() { mock_version "squad $*"; }
     az() { mock_version "az $*"; }
     ruby() { mock_version "ruby $*"; }
     copilot() { mock_version "copilot $*"; }
@@ -335,6 +435,10 @@ PY
     [[ "$output" == *"GitHub Copilot Chat"*"github.copilot-chat"* ]] || fail_test "current editor Copilot extension must be reported"
     [[ "$output" != *"built-in"* ]] || fail_test "editor verification must not claim synthetic built-in Copilot"
     [[ "$output" != *"Copilot CLI"* ]] || fail_test "standalone Copilot must not be reported"
+    grep -qx 'podman --version' "$calls_file" || fail_test "Podman CLI must be checked independently of its desktop app"
+    grep -qx 'squad --version' "$calls_file" || fail_test "Squad CLI must be checked"
+    [[ "$output" == *"[MISSING]"*"GitHub Copilot (desktop)"* ]] || fail_test "CLI presence must not imply Copilot desktop presence"
+    [[ "$output" == *"[MISSING]"*"Podman Desktop (desktop)"* ]] || fail_test "Podman CLI presence must not imply desktop presence"
 }
 
 test_no_standalone_copilot_management_anywhere_in_script() {
@@ -591,6 +695,10 @@ main() {
         test_ensure_cask_respects_skip_before_app_detection
         test_ensure_cask_upgrades_outdated_homebrew_owned_app
         test_ensure_formula_upgrades_outdated_package
+        test_tapped_cask_upgrades_when_outdated_uses_short_or_full_token
+        test_tapped_cask_current_and_similar_tokens_do_not_trigger_install_or_upgrade
+        test_tapped_cask_respects_short_and_full_skip_tokens
+        test_new_desktop_bundles_skip_external_installs_but_upgrade_homebrew_owned_apps
         test_install_stages_keep_github_cli_and_editor_copilot_without_standalone_cli
         test_verification_executes_github_cli_and_editor_checks_without_standalone_copilot
         test_no_standalone_copilot_management_anywhere_in_script
