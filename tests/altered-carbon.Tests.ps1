@@ -401,6 +401,81 @@ Describe 'Install-WingetPackages' {
         Remove-Item function:\global:winget -ErrorAction SilentlyContinue
     }
 
+    Context 'identity-sensitive core packages' {
+        BeforeEach {
+            $definition = $ast.EndBlock.Statements | Where-Object {
+                $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -eq '$corePackages'
+            }
+            $script:corePackages = @(& ([scriptblock]::Create($definition.Right.Extent.Text)) |
+                Where-Object Id -eq $PackageId)
+            $script:corePackages.Count | Should -Be 1
+            Mock Write-Host {}
+            Mock Write-Warning {}
+        }
+
+        It 'keeps current <PackageId> idempotent without name fallback or reinstall' -TestCases @(
+            @{ PackageId = 'bradygaster.Squad'; Source = 'winget' }
+            @{ PackageId = 'XPDCK2L0R6V76J'; Source = 'msstore' }
+            @{ PackageId = 'RedHat.Podman'; Source = 'winget' }
+            @{ PackageId = 'RedHat.Podman-Desktop'; Source = 'winget' }
+        ) {
+            param($PackageId, $Source)
+            $script:wingetResponses.Enqueue(@{
+                ExitCode = 0
+                Output = @(
+                    ('{0,-24}{1,-28}{2,-12}{3,-12}Source' -f 'Name', 'Id', 'Version', 'Available')
+                    ('-' * 90)
+                    ('{0,-24}{1,-28}{2,-12}{3,-12}{4}' -f 'Official app', $PackageId, '1.2.3', '1.2.3', $Source)
+                )
+            })
+            $script:wingetResponses.Enqueue(@{ ExitCode = -1978335189; Output = @() })
+
+            Install-WingetPackages -Personal $false -NoApplicableUpgradeExitCode -1978335189
+
+            $script:wingetCalls.Count | Should -Be 2
+            ($script:wingetCalls[0] -join ' ') | Should -Be "list --id $PackageId --exact --source $Source --accept-source-agreements"
+            ($script:wingetCalls[1] -join ' ') | Should -Be "upgrade --id $PackageId --exact --source $Source --accept-source-agreements --accept-package-agreements --silent --include-unknown"
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+                $Object -like '*already up to date*'
+            }
+            Should -Invoke Write-Warning -Times 0 -Exactly
+        }
+
+        It 'does not detect a near-name app when exact <PackageId> is unavailable' -TestCases @(
+            @{ PackageId = 'bradygaster.Squad'; Source = 'winget'; NearId = 'Other.Squad' }
+            @{ PackageId = 'bradygaster.Squad'; Source = 'winget'; NearId = 'bradygaster.Squad.Tools' }
+            @{ PackageId = 'XPDCK2L0R6V76J'; Source = 'msstore'; NearId = 'GitHub.Copilot' }
+            @{ PackageId = 'RedHat.Podman'; Source = 'winget'; NearId = 'RedHat.Podman-Desktop' }
+            @{ PackageId = 'RedHat.Podman-Desktop'; Source = 'winget'; NearId = 'RedHat.Podman' }
+        ) {
+            param($PackageId, $Source, $NearId)
+            $script:wingetResponses.Enqueue(@{
+                ExitCode = -1978335212
+                Output = @(
+                    ('{0,-24}{1,-28}{2,-12}Source' -f 'Name', 'Id', 'Version')
+                    ('-' * 80)
+                    ('{0,-24}{1,-28}{2,-12}{3}' -f 'Similar app', $NearId, '9.9.9', $Source)
+                )
+            })
+            $script:wingetResponses.Enqueue(@{ ExitCode = -1978335212; Output = @('No package found matching input criteria.') })
+            $script:wingetResponses.Enqueue(@{ ExitCode = -1978335212; Output = @() })
+
+            Install-WingetPackages -Personal $false -PackageNotFoundExitCode -1978335212
+
+            $script:wingetCalls.Count | Should -Be 3
+            ($script:wingetCalls[0] -join ' ') | Should -Be "list --id $PackageId --exact --source $Source --accept-source-agreements"
+            ($script:wingetCalls[1] -join ' ') | Should -Be "search --id $PackageId --exact --source $Source --accept-source-agreements"
+            ($script:wingetCalls[2] -join ' ') | Should -Be "install --id $PackageId --exact --source $Source --accept-source-agreements --accept-package-agreements --silent"
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*not available from the configured sources*'
+            }
+            Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter {
+                $Object -match 'Done:|Skipped:'
+            }
+        }
+    }
+
     It 'treats no-applicable-upgrade as success without falling back to install' {
         $script:corePackages = @(
             @{ Id = 'Contoso.App'; Name = 'Contoso App'; Source = 'winget' }
@@ -997,6 +1072,76 @@ Describe 'Standalone Copilot CLI provisioning' -Tag 'BootstrapSafety' {
         }
         Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
             $Details -eq 'github.copilot-chat' -and $Installed
+        }
+    }
+}
+
+Describe 'Desktop app verification identity' {
+    BeforeEach {
+        Mock Get-ItemProperty { @() }
+        Mock Get-CommandVersion { 'CLI 1.2.3' }
+        Mock Get-Command { $null } -ParameterFilter { $Name -in @('code', 'code-insiders') }
+        Mock Write-Host {}
+        Mock Write-VerificationLine {}
+    }
+
+    It 'accepts official <Name> uninstall registrations without requiring a version' -TestCases @(
+        @{ Name = 'GitHub Copilot'; Publisher = 'GitHub Inc.' }
+        @{ Name = 'GitHub Copilot'; Publisher = 'GitHub, Inc.' }
+        @{ Name = 'Podman Desktop'; Publisher = 'Red Hat, Inc.' }
+        @{ Name = 'Podman Desktop'; Publisher = 'Red Hat' }
+    ) {
+        param($Name, $Publisher)
+        $script:desktopRegistration = [pscustomobject]@{ DisplayName = $Name; Publisher = $Publisher; DisplayVersion = '' }
+        Mock Get-ItemProperty { $script:desktopRegistration }
+
+        Show-VerificationSummary
+
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -like "$Name*" -and $Label -in @('GitHub Copilot App (desktop)', 'Podman Desktop') -and
+            $Installed -and $Details -eq 'installed (uninstall registration)'
+        }
+    }
+
+    It 'does not substitute CLI or lookalike registrations for either desktop app' {
+        Mock Get-ItemProperty {
+            @(
+                [pscustomobject]@{ DisplayName = 'GitHub Copilot CLI'; Publisher = 'GitHub Inc.'; DisplayVersion = '1.0' }
+                [pscustomobject]@{ DisplayName = 'GitHub Copilot'; Publisher = 'Other Publisher'; DisplayVersion = '1.0' }
+                [pscustomobject]@{ DisplayName = 'Podman'; Publisher = 'Red Hat'; DisplayVersion = '1.0' }
+                [pscustomobject]@{ DisplayName = 'Podman Desktop'; Publisher = 'Other Publisher'; DisplayVersion = '1.0' }
+            )
+        }
+
+        Show-VerificationSummary
+
+        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
+            $Label -in @('GitHub Copilot App (desktop)', 'Podman Desktop') -and -not $Installed -and -not $Details
+        }
+        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
+            $Label -in @('GitHub Copilot CLI', 'Podman CLI') -and $Installed -and $Details -eq 'CLI 1.2.3'
+        }
+    }
+
+    It 'reports registered desktop versions independently of missing CLIs' {
+        Mock Get-CommandVersion { $null }
+        Mock Get-ItemProperty {
+            @(
+                [pscustomobject]@{ DisplayName = 'GitHub Copilot'; Publisher = 'GitHub Inc.'; DisplayVersion = '2.3.4' }
+                [pscustomobject]@{ DisplayName = 'Podman Desktop'; Publisher = 'Red Hat'; DisplayVersion = '5.6.7' }
+            )
+        }
+
+        Show-VerificationSummary
+
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'GitHub Copilot App (desktop)' -and $Installed -and $Details -eq '2.3.4'
+        }
+        Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
+            $Label -eq 'Podman Desktop' -and $Installed -and $Details -eq '5.6.7'
+        }
+        Should -Invoke Write-VerificationLine -Times 2 -Exactly -ParameterFilter {
+            $Label -in @('GitHub Copilot CLI', 'Podman CLI') -and -not $Installed
         }
     }
 }

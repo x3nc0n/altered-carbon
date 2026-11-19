@@ -212,7 +212,8 @@ function Get-WingetVersionInfo {
     if (-not $headerLine) { return $null }
 
     # Find the data line containing the package ID
-    $dataLine = $Lines | Where-Object { $_ -match [regex]::Escape($PackageId) } | Select-Object -First 1
+    $packagePattern = '(?<!\S)' + [regex]::Escape($PackageId) + '(?!\S)'
+    $dataLine = $Lines | Where-Object { $_ -match $packagePattern } | Select-Object -First 1
     if (-not $dataLine) { return $null }
 
     # Get column positions from header
@@ -380,6 +381,10 @@ $corePackages = @(
     @{ Id = 'GitHub.GitHubDesktop';                Name = 'GitHub Desktop';          Source = 'winget' }
     @{ Id = 'GitHub.cli';                          Name = 'GitHub CLI';              Source = 'winget' }
     @{ Id = 'GitHub.Copilot';                      Name = 'GitHub Copilot CLI';       Source = 'winget' }
+    @{ Id = 'XPDCK2L0R6V76J';                      Name = 'GitHub Copilot App';       Source = 'msstore'; ExactMatchOnly = $true }
+    @{ Id = 'bradygaster.Squad';                   Name = 'Squad CLI';               Source = 'winget'; ExactMatchOnly = $true }
+    @{ Id = 'RedHat.Podman';                       Name = 'Podman';                  Source = 'winget'; ExactMatchOnly = $true }
+    @{ Id = 'RedHat.Podman-Desktop';               Name = 'Podman Desktop';          Source = 'winget'; ExactMatchOnly = $true }
     @{ Id = 'JanDeDobbeleer.OhMyPosh';             Name = 'oh-my-posh';              Source = 'winget' }
     @{ Id = 'Microsoft.PowerToys';                 Name = 'PowerToys';               Source = 'winget' }
     @{ Id = 'Spotify.Spotify';                     Name = 'Spotify';                 Source = 'winget' }
@@ -461,8 +466,8 @@ function Install-WingetPackages {
             $availableVersion = $versionInfo.Available
         }
 
-        # Fallback: some packages (e.g. Spotify) install as MSIX with a different ID.
-        if (-not $installedVersion) {
+        # Some packages install as MSIX with a different ID; identity-sensitive packages must not match by name.
+        if (-not $installedVersion -and -not $pkg.ExactMatchOnly) {
             $nameLines = winget list --name $pkg.Name --accept-source-agreements 2>&1 | ForEach-Object { $_.ToString() }
             $nameHeader = $nameLines | Where-Object { $_ -match '^\s*Name\s+' -and $_ -match 'Version' } | Select-Object -First 1
             if ($nameHeader) {
@@ -1256,6 +1261,27 @@ function Get-CommandVersion {
     return 'installed'
 }
 
+function Get-DesktopAppVersion {
+    param(
+        [string] $Name,
+        [string[]] $Publisher
+    )
+
+    $uninstallPaths = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $app = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq $Name -and $_.Publisher -in $Publisher } |
+        Select-Object -First 1
+    if ($app) {
+        if ($app.DisplayVersion) { return $app.DisplayVersion }
+        return 'installed (uninstall registration)'
+    }
+    return $null
+}
+
 function Write-VerificationLine {
     param(
         [string] $Label,
@@ -1297,6 +1323,18 @@ function Show-VerificationSummary {
 
     $copilotVersion = Get-CommandVersion -Command 'copilot'
     Write-VerificationLine -Label 'GitHub Copilot CLI' -Installed ([bool]$copilotVersion) -Details $copilotVersion
+
+    $copilotAppVersion = Get-DesktopAppVersion -Name 'GitHub Copilot' -Publisher @('GitHub Inc.', 'GitHub, Inc.')
+    Write-VerificationLine -Label 'GitHub Copilot App (desktop)' -Installed ([bool]$copilotAppVersion) -Details $copilotAppVersion
+
+    $squadVersion = Get-CommandVersion -Command 'squad'
+    Write-VerificationLine -Label 'Squad CLI' -Installed ([bool]$squadVersion) -Details $squadVersion
+
+    $podmanVersion = Get-CommandVersion -Command 'podman'
+    Write-VerificationLine -Label 'Podman CLI' -Installed ([bool]$podmanVersion) -Details $podmanVersion
+
+    $podmanDesktopVersion = Get-DesktopAppVersion -Name 'Podman Desktop' -Publisher @('Red Hat, Inc.', 'Red Hat')
+    Write-VerificationLine -Label 'Podman Desktop' -Installed ([bool]$podmanDesktopVersion) -Details $podmanDesktopVersion
 
     $workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
     Write-VerificationLine -Label 'Microsoft Work IQ CLI' -Installed ([bool]$workIqVersion) -Details $workIqVersion

@@ -217,8 +217,9 @@ ensure_cask() {
     local cask="$1"
     local name="${2:-$cask}"
     local app_name="${3:-}"
+    local cask_token="${cask##*/}"
 
-    if is_skipped "$cask"; then
+    if is_skipped "$cask" || is_skipped "$cask_token"; then
         skip "$name (skipped by --skip)"
         return 0
     fi
@@ -227,7 +228,8 @@ ensure_cask() {
     if brew list --cask "$cask" &>/dev/null; then
         local outdated_casks
         outdated_casks="$(brew outdated --quiet --cask --greedy "$cask")"
-        if grep -Fxq "$cask" <<< "$outdated_casks"; then
+        # Homebrew can report a tapped cask by its short token.
+        if grep -Fxq -e "$cask" -e "$cask_token" <<< "$outdated_casks"; then
             brew upgrade --cask --greedy "$cask" || { warn "Failed to upgrade $name"; return 1; }
             ok "$name upgraded."
         else
@@ -368,6 +370,7 @@ ensure_formula openjdk@17 "OpenJDK 17"
 ensure_formula oh-my-posh "oh-my-posh"
 ensure_formula mas "Mac App Store CLI"
 ensure_formula azure-cli "Azure CLI"
+ensure_formula podman "Podman"
 
 # git-lfs setup (idempotent)
 if command -v git-lfs &>/dev/null; then
@@ -384,7 +387,9 @@ echo ""
 ensure_cask visual-studio-code "Visual Studio Code" "Visual Studio Code"
 ensure_cask visual-studio-code@insiders "Visual Studio Code Insiders" "Visual Studio Code - Insiders"
 ensure_cask github "GitHub Desktop" "GitHub Desktop"
-ensure_cask docker-desktop "Docker Desktop" "Docker"
+ensure_cask github-copilot-app "GitHub Copilot App" "GitHub Copilot"
+ensure_cask bradygaster/squad/squad "Squad CLI"
+ensure_cask podman-desktop "Podman Desktop" "Podman Desktop"
 ensure_cask microsoft-edge "Microsoft Edge" "Microsoft Edge"
 ensure_cask microsoft-teams "Microsoft Teams" "Microsoft Teams"
 ensure_cask microsoft-outlook "Microsoft Outlook" "Microsoft Outlook"
@@ -981,15 +986,24 @@ verify() {
 verify "git" git
 verify "git LFS" git-lfs
 verify "GitHub CLI" gh
+verify "Squad CLI" squad
 verify "Node.js" node
 verify "npm" npm
 verify "dotnet" dotnet
 verify "PowerShell" pwsh
 verify "Java" java "-version"
 verify "oh-my-posh" oh-my-posh
-verify "Docker" docker
+verify "Podman CLI" podman
 verify "Azure CLI" az "--version"
 verify "Ruby" ruby "--version"
+
+for desktop_app in "GitHub Copilot" "Podman Desktop"; do
+    if app_exists "$desktop_app"; then
+        printf "${GREEN}  [OK]${NC} %-30s %s\n" "$desktop_app (desktop)" "Installed (${APP_EXISTS_LOCATION})"
+    else
+        printf "${YELLOW}  [MISSING]${NC} %-30s\n" "$desktop_app (desktop)"
+    fi
+done
 
 if app_exists "Ghostty"; then
     printf "${GREEN}  [OK]${NC} %-30s %s\n" "Ghostty" "Installed (${APP_EXISTS_LOCATION})"
