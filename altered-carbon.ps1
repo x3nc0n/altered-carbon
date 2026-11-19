@@ -997,9 +997,49 @@ function Set-PSGalleryTrust {
 }
 
 # ── PowerShell Modules ─────────────────────────────────────────────────────────
+function Initialize-PSModuleRepository {
+    param([switch] $Work)
+
+    if (-not $Work) { return 'PSGallery' }
+
+    $repositoryName = 'azure-powershell'
+    $sourceLocation = 'https://packagefeedproxy.microsoft.io/powershell/v2'
+    $resourceLocation = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'
+    $repositories = @(Get-PSRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+    if ($repositories.Count -gt 1 -or ($repositories.Count -eq 1 -and
+        ([string]$repositories[0].SourceLocation).TrimEnd('/') -ne $sourceLocation)) {
+        throw 'The existing azure-powershell PowerShellGet registration has a different source. No settings were overwritten.'
+    }
+
+    $hasResourceGet = [bool](Get-Command Get-PSResourceRepository -ErrorAction SilentlyContinue)
+    if ($hasResourceGet) {
+        $resourceRepositories = @(Get-PSResourceRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+        if ($resourceRepositories.Count -gt 1 -or ($resourceRepositories.Count -eq 1 -and
+            ([string]$resourceRepositories[0].Uri).TrimEnd('/') -ne $resourceLocation)) {
+            throw 'The existing azure-powershell PSResourceGet registration has a different source. No settings were overwritten.'
+        }
+    }
+
+    if ($repositories.Count -eq 0) {
+        Register-PSRepository -Name $repositoryName -SourceLocation $sourceLocation -ErrorAction Stop | Out-Null
+    }
+    if ($hasResourceGet) {
+        if ($resourceRepositories.Count -eq 0) {
+            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -ErrorAction Stop | Out-Null
+        }
+    } else {
+        Write-Warning 'PSResourceGet is unavailable; its repository registration is unsupported in this shell.'
+    }
+
+    return $repositoryName
+}
+
 # Install commonly used modules into CurrentUser scope (no admin required).
 function Install-PSModules {
-    param([string] $ModuleDir)
+    param(
+        [string] $ModuleDir,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string] $Repository
+    )
 
     $psModules = @(
         # Core
@@ -1022,14 +1062,14 @@ function Install-PSModules {
                     $installedModule = Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue |
                         Sort-Object Version -Descending |
                         Select-Object -First 1
-                    $latestModule = Find-Module -Name $mod.Name -Repository PSGallery -ErrorAction Stop
+                    $latestModule = Find-Module -Name $mod.Name -Repository $Repository -ErrorAction Stop
 
                     if ($installedModule -and $installedModule.Version -ge $latestModule.Version) {
                         Write-Host "  Skipped: $($mod.Name) is already up to date ($($installedModule.Version))." -ForegroundColor Yellow
                         continue
                     }
 
-                    Save-Module -Name $mod.Name -Repository PSGallery -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
+                    Save-Module -Name $mod.Name -Repository $Repository -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
                     Write-Host "  Done: $($mod.Name) $($latestModule.Version)" -ForegroundColor Green
                 }
                 catch {
@@ -1902,8 +1942,11 @@ if ($Phase -eq 'Phase1') {
     $fontFace     = $fontInfo.Face
     $fontFaceMono = $fontInfo.Mono
 
-    Set-PSGalleryTrust
-    Install-PSModules -ModuleDir $psModuleDir
+    $psRepository = Initialize-PSModuleRepository -Work:$Work.IsPresent
+    if ($Personal.IsPresent) {
+        Set-PSGalleryTrust
+    }
+    Install-PSModules -ModuleDir $psModuleDir -Repository $psRepository
     Install-VSCodeExtensions
     Set-OhMyPoshProfile -ThemeName $OmpTheme -ProfileDir $psProfileDir -ProfileFile $psProfileFile
     Set-WindowsTerminalConfig -FontFaceName $fontFace

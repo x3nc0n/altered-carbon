@@ -648,6 +648,42 @@ done
 
 # ── PowerShell Modules ───────────────────────────────────────────────────────
 
+initialize_ps_repository() {
+    ALTERED_CARBON_MODULE_MODE="$MODE" pwsh -NoProfile -NonInteractive -Command '
+$ErrorActionPreference = "Stop"
+if ($env:ALTERED_CARBON_MODULE_MODE -ne "work") {
+    "PSGallery"
+} else {
+    $repositoryName = "azure-powershell"
+    $sourceLocation = "https://packagefeedproxy.microsoft.io/powershell/v2"
+    $resourceLocation = "https://packagefeedproxy.microsoft.io/powershell/v3/index.json"
+    $repositories = @(Get-PSRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+    if ($repositories.Count -gt 1 -or ($repositories.Count -eq 1 -and
+        ([string]$repositories[0].SourceLocation).TrimEnd("/") -ne $sourceLocation)) {
+        throw "The existing azure-powershell PowerShellGet registration has a different source. No settings were overwritten."
+    }
+    $hasResourceGet = [bool](Get-Command Get-PSResourceRepository -ErrorAction SilentlyContinue)
+    if ($hasResourceGet) {
+        $resourceRepositories = @(Get-PSResourceRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+        if ($resourceRepositories.Count -gt 1 -or ($resourceRepositories.Count -eq 1 -and
+            ([string]$resourceRepositories[0].Uri).TrimEnd("/") -ne $resourceLocation)) {
+            throw "The existing azure-powershell PSResourceGet registration has a different source. No settings were overwritten."
+        }
+    }
+    if ($repositories.Count -eq 0) {
+        Register-PSRepository -Name $repositoryName -SourceLocation $sourceLocation -ErrorAction Stop | Out-Null
+    }
+    if ($hasResourceGet) {
+        if ($resourceRepositories.Count -eq 0) {
+            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -ErrorAction Stop | Out-Null
+        }
+    } else {
+        [Console]::Error.WriteLine("PSResourceGet is unavailable; its repository registration is unsupported in this shell.")
+    }
+    $repositoryName
+}'
+}
+
 # Only modules known to work on macOS are included.
 PS_MODULES=(
     "Microsoft.Graph|Microsoft Graph"
@@ -659,21 +695,26 @@ PS_MODULES=(
 )
 
 if command -v pwsh &>/dev/null; then
+    ps_repository="$(initialize_ps_repository)" || {
+        fail "PowerShell module repository selection failed. No module discovery or installation was attempted."
+        exit 1
+    }
     info "Installing or updating PowerShell modules..."
     for entry in "${PS_MODULES[@]}"; do
         mod_name="${entry%%|*}"
         mod_desc="${entry##*|}"
         info "  Checking $mod_desc ($mod_name)..."
-        module_result="$(pwsh -NoProfile -Command "\
+        module_result="$(ALTERED_CARBON_MODULE_REPOSITORY="$ps_repository" pwsh -NoProfile -Command "\
 \$ErrorActionPreference = 'Stop'
+\$repository = \$env:ALTERED_CARBON_MODULE_REPOSITORY
 \$installed = Get-Module -ListAvailable -Name '$mod_name' | Sort-Object Version -Descending | Select-Object -First 1
-\$latest = Find-Module -Name '$mod_name' -Repository PSGallery
+\$latest = Find-Module -Name '$mod_name' -Repository \$repository
 if (\$installed -and \$installed.Version -ge \$latest.Version) {
     'current'
 } else {
-    Install-Module -Name '$mod_name' -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -AcceptLicense
+    Install-Module -Name '$mod_name' -Scope CurrentUser -Repository \$repository -Force -AllowClobber -AcceptLicense
     'updated'
-}" 2>/dev/null)" || {
+}")" || {
             warn "Failed to install or update $mod_name."
             continue
         }

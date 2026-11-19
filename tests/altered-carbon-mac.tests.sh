@@ -851,6 +851,113 @@ assert not re.search(r"(?im)^\s*(?:ensure_(?:formula|cask)|brew\s+install|instal
 PY
 }
 
+load_module_stage() {
+    MODULE_STAGE="$("$PYTHON" - "$SOURCE_SCRIPT" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index("# ── PowerShell Modules")
+end = text.index("# ── oh-my-posh Configuration", start)
+print(text[start:end], end="")
+PY
+)" || fail_test "Could not isolate PowerShell module orchestration"
+    MODULE_CALLS_FILE="$TEST_SANDBOX_ROOT/module-calls"
+    MODULE_INIT_STATUS=0
+    MODULE_INSTALL_STATUS=0
+    MODULE_PWSH_AVAILABLE=1
+    : >"$MODULE_CALLS_FILE"
+
+    command() {
+        if [[ "$*" == "-v pwsh" ]]; then
+            [[ "$MODULE_PWSH_AVAILABLE" -eq 1 ]]
+        else
+            fail_test "Unexpected module command probe: $*"
+        fi
+    }
+    pwsh() {
+        if [[ "$2" == "-NonInteractive" ]]; then
+            printf 'initialize:%s\n' "$ALTERED_CARBON_MODULE_MODE" >>"$MODULE_CALLS_FILE"
+            printf '%s' "$4" >"$TEST_SANDBOX_ROOT/repository-program"
+            if [[ "$MODULE_INIT_STATUS" -ne 0 ]]; then
+                printf 'mock repository configuration failed\n' >&2
+                return "$MODULE_INIT_STATUS"
+            fi
+            if [[ "$ALTERED_CARBON_MODULE_MODE" == "work" ]]; then
+                printf 'azure-powershell\n'
+            else
+                printf 'PSGallery\n'
+            fi
+        else
+            printf 'module:%s\n' "$ALTERED_CARBON_MODULE_REPOSITORY" >>"$MODULE_CALLS_FILE"
+            printf '%s' "$3" >"$TEST_SANDBOX_ROOT/module-program"
+            if [[ "$MODULE_INSTALL_STATUS" -ne 0 ]]; then
+                printf 'mock module download failed\n' >&2
+                return "$MODULE_INSTALL_STATUS"
+            fi
+            printf 'updated\n'
+        fi
+    }
+}
+
+test_work_modules_configure_before_discovery_and_pass_selected_repository_safely() {
+    load_module_stage
+    local MODE="work" actual expected
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    actual="$(cat "$MODULE_CALLS_FILE")"
+    expected="initialize:work"
+    for ((i=0; i<6; i++)); do expected+=$'\nmodule:azure-powershell'; done
+    assert_eq "$expected" "$actual" "Work must configure sources once before any module operation"
+    grep -Fq '$repository = $env:ALTERED_CARBON_MODULE_REPOSITORY' "$TEST_SANDBOX_ROOT/module-program" ||
+        fail_test "Selected repository must be read as data inside PowerShell"
+    if grep -Fq 'azure-powershell' "$TEST_SANDBOX_ROOT/module-program"; then
+        fail_test "Repository output must not be interpolated into PowerShell code"
+    fi
+}
+
+test_personal_modules_keep_public_source() {
+    load_module_stage
+    local MODE="personal" actual expected
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    actual="$(cat "$MODULE_CALLS_FILE")"
+    expected="initialize:personal"
+    for ((i=0; i<6; i++)); do expected+=$'\nmodule:PSGallery'; done
+    assert_eq "$expected" "$actual" "Personal module operations must retain PSGallery"
+}
+
+test_repository_configuration_failure_stops_module_stage_with_visible_error() {
+    load_module_stage
+    local MODE="work" status
+    MODULE_INIT_STATUS=23
+    if ( eval "$MODULE_STAGE" ) >"$TEST_SANDBOX_ROOT/module-output" 2>"$TEST_SANDBOX_ROOT/module-errors"; then status=0; else status=$?; fi
+    assert_status 1 "$status" "Repository configuration failure must stop setup"
+    assert_eq "initialize:work" "$(cat "$MODULE_CALLS_FILE")" "Configuration failure must prevent all module discovery and downloads"
+    grep -q 'mock repository configuration failed' "$TEST_SANDBOX_ROOT/module-errors" ||
+        fail_test "PowerShell configuration errors must remain visible"
+}
+
+test_module_download_errors_remain_visible_without_false_success() {
+    load_module_stage
+    local MODE="work" event
+    MODULE_INSTALL_STATUS=31
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output" 2>"$TEST_SANDBOX_ROOT/module-errors"
+    grep -q 'mock module download failed' "$TEST_SANDBOX_ROOT/module-errors" ||
+        fail_test "PowerShell module errors must remain visible"
+    assert_array_contains "warn:Failed to install or update Az." EVENTS "Module download failure must warn"
+    for event in "${EVENTS[@]}"; do
+        [[ "$event" != ok:* && "$event" != skip:* ]] || fail_test "Failed module downloads must not report success or already-current status"
+    done
+}
+
+test_module_stage_preserves_skip_when_pwsh_is_unavailable() {
+    load_module_stage
+    local MODE="work"
+    MODULE_PWSH_AVAILABLE=0
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    assert_eq "" "$(cat "$MODULE_CALLS_FILE")" "Missing pwsh must skip all module configuration and installation"
+    assert_array_contains "warn:PowerShell (pwsh) not found. Module installation skipped." EVENTS "Missing pwsh must retain the existing skip"
+}
+
 main() {
     local tests=(
         test_app_exists_detects_system_application
@@ -887,6 +994,11 @@ main() {
         test_agency_download_failure_is_not_masked_by_successful_installer
         test_agency_installer_failure_does_not_report_success_or_restart
         test_mac_never_attempts_cuda_installation
+        test_work_modules_configure_before_discovery_and_pass_selected_repository_safely
+        test_personal_modules_keep_public_source
+        test_repository_configuration_failure_stops_module_stage_with_visible_error
+        test_module_download_errors_remain_visible_without_false_success
+        test_module_stage_preserves_skip_when_pwsh_is_unavailable
     )
     local test_name
 

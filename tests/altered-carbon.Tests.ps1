@@ -1144,29 +1144,48 @@ Describe 'Foundry Local owned login supervisor' -Tag 'LocalAI' {
     }
 }
 
-Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
+Describe 'Module repository configuration' -Tag 'LocalAI' {
     BeforeAll {
-        function Register-PSRepository { [CmdletBinding()] param([switch]$Default) }
+        function Register-PSRepository { [CmdletBinding()] param($Name, $SourceLocation, $InstallationPolicy, [switch]$Default) }
+        function Get-PSResourceRepository { [CmdletBinding()] param($Name) }
+        function Register-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority) }
+        function Set-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority) }
+        function Unregister-PSResourceRepository { [CmdletBinding()] param($Name) }
         if (-not (Get-Command Get-PSRepository -ErrorAction SilentlyContinue)) {
             function Get-PSRepository { param($Name) }
             function Set-PSRepository { param($Name, $InstallationPolicy) }
+            function Unregister-PSRepository { param($Name) }
             function Find-Module { param($Name, $Repository) }
             function Save-Module { param($Name, $Repository, $Path, [switch]$Force, [switch]$AcceptLicense) }
         }
         $macSource = Get-Content (Join-Path $PSScriptRoot '..' 'altered-carbon-mac.sh') -Raw
-        $moduleCommand = [regex]::Match($macSource, '(?s)module_result="\$\(pwsh -NoProfile -Command "\\\r?\n(?<Program>.*?)" 2>/dev/null\)"')
+        $moduleCommand = [regex]::Match($macSource, '(?s)module_result="\$\(ALTERED_CARBON_MODULE_REPOSITORY="\$ps_repository" pwsh -NoProfile -Command "\\\r?\n(?<Program>.*?)"\)"')
         if (-not $moduleCommand.Success) { throw 'Could not isolate the generated macOS pwsh module command.' }
         $script:macModuleProgram = $moduleCommand.Groups['Program'].Value.Replace('\$', '$').Replace('$mod_name', 'Az')
+        $repositoryCommand = [regex]::Match($macSource, '(?s)initialize_ps_repository\(\) \{.*?-Command ''(?<Program>.*?)''\r?\n\}')
+        if (-not $repositoryCommand.Success) { throw 'Could not isolate the generated macOS repository command.' }
+        $script:macRepositoryProgram = [scriptblock]::Create($repositoryCommand.Groups['Program'].Value)
+        $script:originalModuleMode = $env:ALTERED_CARBON_MODULE_MODE
+        $script:originalModuleRepository = $env:ALTERED_CARBON_MODULE_REPOSITORY
+    }
+    AfterAll {
+        $env:ALTERED_CARBON_MODULE_MODE = $script:originalModuleMode
+        $env:ALTERED_CARBON_MODULE_REPOSITORY = $script:originalModuleRepository
     }
     BeforeEach {
         Mock Write-Host {}
         Mock Write-Warning {}
         Mock Register-PSRepository {}
         Mock Set-PSRepository {}
+        Mock Unregister-PSRepository {}
+        Mock Register-PSResourceRepository {}
+        Mock Set-PSResourceRepository {}
+        Mock Unregister-PSResourceRepository {}
         Mock Get-Module { @() }
         Mock Find-Module { [pscustomobject]@{ Version = [version]'2.0' } }
         Mock Save-Module {}
         Mock Install-Module {}
+        $env:ALTERED_CARBON_MODULE_REPOSITORY = 'PSGallery'
     }
 
     It 'registers the default gallery only when missing without changing trust' {
@@ -1186,15 +1205,15 @@ Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
     It 'saves outdated modules from PSGallery explicitly rather than an ambient default source' {
         Mock Get-PSRepository {
             @(
-                [pscustomobject]@{ Name = 'Corporate'; InstallationPolicy = 'Trusted' }
+                [pscustomobject]@{ Name = 'Contoso.Modules'; InstallationPolicy = 'Trusted' }
                 [pscustomobject]@{ Name = 'PSGallery'; InstallationPolicy = 'Untrusted' }
             )
         }
         Mock Find-Module {
-            if ($Repository -ne 'PSGallery') { throw 'Ambiguous repositories: Corporate, PSGallery' }
+            if ($Repository -ne 'PSGallery') { throw 'Unexpected module repository' }
             [pscustomobject]@{ Version = [version]'2.0' }
         }
-        Install-PSModules -ModuleDir 'mock-module-directory'
+        Install-PSModules -ModuleDir 'mock-module-directory' -Repository (Initialize-PSModuleRepository)
         Should -Invoke Save-Module -Times 7 -Exactly -ParameterFilter {
             $Repository -eq 'PSGallery' -and $Path -eq 'mock-module-directory' -and $Force -and $AcceptLicense
         }
@@ -1204,10 +1223,10 @@ Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
 
     It 'leaves current modules untouched and reports genuine gallery failures' {
         Mock Get-Module { [pscustomobject]@{ Version = [version]'2.0' } }
-        Install-PSModules -ModuleDir 'mock-module-directory'
+        Install-PSModules -ModuleDir 'mock-module-directory' -Repository PSGallery
         Should -Invoke Save-Module -Times 0
         Mock Find-Module { throw 'TLS connection failed' }
-        Install-PSModules -ModuleDir 'mock-module-directory'
+        Install-PSModules -ModuleDir 'mock-module-directory' -Repository PSGallery
         Should -Invoke Write-Warning -Times 7 -Exactly -ParameterFilter { $Message -like '*TLS connection failed*' }
         Should -Invoke Save-Module -Times 0
         Should -Invoke Set-PSRepository -Times 0
@@ -1215,17 +1234,17 @@ Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
 
     It 'does not replace a newer installed module with an older gallery version' {
         Mock Get-Module { @([pscustomobject]@{ Version = [version]'1.0' }; [pscustomobject]@{ Version = [version]'3.0' }) }
-        Install-PSModules -ModuleDir 'mock-module-directory'
+        Install-PSModules -ModuleDir 'mock-module-directory' -Repository PSGallery
         Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'PSGallery' }
         Should -Invoke Save-Module -Times 0
     }
 
     It 'executes the bash-generated pwsh command against PSGallery with multiple repositories configured' {
         Mock Get-PSRepository {
-            @([pscustomobject]@{ Name = 'Corporate' }; [pscustomobject]@{ Name = 'PSGallery' })
+            @([pscustomobject]@{ Name = 'Contoso.Modules' }; [pscustomobject]@{ Name = 'PSGallery' })
         }
         Mock Find-Module {
-            if ($Repository -ne 'PSGallery') { throw 'Ambiguous repositories: Corporate, PSGallery' }
+            if ($Repository -ne 'PSGallery') { throw 'Unexpected module repository' }
             [pscustomobject]@{ Version = [version]'2.0' }
         }
         & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'updated'
@@ -1236,6 +1255,166 @@ Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
         Mock Get-Module { @([pscustomobject]@{ Version = [version]'1.0' }; [pscustomobject]@{ Version = [version]'3.0' }) }
         & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'current'
         Should -Invoke Install-Module -Times 1 -Exactly
+    }
+
+    It 'configures Phase 2 before module discovery and registers PSGallery only in Personal mode' {
+        $stage = [regex]::Match($scriptContent, '(?ms)^    \$psRepository = Initialize-PSModuleRepository.*?^    Install-PSModules -ModuleDir \$psModuleDir -Repository \$psRepository\r?$')
+        $stage.Success | Should -BeTrue
+        $phase2Modules = [scriptblock]::Create($stage.Value)
+        Mock Initialize-PSModuleRepository { if ($Work) { 'azure-powershell' } else { 'PSGallery' } }
+        Mock Set-PSGalleryTrust {}
+        Mock Install-PSModules {}
+        $psModuleDir = 'mock-module-directory'
+        $Work = [switch]$true
+        $Personal = [switch]$false
+        & $phase2Modules
+        Should -Invoke Set-PSGalleryTrust -Times 0
+        Should -Invoke Install-PSModules -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+        $Work = [switch]$false
+        $Personal = [switch]$true
+        & $phase2Modules
+        Should -Invoke Set-PSGalleryTrust -Times 1 -Exactly
+        Should -Invoke Install-PSModules -Times 1 -Exactly -ParameterFilter { $Repository -eq 'PSGallery' }
+        Mock Initialize-PSModuleRepository { throw 'Repository configuration failed' }
+        { & $phase2Modules } | Should -Throw '*Repository configuration failed*'
+        Should -Invoke Install-PSModules -Times 2 -Exactly
+    }
+
+    Context '<Platform> repository initialization' -ForEach @(
+        @{ Platform = 'Windows' }
+        @{ Platform = 'macOS' }
+    ) {
+        BeforeAll {
+            function Invoke-RepositorySetup {
+                param([switch] $Personal)
+                if ($Platform -eq 'Windows') {
+                    Initialize-PSModuleRepository -Work:(-not $Personal)
+                } else {
+                    $env:ALTERED_CARBON_MODULE_MODE = if ($Personal) { 'personal' } else { 'work' }
+                    & $script:macRepositoryProgram
+                }
+            }
+        }
+        BeforeEach {
+            $script:testRepositories = @([pscustomobject]@{ Name = 'Contoso.Modules'; SourceLocation = 'https://modules.example.test/v2'; InstallationPolicy = 'Untrusted' })
+            $script:testResourceRepositories = @()
+            Mock Get-Command { [pscustomobject]@{ Name = 'Get-PSResourceRepository' } } -ParameterFilter { $Name -eq 'Get-PSResourceRepository' }
+            Mock Get-PSRepository { $script:testRepositories }
+            Mock Get-PSResourceRepository { $script:testResourceRepositories }
+            Mock Register-PSRepository {
+                $script:testRepositories += [pscustomobject]@{ Name = $Name; SourceLocation = $SourceLocation; InstallationPolicy = 'Untrusted' }
+            }
+            Mock Register-PSResourceRepository {
+                $script:testResourceRepositories += [pscustomobject]@{ Name = $Name; Uri = $Uri; Trusted = $false; Priority = 37 }
+            }
+        }
+
+        It 'registers missing Work sources once and passes the selected name to module operations' {
+            $repository = Invoke-RepositorySetup
+            $repository | Should -BeExactly 'azure-powershell'
+            Invoke-RepositorySetup | Should -BeExactly $repository
+            if ($Platform -eq 'Windows') {
+                Install-PSModules -ModuleDir 'mock-module-directory' -Repository $repository
+                Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+                Should -Invoke Save-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' -and $Path -eq 'mock-module-directory' }
+            } else {
+                $env:ALTERED_CARBON_MODULE_REPOSITORY = $repository
+                & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'updated'
+                Should -Invoke Find-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+                Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+            }
+            Should -Invoke Register-PSRepository -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'azure-powershell' -and $SourceLocation -eq 'https://packagefeedproxy.microsoft.io/powershell/v2' -and -not $InstallationPolicy -and -not $Default
+            }
+            Should -Invoke Register-PSResourceRepository -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'azure-powershell' -and $Uri -eq 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json' -and -not $Trusted -and -not $Priority
+            }
+            Should -Invoke Set-PSRepository -Times 0
+            Should -Invoke Set-PSResourceRepository -Times 0
+            Should -Invoke Unregister-PSRepository -Times 0
+            Should -Invoke Unregister-PSResourceRepository -Times 0
+            $script:testRepositories[0].SourceLocation | Should -Be 'https://modules.example.test/v2'
+            $script:testRepositories[0].InstallationPolicy | Should -Be 'Untrusted'
+        }
+
+        It 'preserves matching registrations including trust and priority' {
+            $script:testRepositories = @([pscustomobject]@{
+                Name = 'azure-powershell'; SourceLocation = 'https://packagefeedproxy.microsoft.io/powershell/v2/'; InstallationPolicy = 'Untrusted'
+            }; [pscustomobject]@{
+                Name = 'PSGallery'; SourceLocation = 'https://modules.example.test/gallery'; InstallationPolicy = 'Untrusted'
+            })
+            $script:testResourceRepositories = @([pscustomobject]@{
+                Name = 'azure-powershell'; Uri = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'; Trusted = $false; Priority = 37
+            }; [pscustomobject]@{
+                Name = 'PSGallery'; Uri = 'https://modules.example.test/gallery'; Trusted = $false; Priority = 42
+            })
+            Invoke-RepositorySetup | Should -Be 'azure-powershell'
+            Should -Invoke Register-PSRepository -Times 0
+            Should -Invoke Register-PSResourceRepository -Times 0
+            Should -Invoke Set-PSRepository -Times 0
+            Should -Invoke Set-PSResourceRepository -Times 0
+            Should -Invoke Unregister-PSRepository -Times 0
+            Should -Invoke Unregister-PSResourceRepository -Times 0
+            $script:testRepositories[0].InstallationPolicy | Should -Be 'Untrusted'
+            $script:testRepositories[1].Name | Should -Be 'PSGallery'
+            $script:testResourceRepositories[0].Trusted | Should -BeFalse
+            $script:testResourceRepositories[0].Priority | Should -Be 37
+            $script:testResourceRepositories[1].Priority | Should -Be 42
+        }
+
+        It 'rejects conflicting <Api> registration before any registration or module operation' -TestCases @(
+            @{ Api = 'PowerShellGet' }
+            @{ Api = 'PSResourceGet' }
+        ) {
+            param($Api)
+            if ($Api -eq 'PowerShellGet') {
+                $script:testRepositories = @([pscustomobject]@{ Name = 'azure-powershell'; SourceLocation = 'https://modules.example.test/v2' })
+            } else {
+                $script:testResourceRepositories = @([pscustomobject]@{ Name = 'azure-powershell'; Uri = 'https://modules.example.test/v3/index.json' })
+            }
+            { Invoke-RepositorySetup } | Should -Throw '*different source*'
+            Should -Invoke Register-PSRepository -Times 0
+            Should -Invoke Register-PSResourceRepository -Times 0
+            Should -Invoke Find-Module -Times 0
+            Should -Invoke Save-Module -Times 0
+            Should -Invoke Install-Module -Times 0
+            Should -Invoke Set-PSRepository -Times 0
+            Should -Invoke Set-PSResourceRepository -Times 0
+        }
+
+        It 'propagates <Operation> errors without public fallback or module operations' -TestCases @(
+            @{ Operation = 'Get-PSRepository' }
+            @{ Operation = 'Get-PSResourceRepository' }
+            @{ Operation = 'Register-PSRepository' }
+            @{ Operation = 'Register-PSResourceRepository' }
+        ) {
+            param($Operation)
+            Mock $Operation { throw 'Repository operation failed' }
+            { Invoke-RepositorySetup } | Should -Throw '*Repository operation failed*'
+            Should -Invoke Find-Module -Times 0
+            Should -Invoke Save-Module -Times 0
+            Should -Invoke Install-Module -Times 0
+            Should -Invoke Register-PSRepository -Times 0 -ParameterFilter { $Default -or $Name -eq 'PSGallery' }
+        }
+
+        It 'supports PowerShellGet without bootstrapping unavailable PSResourceGet' {
+            Mock Get-Command { $null } -ParameterFilter { $Name -eq 'Get-PSResourceRepository' }
+            Invoke-RepositorySetup | Should -Be 'azure-powershell'
+            Should -Invoke Register-PSRepository -Times 1 -Exactly
+            Should -Invoke Get-PSResourceRepository -Times 0
+            Should -Invoke Register-PSResourceRepository -Times 0
+            Should -Invoke Install-Module -Times 0
+        }
+
+        It 'returns the Personal source without inspecting or changing either repository registry' {
+            Invoke-RepositorySetup -Personal | Should -Be 'PSGallery'
+            Should -Invoke Get-PSRepository -Times 0
+            Should -Invoke Get-PSResourceRepository -Times 0
+            Should -Invoke Register-PSRepository -Times 0
+            Should -Invoke Register-PSResourceRepository -Times 0
+            Should -Invoke Set-PSRepository -Times 0
+            Should -Invoke Set-PSResourceRepository -Times 0
+        }
     }
 }
 
