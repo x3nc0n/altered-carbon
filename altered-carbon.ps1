@@ -588,6 +588,264 @@ function Install-NvidiaApp {
     }
 }
 
+function Get-CudaInstallPlan {
+    param([object[]] $Gpu)
+
+    $legacy = @('5.0', '5.2', '5.3', '6.0', '6.1', '6.2', '7.0', '7.2')
+    $modern = @('7.5', '8.0', '8.6', '8.7', '8.9', '9.0', '10.0', '10.3', '11.0', '12.0', '12.1')
+    if (-not $Gpu.Count) { return @{ Reason = 'No GPU capability/driver data.' } }
+    foreach ($device in $Gpu) {
+        if ($device.Capability -notin ($legacy + $modern) -or $device.Driver -notmatch '^\d+\.\d+$') {
+            return @{ Reason = "Unknown NVIDIA capability or driver for $($device.Name); no installation attempted." }
+        }
+    }
+    $version = '13.5'
+    $minimumDriver = [version]'620.0'
+    if (@($Gpu | Where-Object Capability -In $legacy).Count) {
+        $version = '12.9'
+        $minimumDriver = [version]'576.57'
+        if (@($Gpu | Where-Object Capability -In @('10.3', '11.0', '12.1')).Count) {
+            return @{ Reason = 'Mixed GPUs need different toolkit generations; select side-by-side toolkits manually.' }
+        }
+    }
+    return @{ Version = $version; MinimumDriver = $minimumDriver; Architectures = @($Gpu.Capability | ForEach-Object { 'compute_' + $_.Replace('.', '') } | Select-Object -Unique) }
+}
+
+function Get-CudaCompiler {
+    $candidates = @()
+    $command = Get-Command nvcc -ErrorAction SilentlyContinue
+    if ($command) { $candidates += $command.Source }
+    foreach ($variable in Get-ChildItem Env: | Where-Object Name -Match '^CUDA_PATH(_V\d+_\d+)?$') {
+        $candidates += Join-Path $variable.Value 'bin\nvcc.exe'
+    }
+    if ($env:ProgramFiles) {
+        $root = Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit\CUDA'
+        if (Test-Path -LiteralPath $root) {
+            $candidates += Get-ChildItem -LiteralPath $root -Directory | ForEach-Object { Join-Path $_.FullName 'bin\nvcc.exe' }
+        }
+    }
+    foreach ($candidate in $candidates | Select-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $versionOutput = & $candidate --version 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch 'release (\d+\.\d+)') { continue }
+        $version = [version]$Matches[1]
+        $architectures = @(& $candidate --list-gpu-arch 2>$null)
+        if ($LASTEXITCODE -ne 0) { continue }
+        [pscustomobject]@{ Path = $candidate; Version = $version; Architectures = $architectures }
+    }
+}
+
+function Install-CudaToolkit {
+    param([string[]] $SkipPackages = @())
+
+    if ('Nvidia.CUDA' -in $SkipPackages) {
+        Write-Host '  Skipped: CUDA Toolkit (-SkipPackages Nvidia.CUDA).' -ForegroundColor Yellow
+        return
+    }
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        $build = [int]$os.BuildNumber
+        $supportedBuilds = if ($os.ProductType -eq 1) { @(19045, 22621, 22631, 26100, 26200) } else { @(20348, 26100) }
+        if ($architecture -ne 'X64' -or -not [Environment]::Is64BitProcess -or $build -notin $supportedBuilds) {
+            Write-Warning 'CUDA Toolkit skipped: requires native Windows x64 on a documented Windows 10 22H2, Windows 11, or Server 2022/2025 build.'
+            return
+        }
+        $present = @(Get-PnpDevice -PresentOnly -Class Display -Status OK -ErrorAction Stop |
+            Where-Object InstanceId -Match '^PCI\\VEN_10DE&')
+        if (-not $present.Count) {
+            Write-Host '  Skipped: CUDA Toolkit; no present healthy PCI NVIDIA GPU (AMD/Intel are not CUDA devices).' -ForegroundColor Yellow
+            return
+        }
+        $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+        if (-not $smi) {
+            $smiPath = Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'
+            if (Test-Path -LiteralPath $smiPath) { $smi = Get-Item -LiteralPath $smiPath }
+        }
+        if (-not $smi) { Write-Warning 'CUDA Toolkit skipped: nvidia-smi/working NVIDIA driver is missing.'; return }
+        $smiPath = if ($smi.Source) { $smi.Source } else { $smi.FullName }
+        $rows = @(& $smiPath --query-gpu=pci.bus_id,name,compute_cap,driver_version --format=csv,noheader,nounits 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $rows.Count) { Write-Warning 'CUDA Toolkit skipped: NVIDIA capability query failed.'; return }
+        $gpus = @($rows | ConvertFrom-Csv -Header Bus, Name, Capability, Driver | ForEach-Object {
+            [pscustomobject]@{ Bus = ([string]$_.Bus).Trim(); Name = ([string]$_.Name).Trim(); Capability = ([string]$_.Capability).Trim(); Driver = ([string]$_.Driver).Trim() }
+        })
+        if (@($gpus | Where-Object Bus -NotMatch '^[0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$').Count) {
+            Write-Warning 'CUDA Toolkit skipped: NVIDIA query did not identify known PCI GPU bus addresses.'
+            return
+        }
+        $plan = Get-CudaInstallPlan -Gpu $gpus
+        if (-not $plan.Version) { Write-Warning "CUDA Toolkit skipped: $($plan.Reason)"; return }
+        if ($plan.Version -eq '12.9' -and $build -eq 26200) {
+            Write-Warning 'CUDA 12.9 skipped: Windows 11 25H2 is not in its documented OS support matrix.'
+            return
+        }
+        $compilers = @(Get-CudaCompiler)
+        foreach ($compiler in $compilers) {
+            $driverMinimum = if ($compiler.Version -ge [version]'13.0') { [version]'620.0' } else { [version]'576.57' }
+            if ($compiler.Version -ge [version]'11.0' -and $compiler.Version -le [version]'13.5' -and
+                -not @($gpus | Where-Object { [version]$_.Driver -lt $driverMinimum }).Count -and
+                -not @($plan.Architectures | Where-Object { $_ -notin $compiler.Architectures }).Count) {
+                Write-Host "  Skipped: compatible CUDA Toolkit $($compiler.Version) preserved at $($compiler.Path)." -ForegroundColor Yellow
+                return
+            }
+        }
+        foreach ($device in $gpus) {
+            if ([version]$device.Driver -lt $plan.MinimumDriver) {
+                Write-Warning "CUDA Toolkit skipped: $($device.Name) needs NVIDIA driver $($plan.MinimumDriver)+ for CUDA $($plan.Version); update the driver manually first."
+                return
+            }
+        }
+        if (@($compilers | Where-Object Version -GT ([version]$plan.Version)).Count) {
+            Write-Warning "CUDA Toolkit skipped: newer toolkit exists; no downgrade or PATH replacement. Install CUDA $($plan.Version) side by side manually if needed."
+            return
+        }
+        $arguments = @('install', '--id', 'Nvidia.CUDA', '--exact', '--source', 'winget', '--version', $plan.Version,
+            '--scope', 'machine', '--silent', '--accept-source-agreements', '--accept-package-agreements', '--disable-interactivity')
+        if ($plan.Version -eq '12.9') {
+            # NVIDIA 12.9.1 Windows guide: explicit subpackages replace the defaults; exclude Display.Driver.
+            $components = @('nvcc', 'cudart', 'cublas', 'cublas_dev', 'cufft', 'cufft_dev', 'curand', 'curand_dev',
+                'cusolver', 'cusolver_dev', 'cusparse', 'cusparse_dev', 'npp', 'npp_dev', 'nvrtc', 'nvrtc_dev',
+                'nvjitlink', 'nvfatbin', 'nvjpeg', 'nvjpeg_dev', 'nvml_dev', 'thrust', 'cuobjdump', 'nvdisasm',
+                'nvprune', 'cuxxfilt', 'sanitizer', 'visual_studio_integration')
+            $arguments += @('--override', ('-s -n ' + (($components | ForEach-Object { "${_}_12.9" }) -join ' ')))
+        }
+        Write-Host "Installing CUDA Toolkit $($plan.Version) only; existing display driver is not replaced..." -ForegroundColor Cyan
+        & winget @arguments
+        if ($LASTEXITCODE -ne 0) { throw "winget CUDA installation failed (exit $LASTEXITCODE)." }
+        $verified = @(Get-CudaCompiler | Where-Object {
+            $compiler = $_
+            $compiler.Version -eq [version]$plan.Version -and
+                -not @($plan.Architectures | Where-Object { $_ -notin $compiler.Architectures }).Count
+        })
+        if (-not $verified.Count) { throw 'CUDA installer returned success, but a compiler supporting all detected GPUs was not found. Review the installer log/reboot requirements.' }
+        Write-Host "  Done: CUDA Toolkit $($plan.Version) compiler and GPU targets verified; compiling applications also requires supported Visual Studio C++ tools." -ForegroundColor Green
+    } catch {
+        throw "CUDA Toolkit setup failed: $_"
+    }
+}
+
+function Test-FoundryReady {
+    try {
+        $status = Invoke-RestMethod -Uri 'http://127.0.0.1:39839/openai/status' -TimeoutSec 2 -NoProxy -ErrorAction Stop
+        return [bool]($status.ModelDirPath -and $status.PipeName -and @($status.Endpoints | Where-Object {
+            $uri = [uri]$_
+            $uri.IsLoopback -and $uri.Port -eq 39839
+        }).Count)
+    } catch { return $false }
+}
+
+function Install-FoundryLocal {
+    param([string[]] $SkipPackages = @())
+
+    if ('Microsoft.FoundryLocal' -in $SkipPackages) {
+        Write-Host '  Skipped: Foundry Local install/autostart (-SkipPackages Microsoft.FoundryLocal).' -ForegroundColor Yellow
+        return
+    }
+    $os = Get-CimInstance Win32_OperatingSystem
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ($architecture -notin @('X64', 'Arm64') -or $os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 26100) {
+        Write-Warning 'Foundry Local skipped: automation targets the tested Windows 11 24H2+ x64/ARM64 baseline. Other Windows versions are not validated here.'
+        return
+    }
+    $foundry = Get-Command foundry -ErrorAction SilentlyContinue
+    if (-not $foundry) {
+        & winget install --id Microsoft.FoundryLocal --exact --source winget --scope user --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+        if ($LASTEXITCODE -notin @(0, -1978335135, -1978335189)) { throw "Foundry Local user installation failed (exit $LASTEXITCODE)." }
+        Update-PathFromRegistry
+        $foundry = Get-Command foundry -ErrorAction SilentlyContinue
+    }
+    if (-not $foundry) { throw 'Foundry Local installed but foundry is not on PATH. Reopen a non-elevated terminal and retry Phase 2.' }
+    & $foundry.Source --version
+    if ($LASTEXITCODE -ne 0) { throw 'Foundry Local version verification failed.' }
+    $helpText = & $foundry.Source server start --help 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $helpText -notmatch '--port\b' -or $helpText -notmatch '--idle-timeout\b') {
+        throw 'Foundry Local CLI lacks documented server start --port/--idle-timeout support. Upgrade Microsoft.FoundryLocal as this user, then retry; no existing server was stopped.'
+    }
+    $directory = Join-Path $env:LOCALAPPDATA 'altered-carbon\foundry-local'
+    $null = New-Item -ItemType Directory -Path $directory -Force
+    $wrapper = Join-Path $directory 'start-foundry.ps1'
+    $owner = '# altered-carbon: Foundry Local login supervisor v1'
+    if ((Test-Path -LiteralPath $wrapper) -and (Get-Content -LiteralPath $wrapper -First 1) -ne $owner) {
+        throw "Refusing to overwrite an unowned Foundry wrapper: $wrapper"
+    }
+    $runtime = @'
+# altered-carbon: Foundry Local login supervisor v1
+$ErrorActionPreference = 'Stop'
+$directory = Split-Path -Parent $PSCommandPath
+try {
+    Start-Transcript -Path (Join-Path $directory 'startup.log') -Append | Out-Null
+    __READY_FUNCTION__
+    while ($true) {
+        if (-not (Test-FoundryReady)) {
+            $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+            if (@($listeners | Where-Object Port -EQ 39839).Count) {
+                throw 'Port 39839 is occupied but does not report a healthy Foundry Local server. Nothing was stopped; resolve the conflict manually.'
+            }
+            $process = Start-Process -FilePath '__FOUNDRY__' -ArgumentList @('server', 'start', '--port', '39839', '--idle-timeout', '0') -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $directory 'server-start.log') -RedirectStandardError (Join-Path $directory 'server-start-error.log')
+            if (-not $process.WaitForExit(45000)) {
+                Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+                throw 'Foundry server start timed out after 45 seconds. Only the launched CLI was stopped; inspect server-start logs.'
+            }
+            if ($process.ExitCode -ne 0) { throw "Foundry server start failed (exit $($process.ExitCode)); see server-start logs." }
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+                if (Test-FoundryReady) { $ready = $true; break }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw 'Foundry readiness timed out. An existing daemon on another port is left untouched; inspect foundry server status and resolve manually.' }
+            Write-Host "$(Get-Date -Format o) Foundry Local ready at http://127.0.0.1:39839/v1 (no model downloaded)."
+        }
+        Start-Sleep -Seconds 30
+    }
+} catch {
+    Write-Error $_ -ErrorAction Continue
+    exit 1
+} finally {
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+}
+'@
+    $runtime = $runtime.Replace('__READY_FUNCTION__', "function Test-FoundryReady {`n$(${function:Test-FoundryReady}.ToString())`n}").
+        Replace('__FOUNDRY__', $foundry.Source.Replace("'", "''"))
+    $runtimeChanged = -not (Test-Path -LiteralPath $wrapper) -or (Get-Content -LiteralPath $wrapper -Raw) -cne $runtime
+    if ($runtimeChanged) {
+        Set-Content -LiteralPath $wrapper -Value $runtime -NoNewline -Encoding utf8
+    }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $name = "altered-carbon-foundry-local-$sid"
+    $description = 'altered-carbon owned Foundry Local login supervisor v1'
+    $existing = Get-ScheduledTask -TaskPath '\' | Where-Object TaskName -EQ $name
+    if ($existing -and $existing.Description -ne $description) { throw "Refusing to replace unowned scheduled task '$name'." }
+    $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$wrapper`""
+    $matchesTask = $existing -and $existing.Actions.Count -eq 1 -and $existing.Actions[0].Execute -eq $pwsh -and
+        $existing.Actions[0].Arguments -eq $arguments -and $existing.Principal.UserId -eq $sid -and
+        $existing.Principal.LogonType -eq 'Interactive' -and $existing.Principal.RunLevel -eq 'Limited' -and
+        $existing.Triggers.Count -eq 1 -and @($existing.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -and $_.UserId -eq $sid -and $_.Enabled }).Count -eq 1 -and
+        $existing.Settings.Enabled -and $existing.Settings.MultipleInstances -eq 'IgnoreNew' -and
+        -not $existing.Settings.DisallowStartIfOnBatteries -and -not $existing.Settings.StopIfGoingOnBatteries -and
+        $existing.Settings.ExecutionTimeLimit -eq 'PT0S'
+    if (-not $matchesTask) {
+        if ($existing.State -eq 'Running') { Stop-ScheduledTask -TaskName $name }
+        $action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments
+        $trigger = New-ScheduledTaskTrigger -AtLogon -User $sid
+        $principal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([timespan]::Zero) -StartWhenAvailable
+        Register-ScheduledTask -TaskName $name -Description $description -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    } elseif ($runtimeChanged -and $existing.State -eq 'Running') {
+        Stop-ScheduledTask -TaskName $name
+    }
+    $task = Get-ScheduledTask -TaskName $name
+    if ($task.State -ne 'Running') { Start-ScheduledTask -TaskName $name }
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if ((Test-FoundryReady) -and (Get-ScheduledTask -TaskName $name).State -eq 'Running') { $ready = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $ready) { throw "Foundry Local not ready at http://127.0.0.1:39839/v1; inspect $directory\startup.log and server-start logs. No unrelated process/server was stopped." }
+    Write-Host "  Done: Foundry Local endpoint ready; login autostart task '$name' registered (not a pre-login service). Logs: $directory" -ForegroundColor Green
+    Write-Host '  MANUAL: GitHub Copilot desktop > Settings > Model providers > Add provider > Foundry Local; endpoint http://127.0.0.1:39839/v1. Explicitly choose/download a model and use its actual discovered ID. No provider, model, or credentials were configured.' -ForegroundColor Yellow
+}
+
 # Refresh PATH so newly installed tools (oh-my-posh, git, etc.) are available
 # in this session without restarting the terminal.
 # (now handled via Update-PathFromRegistry call in orchestration block)
@@ -728,17 +986,13 @@ function Install-NerdFont {
 
 # ── PSGallery Trust ────────────────────────────────────────────────────────────
 function Set-PSGalleryTrust {
-    Write-Host 'Ensuring PSGallery is a trusted repository...' -ForegroundColor Cyan
+    Write-Host 'Ensuring PSGallery is registered (preserving repository trust)...' -ForegroundColor Cyan
     $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
     if (-not $psGallery) {
-        Register-PSRepository -Default -ErrorAction SilentlyContinue
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-        Write-Host '  Done: PSGallery registered and trusted.' -ForegroundColor Green
-    } elseif ($psGallery.InstallationPolicy -ne 'Trusted') {
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-        Write-Host '  Done: PSGallery set to Trusted.' -ForegroundColor Green
+        Register-PSRepository -Default -ErrorAction Stop
+        Write-Host '  Done: PSGallery registered with default trust.' -ForegroundColor Green
     } else {
-        Write-Host '  Skipped: PSGallery already trusted.' -ForegroundColor Yellow
+        Write-Host '  Skipped: PSGallery settings and trust preserved.' -ForegroundColor Yellow
     }
 }
 
@@ -775,7 +1029,7 @@ function Install-PSModules {
                         continue
                     }
 
-                    Save-Module -Name $mod.Name -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
+                    Save-Module -Name $mod.Name -Repository PSGallery -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
                     Write-Host "  Done: $($mod.Name) $($latestModule.Version)" -ForegroundColor Green
                 }
                 catch {
@@ -1560,6 +1814,7 @@ if ($Phase -eq 'Phase1') {
     Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND -UpgradeVersionNotNewerExitCode $WINGET_UPGRADE_VERSION_NOT_NEWER
     Enable-WindowsFeatures -IsAdmin $isAdmin
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
+    Install-CudaToolkit -SkipPackages $SkipPackages
     Update-PathFromRegistry
 
     # Register Phase 2 scheduled task (runs at logon as current user, non-elevated)
@@ -1600,6 +1855,7 @@ if ($Phase -eq 'Phase1') {
         Install-Agency
     }
     Update-PathFromRegistry
+    Install-FoundryLocal -SkipPackages $SkipPackages
     Install-WorkIqCli
 
     # Install Spotify (requires non-admin)

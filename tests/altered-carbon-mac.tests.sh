@@ -335,6 +335,164 @@ test_new_desktop_bundles_skip_external_installs_but_upgrade_homebrew_owned_apps(
     done
 }
 
+test_foundry_skips_unsupported_hosts_and_explicit_exclusions() {
+    local token
+    sw_vers() { printf '14.7\n'; }
+    uname() { printf 'arm64\n'; }
+    install_foundry_local
+    assert_array_empty BREW_CALLS "Unsupported macOS must not install Foundry"
+    assert_array_contains "skip:Foundry Local requires macOS 15+." EVENTS "Old macOS must be explained"
+
+    EVENTS=()
+    sw_vers() { printf '15.0\n'; }
+    uname() { printf 'x86_64\n'; }
+    install_foundry_local
+    assert_array_empty BREW_CALLS "Intel or Rosetta must not install Foundry"
+
+    for token in foundrylocal microsoft/foundrylocal/foundrylocal; do
+        SKIP_PACKAGES=("$token")
+        sw_vers() { fail_test "Explicit skip must precede OS probes"; }
+        install_foundry_local
+        assert_array_contains "skip:Foundry Local install/autostart (--skip foundrylocal)." EVENTS "Both Foundry skip spellings must work"
+        assert_array_empty BREW_CALLS "Explicit skip must prevent package operations"
+    done
+}
+
+test_foundry_generated_artifacts_and_supervisor_without_starting_services() {
+    "$PYTHON" - "$SOURCE_SCRIPT" "$TEST_SANDBOX_ROOT" <<'PY' || fail_test "Generated Foundry artifacts or supervisor violated its contract"
+import ast
+import contextlib
+import io
+import json
+import pathlib
+import plistlib
+import sys
+import urllib.request
+from unittest import mock
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("import pathlib\nimport plistlib", source.index("install_foundry_local() {"))
+generator = compile(source[start:source.index("\nPY\n", start)], "Foundry artifact generator", "exec")
+root = pathlib.Path(sys.argv[2]) / "Foundry & user's fixtures"
+directory = root / "configuration"
+plist = root / "Library" / "LaunchAgents" / "foundry.plist"
+foundry = str(root / "tool's & binary")
+python = sys.executable
+label = "io.altered-carbon.foundry-local"
+
+def generate():
+    output = io.StringIO()
+    with mock.patch.object(sys, "argv", ["generator", str(directory), foundry, python, str(plist), label]), contextlib.redirect_stdout(output):
+        exec(generator, {})
+    return output.getvalue().strip()
+
+assert generate() == "changed", "First run must create the persistent artifacts"
+wrapper = directory / "start-foundry.py"
+configuration = plistlib.loads(plist.read_bytes())
+assert configuration["ProgramArguments"] == [python, str(wrapper), foundry], "Paths with spaces, apostrophes and XML metacharacters must round-trip"
+assert configuration["Label"] == label
+assert configuration["RunAtLoad"] is True and configuration["KeepAlive"] is True
+assert configuration["ThrottleInterval"] == 60
+assert configuration["StandardOutPath"] == str(directory / "startup.log")
+assert b"&amp;" in plist.read_bytes(), "LaunchAgent XML must escape metacharacters in paths"
+original = (wrapper.read_bytes(), plist.read_bytes())
+timestamps = (wrapper.stat().st_mtime_ns, plist.stat().st_mtime_ns)
+assert generate() == "current", "Second run must be idempotent"
+assert timestamps == (wrapper.stat().st_mtime_ns, plist.stat().st_mtime_ns), "Current artifacts must not be rewritten"
+
+tree = ast.parse(wrapper.read_text())
+definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+namespace = {
+    "json": json, "socket": mock.Mock(), "OPENER": mock.Mock(),
+}
+exec(compile(ast.Module(body=definitions, type_ignores=[]), str(wrapper), "exec"), namespace)
+healthy = {"ModelDirPath": "models", "PipeName": "foundry", "Endpoints": ["http://127.0.0.1:39839"]}
+for status, expected in (
+    (healthy, True),
+    ({**healthy, "Endpoints": ["http://[::1]:39839"]}, True),
+    ({**healthy, "ModelDirPath": ""}, False),
+    ({**healthy, "PipeName": ""}, False),
+    ({**healthy, "Endpoints": ["http://example.invalid:39839"]}, False),
+    ({**healthy, "Endpoints": ["http://localhost:39840"]}, False),
+):
+    namespace["OPENER"].open.return_value = io.BytesIO(json.dumps(status).encode())
+    assert namespace["ready"]() is expected, f"Incorrect readiness result for {status}"
+    namespace["OPENER"].open.assert_called_with("http://127.0.0.1:39839/openai/status", timeout=2)
+namespace["OPENER"].open.side_effect = OSError("connection refused")
+assert namespace["ready"]() is False, "HTTP failures are not readiness"
+
+class EndIteration(BaseException):
+    pass
+
+def run_supervisor(statuses, occupied=False):
+    opener = mock.Mock()
+    opener.open.side_effect = [
+        io.StringIO(json.dumps(status)) if status is not None else OSError("not listening")
+        for status in statuses
+    ]
+    connect = mock.MagicMock()
+    if not occupied:
+        connect.side_effect = OSError("not listening")
+    process = mock.Mock()
+    errors, output = io.StringIO(), io.StringIO()
+    def sleep(seconds):
+        if seconds == 30:
+            raise EndIteration()
+    code = None
+    with mock.patch.object(sys, "argv", [str(wrapper), foundry]), \
+         mock.patch("urllib.request.build_opener", return_value=opener), \
+         mock.patch("socket.create_connection", connect), \
+         mock.patch("subprocess.run", process), \
+         mock.patch("time.sleep", side_effect=sleep), \
+         contextlib.redirect_stderr(errors), contextlib.redirect_stdout(output):
+        try:
+            exec(compile(wrapper.read_text(), str(wrapper), "exec"), {"__file__": str(wrapper)})
+        except EndIteration:
+            pass
+        except SystemExit as error:
+            code = error.code
+    return process, connect, code, errors.getvalue(), output.getvalue()
+
+process, connect, code, errors, _ = run_supervisor([healthy])
+process.assert_not_called()
+connect.assert_not_called()
+assert code is None and not errors
+
+process, _, code, errors, _ = run_supervisor([None, healthy])
+process.assert_called_once()
+assert process.call_args.args[0] == [foundry, "server", "start", "--port", "39839", "--idle-timeout", "0"]
+assert process.call_args.kwargs["check"] is True and process.call_args.kwargs["timeout"] == 45
+assert code is None and not errors
+
+process, _, code, errors, output = run_supervisor([None], occupied=True)
+process.assert_not_called()
+assert code == 1 and "nothing was stopped" in errors and "ready at" not in output
+
+process, _, code, errors, output = run_supervisor([None] * 21)
+process.assert_called_once()
+assert code == 1 and "Readiness timed out" in errors and "ready at" not in output
+
+wrapper.write_text("# foreign wrapper\n", encoding="utf-8")
+try:
+    generate()
+except SystemExit as error:
+    assert "unowned wrapper" in str(error)
+else:
+    raise AssertionError("Foreign wrapper must not be overwritten")
+assert wrapper.read_text() == "# foreign wrapper\n"
+wrapper.write_bytes(original[0])
+configuration["Comment"] = "foreign owner"
+plist.write_bytes(plistlib.dumps(configuration))
+try:
+    generate()
+except SystemExit as error:
+    assert "unowned LaunchAgent" in str(error)
+else:
+    raise AssertionError("Foreign LaunchAgent must not be overwritten")
+assert plistlib.loads(plist.read_bytes())["Comment"] == "foreign owner"
+PY
+}
+
 test_install_stages_keep_github_cli_and_editor_copilot_without_standalone_cli() {
     local install_source call
 
@@ -683,6 +841,16 @@ test_agency_installer_failure_does_not_report_success_or_restart() {
     assert_eq "2" "${#EVENTS[@]}" "Failed installer must not report success or terminal restart"
 }
 
+test_mac_never_attempts_cuda_installation() {
+    "$PYTHON" - "$SOURCE_SCRIPT" <<'PY' || fail_test "macOS must not attempt CUDA installation"
+import re
+import sys
+from pathlib import Path
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+assert not re.search(r"(?im)^\s*(?:ensure_(?:formula|cask)|brew\s+install|install_[a-z_]*)[^\n]*(?:cuda|nvidia)", source)
+PY
+}
+
 main() {
     local tests=(
         test_app_exists_detects_system_application
@@ -699,6 +867,8 @@ main() {
         test_tapped_cask_current_and_similar_tokens_do_not_trigger_install_or_upgrade
         test_tapped_cask_respects_short_and_full_skip_tokens
         test_new_desktop_bundles_skip_external_installs_but_upgrade_homebrew_owned_apps
+        test_foundry_skips_unsupported_hosts_and_explicit_exclusions
+        test_foundry_generated_artifacts_and_supervisor_without_starting_services
         test_install_stages_keep_github_cli_and_editor_copilot_without_standalone_cli
         test_verification_executes_github_cli_and_editor_checks_without_standalone_copilot
         test_no_standalone_copilot_management_anywhere_in_script
@@ -716,6 +886,7 @@ main() {
         test_agency_warns_to_restart_terminal_when_installed_command_is_not_on_path
         test_agency_download_failure_is_not_masked_by_successful_installer
         test_agency_installer_failure_does_not_report_success_or_restart
+        test_mac_never_attempts_cuda_installation
     )
     local test_name
 

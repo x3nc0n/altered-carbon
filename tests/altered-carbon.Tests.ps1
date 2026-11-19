@@ -22,6 +22,11 @@ BeforeAll {
     if (-not (Get-Command Get-InstalledModule -ErrorAction SilentlyContinue)) {
         function global:Get-InstalledModule { param([string] $Name) }
     }
+    function Register-ScheduledTask {
+        [CmdletBinding()]
+        param($TaskName, $Description, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+        throw 'Tests must mock task registration rather than register a real task.'
+    }
 
     # Also extract key data structures (package arrays) by evaluating variable assignments.
     # We'll parse them manually from the script content for test assertions.
@@ -729,6 +734,621 @@ Describe 'Enable-WindowsFeatures' {
         Mock Enable-WindowsOptionalFeature {}
         Enable-WindowsFeatures -IsAdmin $true
         Should -Invoke Enable-WindowsOptionalFeature -Times 0
+    }
+}
+
+Describe 'CUDA toolkit compatibility' -Tag 'LocalAI' {
+    It 'selects CUDA <Version> and the exact target for compute <Capability>' -TestCases @(
+        @('5.0', '5.2', '5.3', '6.0', '6.1', '6.2', '7.0', '7.2') | ForEach-Object {
+            @{ Capability = $_; Version = '12.9'; Driver = [version]'576.57' }
+        }
+        @('7.5', '8.0', '8.6', '8.7', '8.9', '9.0', '10.0', '10.3', '11.0', '12.0', '12.1') | ForEach-Object {
+            @{ Capability = $_; Version = '13.5'; Driver = [version]'620.0' }
+        }
+    ) {
+        param($Capability, $Version, $Driver)
+        $plan = Get-CudaInstallPlan -Gpu @([pscustomobject]@{ Name = 'NVIDIA fixture'; Capability = $Capability; Driver = '620.00' })
+        $plan.Version | Should -Be $Version
+        $plan.MinimumDriver | Should -Be $Driver
+        $plan.Architectures | Should -HaveCount 1
+        $plan.Architectures[0] | Should -Be ('compute_' + $Capability.Replace('.', ''))
+    }
+
+    It 'declines unsupported or malformed capability/driver data' -TestCases @(
+        @{ Capability = '5.20'; Driver = '620.00' }
+        @{ Capability = '9.9'; Driver = '620.00' }
+        @{ Capability = ''; Driver = '620.00' }
+        @{ Capability = '8.6'; Driver = 'unknown' }
+    ) {
+        param($Capability, $Driver)
+        $plan = Get-CudaInstallPlan -Gpu @([pscustomobject]@{ Name = 'NVIDIA fixture'; Capability = $Capability; Driver = $Driver })
+        $plan.Version | Should -BeNullOrEmpty
+        $plan.Reason | Should -Match 'Unknown'
+    }
+
+    It 'requires manual selection for legacy plus compute <Capability>' -TestCases @(
+        @{ Capability = '10.3' }; @{ Capability = '11.0' }; @{ Capability = '12.1' }
+    ) {
+        param($Capability)
+        $plan = Get-CudaInstallPlan -Gpu @(
+            [pscustomobject]@{ Name = 'Legacy'; Capability = '5.2'; Driver = '620.00' }
+            [pscustomobject]@{ Name = 'Modern'; Capability = $Capability; Driver = '620.00' }
+        )
+        $plan.Version | Should -BeNullOrEmpty
+        $plan.Reason | Should -Match 'Mixed'
+    }
+
+    It 'uses the legacy toolkit for supported mixed GPUs and retains all distinct targets' {
+        $plan = Get-CudaInstallPlan -Gpu @(
+            [pscustomobject]@{ Name = 'Legacy'; Capability = '5.2'; Driver = '620.00' }
+            [pscustomobject]@{ Name = 'Modern'; Capability = '8.6'; Driver = '620.00' }
+            [pscustomobject]@{ Name = 'Modern duplicate'; Capability = '8.6'; Driver = '620.00' }
+        )
+        $plan.Version | Should -Be '12.9'
+        $plan.Architectures | Should -HaveCount 2
+        $plan.Architectures | Should -Contain 'compute_52'
+        $plan.Architectures | Should -Contain 'compute_86'
+        (Get-CudaInstallPlan -Gpu @()).Reason | Should -Not -BeNullOrEmpty
+    }
+
+    Context 'mocked CUDA installation' {
+        BeforeAll {
+            if (-not (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue)) {
+                function Get-PnpDevice { param($PresentOnly, $Class, $Status) }
+            }
+            function Invoke-TestNvidiaSmi {
+                $global:LASTEXITCODE = $script:cudaSmiExit
+                $script:cudaGpuRows
+            }
+            function winget {
+                param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Arguments)
+                $script:cudaInstallArguments = $Arguments
+                $global:LASTEXITCODE = $script:cudaInstallExit
+            }
+        }
+        BeforeEach {
+            $script:cudaSmiExit = 0
+            $script:cudaInstallExit = 0
+            $script:cudaInstallArguments = @()
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA fixture, 8.6, 620.00')
+            $script:cudaBeforeCompilers = @()
+            $script:cudaAfterCompilers = @([pscustomobject]@{
+                Path = 'mock nvcc'; Version = [version]'13.5'; Architectures = @('compute_86')
+            })
+            Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+            Mock Get-PnpDevice { [pscustomobject]@{ InstanceId = 'PCI\VEN_10DE&DEV_1234' } }
+            Mock Get-Command { [pscustomobject]@{ Source = 'Invoke-TestNvidiaSmi' } } -ParameterFilter { $Name -eq 'nvidia-smi' }
+            Mock Get-CudaCompiler {
+                if ($script:cudaInstallArguments.Count) { $script:cudaAfterCompilers } else { $script:cudaBeforeCompilers }
+            }
+            Mock Write-Host {}
+            Mock Write-Warning {}
+        }
+
+        It 'skips explicitly excluded CUDA before probing the host' {
+            Install-CudaToolkit -SkipPackages @('Nvidia.CUDA')
+            Should -Invoke Get-CimInstance -Times 0
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+        }
+
+        It 'does not install on an unvalidated OS build or without a present NVIDIA PCI device' -TestCases @(
+            @{ Build = '22000'; Device = 'PCI\VEN_10DE&DEV_1234' }
+            @{ Build = '26100'; Device = 'PCI\VEN_1002&DEV_1234' }
+            @{ Build = '26100'; Device = 'ROOT\NVIDIA' }
+        ) {
+            param($Build, $Device)
+            Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = $Build; ProductType = 1 } }
+            Mock Get-PnpDevice { [pscustomobject]@{ InstanceId = $Device } }
+            Install-CudaToolkit
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Get-CudaCompiler -Times 0
+        }
+
+        It 'does not install when the GPU query fails or its driver is too old' -TestCases @(
+            @{ QueryExit = 1; Driver = '620.00' }
+            @{ QueryExit = 0; Driver = '619.99' }
+        ) {
+            param($QueryExit, $Driver)
+            $script:cudaSmiExit = $QueryExit
+            $script:cudaGpuRows = @("00000000:01:00.0, NVIDIA fixture, 8.6, $Driver")
+            Install-CudaToolkit
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1
+        }
+
+        It 'preserves a compatible older compiler before applying the newer toolkit driver threshold' {
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA fixture, 8.6, 576.57')
+            $script:cudaBeforeCompilers = @([pscustomobject]@{
+                Path = 'existing nvcc'; Version = [version]'12.9'; Architectures = @('compute_86')
+            })
+            Install-CudaToolkit
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*compatible CUDA Toolkit*preserved*' }
+            Should -Invoke Write-Warning -Times 0
+        }
+
+        It 'does not downgrade an unsupported newer compiler' {
+            $script:cudaBeforeCompilers = @([pscustomobject]@{
+                Path = 'future nvcc'; Version = [version]'14.0'; Architectures = @('compute_86')
+            })
+            Install-CudaToolkit
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*no downgrade*' }
+        }
+
+        It 'installs modern CUDA by exact version and verifies compiler targets' {
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA GeForce RTX 3090, 8.6, 621.24')
+            Install-CudaToolkit
+            ($script:cudaInstallArguments -join ' ') | Should -Be 'install --id Nvidia.CUDA --exact --source winget --version 13.5 --scope machine --silent --accept-source-agreements --accept-package-agreements --disable-interactivity'
+            Should -Invoke Get-CudaCompiler -Times 2 -Exactly
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -like '*Done:*compiler and GPU targets verified*' }
+        }
+
+        It 'skips an empty GPU inventory before querying a driver' {
+            Mock Get-PnpDevice { @() }
+            Install-CudaToolkit
+            Should -Invoke Get-Command -Times 0 -ParameterFilter { $Name -eq 'nvidia-smi' }
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+        }
+
+        It 'does not install without a working driver executable' {
+            Mock Get-Command { $null } -ParameterFilter { $Name -eq 'nvidia-smi' }
+            Mock Test-Path { $false }
+            Install-CudaToolkit
+            Should -Invoke Get-CudaCompiler -Times 0
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*driver is missing*' }
+        }
+
+        It 'does not install for an unknown GPU capability' {
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA fixture, 99.0, 621.24')
+            Install-CudaToolkit
+            Should -Invoke Get-CudaCompiler -Times 0
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*Unknown NVIDIA capability*' }
+        }
+
+        It 'selects explicit legacy toolkit components without installing a display driver' {
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA fixture, 5.2, 576.57')
+            $script:cudaAfterCompilers = @([pscustomobject]@{
+                Path = 'mock nvcc'; Version = [version]'12.9'; Architectures = @('compute_52')
+            })
+            Install-CudaToolkit
+            $versionIndex = [array]::IndexOf($script:cudaInstallArguments, '--version')
+            $script:cudaInstallArguments[$versionIndex + 1] | Should -Be '12.9'
+            $overrideIndex = [array]::IndexOf($script:cudaInstallArguments, '--override')
+            $overrideIndex | Should -BeGreaterThan -1
+            $override = $script:cudaInstallArguments[$overrideIndex + 1]
+            $override | Should -Match '^-s -n nvcc_12\.9 '
+            $override | Should -Match '\bcudart_12\.9\b'
+            $override | Should -Not -Match '(?i)display|driver'
+            @($override -split ' ' | Select-Object -Skip 2 | Where-Object { $_ -notmatch '^[a-z_]+_12\.9$' }) | Should -BeNullOrEmpty
+        }
+
+        It 'declines CUDA 12.9 on Windows 11 25H2' {
+            Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26200'; ProductType = 1 } }
+            $script:cudaGpuRows = @('00000000:01:00.0, NVIDIA fixture, 5.2, 620.00')
+            Install-CudaToolkit
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*12.9*25H2*' }
+        }
+
+        It 'fails loudly when installation fails or its claimed success cannot be verified' -TestCases @(
+            @{ ExitCode = 5; Targets = @('compute_86') }
+            @{ ExitCode = 0; Targets = @('compute_75') }
+        ) {
+            param($ExitCode, $Targets)
+            $script:cudaInstallExit = $ExitCode
+            $script:cudaAfterCompilers[0].Architectures = $Targets
+            { Install-CudaToolkit } | Should -Throw '*CUDA Toolkit setup failed*'
+            Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Done:*' }
+        }
+    }
+}
+
+Describe 'Foundry Local readiness identity' -Tag 'LocalAI' {
+    BeforeEach {
+        Mock Invoke-RestMethod {
+            [pscustomobject]@{ ModelDirPath = 'models'; PipeName = 'foundry'; Endpoints = @('http://127.0.0.1:39839') }
+        }
+    }
+
+    It 'requires the expected service payload and loopback endpoint, bypassing proxy configuration' {
+        Test-FoundryReady | Should -BeTrue
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+            $Uri -eq 'http://127.0.0.1:39839/openai/status' -and $TimeoutSec -eq 2 -and $NoProxy -and $ErrorAction -eq 'Stop'
+        }
+    }
+
+    It 'rejects incomplete or foreign status payloads' -TestCases @(
+        @{ ModelDir = ''; Pipe = 'foundry'; Endpoint = 'http://127.0.0.1:39839' }
+        @{ ModelDir = 'models'; Pipe = ''; Endpoint = 'http://127.0.0.1:39839' }
+        @{ ModelDir = 'models'; Pipe = 'foundry'; Endpoint = 'http://example.invalid:39839' }
+        @{ ModelDir = 'models'; Pipe = 'foundry'; Endpoint = 'http://127.0.0.1:12345' }
+        @{ ModelDir = 'models'; Pipe = 'foundry'; Endpoint = 'not a URI' }
+    ) {
+        param($ModelDir, $Pipe, $Endpoint)
+        Mock Invoke-RestMethod {
+            [pscustomobject]@{ ModelDirPath = $ModelDir; PipeName = $Pipe; Endpoints = @($Endpoint) }
+        }
+        Test-FoundryReady | Should -BeFalse
+    }
+
+    It 'returns false rather than treating an HTTP failure as readiness' {
+        Mock Invoke-RestMethod { throw 'connection refused' }
+        Test-FoundryReady | Should -BeFalse
+    }
+}
+
+Describe 'Foundry Local owned login supervisor' -Tag 'LocalAI' {
+    BeforeAll {
+        function Invoke-TestFoundry {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Arguments)
+            $script:foundryCliCalls.Add(($Arguments -join ' '))
+            $global:LASTEXITCODE = $script:foundryCliExit
+            if ($Arguments[0] -eq 'server') { $script:foundryHelp } else { 'Foundry fixture 1.0' }
+        }
+        function winget {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Arguments)
+            $script:foundryInstallArguments = $Arguments
+            $script:foundryOnPath = $true
+            $global:LASTEXITCODE = 0
+        }
+        $script:foundrySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $script:foundryWrapperPath = Join-Path $env:LOCALAPPDATA 'altered-carbon\foundry-local\start-foundry.ps1'
+    }
+    BeforeEach {
+        $script:foundryCliCalls = [System.Collections.Generic.List[string]]::new()
+        $script:foundryInstallArguments = @()
+        $script:foundryCliExit = 0
+        $script:foundryHelp = '--port --idle-timeout'
+        $script:foundryOnPath = $true
+        $script:foundryWrapperExists = $false
+        $script:foundryWrapperContent = ''
+        $script:foundryExistingTask = $null
+        Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+        Mock Get-Command {
+            if ($script:foundryOnPath) { [pscustomobject]@{ Source = 'Invoke-TestFoundry' } }
+        } -ParameterFilter { $Name -eq 'foundry' }
+        Mock Get-Command { [pscustomobject]@{ Source = 'mock-pwsh.exe' } } -ParameterFilter { $Name -eq 'pwsh' }
+        Mock Update-PathFromRegistry {}
+        Mock New-Item {}
+        Mock Test-Path { $script:foundryWrapperExists } -ParameterFilter { $LiteralPath -eq $script:foundryWrapperPath }
+        Mock Get-Content {
+            if ($Raw) { $script:foundryWrapperContent } else { ($script:foundryWrapperContent -split '\r?\n')[0] }
+        } -ParameterFilter { $LiteralPath -eq $script:foundryWrapperPath }
+        Mock Set-Content {
+            $script:foundryWrapperContent = $Value
+            $script:foundryWrapperExists = $true
+        } -ParameterFilter { $LiteralPath -eq $script:foundryWrapperPath }
+        Mock Get-ScheduledTask {
+            if ($TaskName) { [pscustomobject]@{ State = 'Running' } } else { $script:foundryExistingTask }
+        }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+        Mock New-ScheduledTaskTrigger { [pscustomobject]@{ UserId = $User; Enabled = $true } }
+        Mock New-ScheduledTaskPrincipal { [pscustomobject]@{ UserId = $UserId } }
+        Mock New-ScheduledTaskSettingsSet { [pscustomobject]@{ Enabled = $true } }
+        Mock Register-ScheduledTask {} -RemoveParameterType @('Action', 'Trigger', 'Principal', 'Settings')
+        Mock Start-ScheduledTask {}
+        Mock Stop-ScheduledTask {}
+        Mock Test-FoundryReady { $true }
+        Mock Start-Sleep {}
+        Mock Start-Process { throw 'The test must not start a real server' }
+        Mock Stop-Process { throw 'The test must not stop processes' }
+        Mock Write-Host {}
+        Mock Write-Warning {}
+    }
+
+    It 'honors exclusion before probing the host or invoking package tools' {
+        Install-FoundryLocal -SkipPackages @('Microsoft.FoundryLocal')
+        Should -Invoke Get-CimInstance -Times 0
+        Should -Invoke Register-ScheduledTask -Times 0
+        $script:foundryCliCalls | Should -BeNullOrEmpty
+    }
+
+    It 'declines unsupported OS and server installations without modifying files' -TestCases @(
+        @{ Build = '22631'; ProductType = 1 }
+        @{ Build = '26100'; ProductType = 3 }
+    ) {
+        param($Build, $ProductType)
+        Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = $Build; ProductType = $ProductType } }
+        Install-FoundryLocal
+        Should -Invoke New-Item -Times 0
+        $script:foundryCliCalls | Should -BeNullOrEmpty
+    }
+
+    It 'installs missing Foundry only for the current user and creates a least-privilege login task' {
+        $script:foundryOnPath = $false
+        Install-FoundryLocal
+        ($script:foundryInstallArguments -join ' ') | Should -Be 'install --id Microsoft.FoundryLocal --exact --source winget --scope user --silent --accept-source-agreements --accept-package-agreements --disable-interactivity'
+        @($script:foundryCliCalls) | Should -Be @('--version', 'server start --help')
+        Should -Invoke New-ScheduledTaskPrincipal -Times 1 -Exactly -ParameterFilter {
+            $UserId -eq $script:foundrySid -and $LogonType -eq 'Interactive' -and $RunLevel -eq 'Limited'
+        }
+        Should -Invoke New-ScheduledTaskTrigger -Times 1 -Exactly -ParameterFilter { $AtLogon -and $User -eq $script:foundrySid }
+        Should -Invoke New-ScheduledTaskSettingsSet -Times 1 -Exactly -ParameterFilter {
+            $MultipleInstances -eq 'IgnoreNew' -and $AllowStartIfOnBatteries -and $DontStopIfGoingOnBatteries -and $ExecutionTimeLimit -eq [timespan]::Zero
+        }
+        Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            $TaskName -eq "altered-carbon-foundry-local-$script:foundrySid" -and
+            $Description -eq 'altered-carbon owned Foundry Local login supervisor v1'
+        }
+        Should -Invoke Start-Process -Times 0
+        Should -Invoke Stop-Process -Times 0
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like '*MANUAL:*No provider, model, or credentials were configured*' }
+    }
+
+    It 'does not replace a wrapper lacking the ownership marker' {
+        $script:foundryWrapperExists = $true
+        $script:foundryWrapperContent = '# somebody else owns this'
+        { Install-FoundryLocal } | Should -Throw '*unowned Foundry wrapper*'
+        Should -Invoke Set-Content -Times 0
+        Should -Invoke Register-ScheduledTask -Times 0
+    }
+
+    It 'does not replace or stop a task lacking its ownership description' {
+        $script:foundryExistingTask = [pscustomobject]@{
+            TaskName = "altered-carbon-foundry-local-$script:foundrySid"; Description = 'Foreign'; State = 'Running'
+        }
+        { Install-FoundryLocal } | Should -Throw '*unowned scheduled task*'
+        Should -Invoke Register-ScheduledTask -Times 0
+        Should -Invoke Stop-ScheduledTask -Times 0
+        Should -Invoke Stop-Process -Times 0
+    }
+
+    It 'reuses matching files and a running task without reinstalling or restarting' {
+        Install-FoundryLocal
+        $script:foundryExistingTask = [pscustomobject]@{
+            TaskName = "altered-carbon-foundry-local-$script:foundrySid"
+            Description = 'altered-carbon owned Foundry Local login supervisor v1'
+            State = 'Running'
+            Actions = @([pscustomobject]@{
+                Execute = 'mock-pwsh.exe'
+                Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$script:foundryWrapperPath`""
+            })
+            Principal = [pscustomobject]@{ UserId = $script:foundrySid; LogonType = 'Interactive'; RunLevel = 'Limited' }
+            Triggers = @([pscustomobject]@{
+                CimClass = [pscustomobject]@{ CimClassName = 'MSFT_TaskLogonTrigger' }; UserId = $script:foundrySid; Enabled = $true
+            })
+            Settings = [pscustomobject]@{
+                Enabled = $true; MultipleInstances = 'IgnoreNew'; DisallowStartIfOnBatteries = $false
+                StopIfGoingOnBatteries = $false; ExecutionTimeLimit = 'PT0S'
+            }
+        }
+        Install-FoundryLocal
+        Should -Invoke Set-Content -Times 1 -Exactly
+        Should -Invoke Register-ScheduledTask -Times 1 -Exactly
+        Should -Invoke Stop-ScheduledTask -Times 0
+        Should -Invoke Start-ScheduledTask -Times 0
+        $script:foundryInstallArguments | Should -BeNullOrEmpty
+
+        $script:foundryWrapperContent += "`n# stale owned wrapper"
+        Install-FoundryLocal
+        Should -Invoke Stop-ScheduledTask -Times 1 -Exactly
+        Should -Invoke Register-ScheduledTask -Times 1 -Exactly
+        Should -Invoke Stop-Process -Times 0
+    }
+
+    It 'rejects unsupported CLI command flags before writing startup configuration' {
+        $script:foundryHelp = '--port'
+        { Install-FoundryLocal } | Should -Throw '*lacks documented server start*'
+        Should -Invoke Set-Content -Times 0
+        Should -Invoke Register-ScheduledTask -Times 0
+    }
+
+    It 'bounds readiness polling and fails without stopping unrelated processes' {
+        Mock Test-FoundryReady { $false }
+        { Install-FoundryLocal } | Should -Throw '*Foundry Local not ready*'
+        Should -Invoke Start-Sleep -Times 30 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        Should -Invoke Stop-Process -Times 0
+    }
+}
+
+Describe 'PSGallery source and trust repair' -Tag 'LocalAI' {
+    BeforeAll {
+        function Register-PSRepository { [CmdletBinding()] param([switch]$Default) }
+        if (-not (Get-Command Get-PSRepository -ErrorAction SilentlyContinue)) {
+            function Get-PSRepository { param($Name) }
+            function Set-PSRepository { param($Name, $InstallationPolicy) }
+            function Find-Module { param($Name, $Repository) }
+            function Save-Module { param($Name, $Repository, $Path, [switch]$Force, [switch]$AcceptLicense) }
+        }
+        $macSource = Get-Content (Join-Path $PSScriptRoot '..' 'altered-carbon-mac.sh') -Raw
+        $moduleCommand = [regex]::Match($macSource, '(?s)module_result="\$\(pwsh -NoProfile -Command "\\\r?\n(?<Program>.*?)" 2>/dev/null\)"')
+        if (-not $moduleCommand.Success) { throw 'Could not isolate the generated macOS pwsh module command.' }
+        $script:macModuleProgram = $moduleCommand.Groups['Program'].Value.Replace('\$', '$').Replace('$mod_name', 'Az')
+    }
+    BeforeEach {
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Register-PSRepository {}
+        Mock Set-PSRepository {}
+        Mock Get-Module { @() }
+        Mock Find-Module { [pscustomobject]@{ Version = [version]'2.0' } }
+        Mock Save-Module {}
+        Mock Install-Module {}
+    }
+
+    It 'registers the default gallery only when missing without changing trust' {
+        Mock Get-PSRepository { $null }
+        Set-PSGalleryTrust
+        Should -Invoke Register-PSRepository -Times 1 -Exactly -ParameterFilter { $Default }
+        Should -Invoke Set-PSRepository -Times 0
+    }
+
+    It 'preserves an existing gallery source and installation policy' {
+        Mock Get-PSRepository { [pscustomobject]@{ Name = 'PSGallery'; InstallationPolicy = 'Untrusted'; SourceLocation = 'https://example.invalid/gallery' } }
+        Set-PSGalleryTrust
+        Should -Invoke Register-PSRepository -Times 0
+        Should -Invoke Set-PSRepository -Times 0
+    }
+
+    It 'saves outdated modules from PSGallery explicitly rather than an ambient default source' {
+        Mock Get-PSRepository {
+            @(
+                [pscustomobject]@{ Name = 'Corporate'; InstallationPolicy = 'Trusted' }
+                [pscustomobject]@{ Name = 'PSGallery'; InstallationPolicy = 'Untrusted' }
+            )
+        }
+        Mock Find-Module {
+            if ($Repository -ne 'PSGallery') { throw 'Ambiguous repositories: Corporate, PSGallery' }
+            [pscustomobject]@{ Version = [version]'2.0' }
+        }
+        Install-PSModules -ModuleDir 'mock-module-directory'
+        Should -Invoke Save-Module -Times 7 -Exactly -ParameterFilter {
+            $Repository -eq 'PSGallery' -and $Path -eq 'mock-module-directory' -and $Force -and $AcceptLicense
+        }
+        Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'PSGallery' }
+        Should -Invoke Save-Module -Times 0 -ParameterFilter { $Name -eq 'ActiveDirectory' }
+    }
+
+    It 'leaves current modules untouched and reports genuine gallery failures' {
+        Mock Get-Module { [pscustomobject]@{ Version = [version]'2.0' } }
+        Install-PSModules -ModuleDir 'mock-module-directory'
+        Should -Invoke Save-Module -Times 0
+        Mock Find-Module { throw 'TLS connection failed' }
+        Install-PSModules -ModuleDir 'mock-module-directory'
+        Should -Invoke Write-Warning -Times 7 -Exactly -ParameterFilter { $Message -like '*TLS connection failed*' }
+        Should -Invoke Save-Module -Times 0
+        Should -Invoke Set-PSRepository -Times 0
+    }
+
+    It 'does not replace a newer installed module with an older gallery version' {
+        Mock Get-Module { @([pscustomobject]@{ Version = [version]'1.0' }; [pscustomobject]@{ Version = [version]'3.0' }) }
+        Install-PSModules -ModuleDir 'mock-module-directory'
+        Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'PSGallery' }
+        Should -Invoke Save-Module -Times 0
+    }
+
+    It 'executes the bash-generated pwsh command against PSGallery with multiple repositories configured' {
+        Mock Get-PSRepository {
+            @([pscustomobject]@{ Name = 'Corporate' }; [pscustomobject]@{ Name = 'PSGallery' })
+        }
+        Mock Find-Module {
+            if ($Repository -ne 'PSGallery') { throw 'Ambiguous repositories: Corporate, PSGallery' }
+            [pscustomobject]@{ Version = [version]'2.0' }
+        }
+        & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'updated'
+        Should -Invoke Find-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Az' -and $Repository -eq 'PSGallery' }
+        Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'Az' -and $Repository -eq 'PSGallery' -and $Scope -eq 'CurrentUser' -and $Force -and $AllowClobber -and $AcceptLicense
+        }
+        Mock Get-Module { @([pscustomobject]@{ Version = [version]'1.0' }; [pscustomobject]@{ Version = [version]'3.0' }) }
+        & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'current'
+        Should -Invoke Install-Module -Times 1 -Exactly
+    }
+}
+
+Describe 'Foundry Local emitted Windows artifacts' -Tag 'LocalAI' {
+    BeforeAll {
+        function Invoke-TestFoundry {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Arguments)
+            $global:LASTEXITCODE = 0
+            if ($Arguments -contains '--help') { '--port --idle-timeout' } else { '1.0' }
+        }
+        function winget {
+            param([Parameter(ValueFromRemainingArguments = $true)][object[]] $Arguments)
+            $script:foundryInstallArguments = $Arguments
+            $script:foundryAvailable = $true
+            $global:LASTEXITCODE = 0
+        }
+        function Get-TestFoundryListeners { @() }
+        $script:originalFoundryLocalAppData = $env:LOCALAPPDATA
+    }
+
+    BeforeEach {
+        $env:LOCALAPPDATA = Join-Path $TestDrive "user's local data & apps"
+        $script:foundryAvailable = $true
+        $script:foundryInstallArguments = @()
+        $script:foundryTask = $null
+        Mock Write-Host {}
+        Mock Write-Warning {}
+        Mock Start-Sleep {}
+        Mock Update-PathFromRegistry {}
+        Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+        Mock Get-Command {
+            if ($script:foundryAvailable) { [pscustomobject]@{ Source = 'Invoke-TestFoundry' } }
+        } -ParameterFilter { $Name -eq 'foundry' }
+        Mock Get-ScheduledTask {
+            if ($TaskName) { [pscustomobject]@{ State = 'Running' } } else { $script:foundryTask }
+        }
+        Mock New-ScheduledTaskAction { [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+        Mock New-ScheduledTaskTrigger {
+            [pscustomobject]@{ UserId = $User; Enabled = $true; CimClass = @{ CimClassName = 'MSFT_TaskLogonTrigger' } }
+        }
+        Mock New-ScheduledTaskPrincipal { [pscustomobject]@{ UserId = $UserId; LogonType = $LogonType; RunLevel = $RunLevel } }
+        Mock New-ScheduledTaskSettingsSet {
+            [pscustomobject]@{
+                Enabled = $true; MultipleInstances = $MultipleInstances; DisallowStartIfOnBatteries = $false
+                StopIfGoingOnBatteries = $false; ExecutionTimeLimit = 'PT0S'
+            }
+        }
+        Mock Register-ScheduledTask {
+            $script:foundryTask = [pscustomobject]@{
+                TaskName = $TaskName; Description = $Description; Actions = @($Action); Triggers = @($Trigger)
+                Principal = $Principal; Settings = $Settings; State = 'Running'
+            }
+        }
+        Mock Start-ScheduledTask {}
+        Mock Stop-ScheduledTask {}
+        Mock Test-FoundryReady { $true }
+    }
+
+    AfterEach { $env:LOCALAPPDATA = $script:originalFoundryLocalAppData }
+
+    It 'emits a parseable wrapper and quoted task action for paths with spaces and apostrophes' {
+        Install-FoundryLocal
+        $arguments = $script:foundryTask.Actions[0].Arguments
+        $argumentMatch = [regex]::Match($arguments, '\-File "([^"]+)"$')
+        $argumentMatch.Success | Should -BeTrue
+        $wrapperPath = $argumentMatch.Groups[1].Value
+        $wrapperPath | Should -Be (Join-Path $env:LOCALAPPDATA 'altered-carbon\foundry-local\start-foundry.ps1')
+        $wrapperErrors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($wrapperPath, [ref]$null, [ref]$wrapperErrors)
+        $wrapperErrors | Should -BeNullOrEmpty
+    }
+
+    It 'runs the emitted supervisor safely for <Scenario>' -ForEach @(
+        @{ Scenario = 'already healthy'; Healthy = $true; Occupied = $false; ReadyAfterStart = $true }
+        @{ Scenario = 'new healthy server'; Healthy = $false; Occupied = $false; ReadyAfterStart = $true }
+        @{ Scenario = 'foreign port conflict'; Healthy = $false; Occupied = $true; ReadyAfterStart = $false }
+        @{ Scenario = 'readiness failure'; Healthy = $false; Occupied = $false; ReadyAfterStart = $false }
+    ) {
+        Install-FoundryLocal
+        $wrapperPath = Join-Path $env:LOCALAPPDATA 'altered-carbon\foundry-local\start-foundry.ps1'
+        $wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile($wrapperPath, [ref]$null, [ref]$null)
+        $loop = $wrapperAst.Find({ param($node) $node -is [System.Management.Automation.Language.WhileStatementAst] }, $true)
+        $body = $loop.Body.Statements[0].Extent.Text
+        # Substitute only the static OS listener probe; run the actual emitted startup branch.
+        $body = $body.Replace('[Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()', '(Get-TestFoundryListeners)')
+        $script:foundryProbeCount = 0
+        Mock Test-FoundryReady {
+            $script:foundryProbeCount++
+            if ($script:foundryProbeCount -eq 1) { $Healthy } else { $ReadyAfterStart }
+        }
+        Mock Get-TestFoundryListeners { if ($Occupied) { [pscustomobject]@{ Port = 39839 } } }
+        Mock Start-Process {
+            $process = [pscustomobject]@{ ExitCode = 0; Id = 12345 }
+            $process | Add-Member ScriptMethod WaitForExit { param($Milliseconds) return $true } -PassThru
+        }
+        Mock Stop-Process {}
+        $directory = Split-Path -Parent $wrapperPath
+        if ($Occupied -or -not $ReadyAfterStart) {
+            { & ([scriptblock]::Create($body)) } | Should -Throw
+            Should -Invoke Write-Host -Times 0 -ParameterFilter { $Object -like '*Foundry Local ready at*' }
+        } else {
+            & ([scriptblock]::Create($body))
+        }
+        Should -Invoke Start-Process -Times $(if ($Healthy -or $Occupied) { 0 } else { 1 }) -Exactly
+        if (-not $Healthy -and -not $Occupied) {
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+                $FilePath -eq 'Invoke-TestFoundry' -and
+                ($ArgumentList -join ' ') -eq 'server start --port 39839 --idle-timeout 0' -and
+                $RedirectStandardOutput -eq (Join-Path $directory 'server-start.log') -and
+                $RedirectStandardError -eq (Join-Path $directory 'server-start-error.log')
+            }
+        }
+        Should -Invoke Stop-Process -Times 0
     }
 }
 
