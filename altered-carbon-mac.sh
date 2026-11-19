@@ -282,6 +282,156 @@ install_agency() {
     fi
 }
 
+install_foundry_local() {
+    if is_skipped foundrylocal || is_skipped microsoft/foundrylocal/foundrylocal; then
+        skip "Foundry Local install/autostart (--skip foundrylocal)."
+        return 0
+    fi
+    local major python foundry directory plist label domain generated loaded help_text
+    if [[ "$(uname -m)" != arm64 ]]; then
+        skip "Foundry Local requires native Apple Silicon (Intel/Rosetta unsupported)."
+        return 0
+    fi
+    major="$(sw_vers -productVersion)"
+    major="${major%%.*}"
+    if [[ "$major" -lt 15 ]]; then
+        skip "Foundry Local requires macOS 15+."
+        return 0
+    fi
+    python="$(command -v python3)" || { fail "Foundry Local login supervisor requires python3 from the Xcode command line tools."; return 1; }
+    if ! command -v foundry &>/dev/null; then
+        brew tap microsoft/foundrylocal || { fail "Could not tap the official Foundry Local repository."; return 1; }
+        brew install microsoft/foundrylocal/foundrylocal || { fail "Foundry Local installation failed."; return 1; }
+    fi
+    foundry="$(command -v foundry)" || { fail "Foundry Local installed but foundry is not on PATH."; return 1; }
+    "$foundry" --version || { fail "Foundry Local version verification failed."; return 1; }
+    help_text="$("$foundry" server start --help 2>&1)" || { fail "Upgrade Foundry Local: documented server commands are unavailable; existing servers were not stopped."; return 1; }
+    if ! grep -q -- '--port' <<< "$help_text" || ! grep -q -- '--idle-timeout' <<< "$help_text"; then
+        fail "Upgrade Foundry Local to support server start --port and --idle-timeout; no existing server was stopped."
+        return 1
+    fi
+    directory="${XDG_CONFIG_HOME:-$HOME/.config}/altered-carbon/foundry-local"
+    label="io.altered-carbon.foundry-local"
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    domain="gui/$(id -u)"
+    generated="$("$python" - "$directory" "$foundry" "$python" "$plist" "$label" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+directory, foundry, python, plist_path, label = sys.argv[1:]
+root = pathlib.Path(directory)
+wrapper = root / "start-foundry.py"
+plist = pathlib.Path(plist_path)
+owner = "altered-carbon: Foundry Local login supervisor v1"
+runtime = r'''# altered-carbon: Foundry Local login supervisor v1
+import datetime
+import json
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def ready():
+    try:
+        with OPENER.open("http://127.0.0.1:39839/openai/status", timeout=2) as response:
+            status = json.load(response)
+        from urllib.parse import urlparse
+        return bool(status.get("ModelDirPath") and status.get("PipeName") and any(
+            urlparse(endpoint).hostname in ("127.0.0.1", "localhost", "::1")
+            and urlparse(endpoint).port == 39839 for endpoint in status.get("Endpoints", [])))
+    except Exception:
+        return False
+
+if sys.argv[1:] == ["--check"]:
+    sys.exit(0 if ready() else 1)
+
+def occupied():
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, 39839), timeout=1):
+                return True
+        except OSError:
+            pass
+    return False
+
+try:
+    while True:
+        if not ready():
+            if occupied():
+                raise RuntimeError("Port 39839 is occupied but not a healthy Foundry Local endpoint. Resolve the conflict manually; nothing was stopped.")
+            with (ROOT / "server-start.log").open("a") as log:
+                subprocess.run([sys.argv[1], "server", "start", "--port", "39839", "--idle-timeout", "0"],
+                               stdout=log, stderr=subprocess.STDOUT, timeout=45, check=True)
+            for attempt in range(20):
+                if ready():
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError("Readiness timed out. An existing daemon on another port is left untouched; inspect foundry server status.")
+            print(f"{datetime.datetime.now().isoformat()} Foundry Local ready at http://127.0.0.1:39839/v1 (no model downloaded).", flush=True)
+        time.sleep(30)
+except Exception as error:
+    print(f"{datetime.datetime.now().isoformat()} ERROR: {error}", file=sys.stderr, flush=True)
+    sys.exit(1)
+'''
+if wrapper.exists() and wrapper.read_text().splitlines()[0:1] != ["# " + owner]:
+    raise SystemExit(f"Refusing to overwrite an unowned wrapper: {wrapper}")
+if plist.exists() and plistlib.loads(plist.read_bytes()).get("Comment") != owner:
+    raise SystemExit(f"Refusing to overwrite an unowned LaunchAgent: {plist}")
+configuration = {
+    "Label": label, "Comment": owner,
+    "ProgramArguments": [python, str(wrapper), foundry],
+    "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 60,
+    "StandardOutPath": str(root / "startup.log"),
+    "StandardErrorPath": str(root / "startup-error.log"),
+}
+root.mkdir(parents=True, exist_ok=True)
+plist.parent.mkdir(parents=True, exist_ok=True)
+changed = False
+for path, content in ((wrapper, runtime.encode()), (plist, plistlib.dumps(configuration))):
+    if not path.exists() or path.read_bytes() != content:
+        path.write_bytes(content)
+        changed = True
+print("changed" if changed else "current")
+PY
+)" || { fail "Could not create the owned Foundry Local login supervisor."; return 1; }
+    loaded="$(launchctl print "$domain/$label" 2>/dev/null)" || loaded=""
+    if [[ -n "$loaded" ]]; then
+        if ! grep -Fq -- "$directory/start-foundry.py" <<< "$loaded"; then
+            fail "LaunchAgent label $label is already used by another job; nothing was unloaded."
+            return 1
+        fi
+        if [[ "$generated" == changed ]]; then
+            launchctl bootout "$domain/$label" || { fail "Could not reload the owned Foundry supervisor."; return 1; }
+            loaded=""
+        fi
+    fi
+    launchctl enable "$domain/$label" || { fail "Could not enable Foundry Local at login."; return 1; }
+    if [[ -z "$loaded" ]]; then
+        launchctl bootstrap "$domain" "$plist" || { fail "Could not load Foundry LaunchAgent in this logged-in GUI session."; return 1; }
+    fi
+    local attempt
+    for ((attempt=0; attempt<30; attempt++)); do
+        if "$python" "$directory/start-foundry.py" --check; then
+            loaded="$(launchctl print "$domain/$label" 2>/dev/null)"
+            if grep -Eq 'pid = [0-9]+' <<< "$loaded"; then
+                ok "Foundry endpoint ready: http://127.0.0.1:39839/v1; login LaunchAgent $label (not a pre-login service). Logs: $directory"
+                info "MANUAL: GitHub Copilot desktop > Settings > Model providers > Add provider > Foundry Local; endpoint http://127.0.0.1:39839/v1. Explicitly choose/download a model and use its actual discovered ID. No provider, model, or credentials were configured."
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    fail "Foundry Local readiness timed out; inspect $directory/startup-error.log and server-start.log. No unrelated process/server was stopped."
+    return 1
+}
+
 ensure_vscode_ext() {
     local editor="$1"
     local ext_id="$2"
@@ -371,6 +521,8 @@ ensure_formula oh-my-posh "oh-my-posh"
 ensure_formula mas "Mac App Store CLI"
 ensure_formula azure-cli "Azure CLI"
 ensure_formula podman "Podman"
+install_foundry_local || exit 1
+skip "CUDA Toolkit: modern macOS is unsupported by NVIDIA; no CUDA toolkit or driver will be installed."
 
 # git-lfs setup (idempotent)
 if command -v git-lfs &>/dev/null; then

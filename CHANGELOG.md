@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-19
+
+### Added
+- Microsoft Foundry Local through official user-scope WinGet installation in Windows Phase 2 and the Microsoft Homebrew tap on native Apple Silicon/macOS 15+. Supported installs get project-owned login autostart, fixed-port readiness checks, foreground supervision, and diagnostic logs without automatic model downloads.
+- Targeted manual GitHub Copilot desktop Foundry Local provider instructions; app settings, credentials, and model selection remain user-controlled.
+- Conditional Windows x64 NVIDIA CUDA Toolkit installation based on healthy hardware, known compute capability, OS, and existing driver: CUDA 13.5 for supported modern GPUs or toolkit-only CUDA 12.9 for supported legacy GPUs, with no display-driver replacement or destructive toolkit downgrade. Modern macOS explicitly skips CUDA.
+
+### Fixed
+- Windows `Save-Module` now explicitly selects PSGallery, matching every Gallery lookup/install on both platforms, while retaining the intended module directory and preserving repository settings/trust.
+
 ## [1.4.0] - 2026-11-19
 
 ### Added
