@@ -1144,13 +1144,145 @@ Describe 'Foundry Local owned login supervisor' -Tag 'LocalAI' {
     }
 }
 
+Describe 'Azure Artifacts Credential Provider help probe' {
+    BeforeAll {
+        $originalProviderHelpExitCode = $global:LASTEXITCODE
+        function Invoke-ProviderHelpFixture {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+            $script:providerHelpArguments = $Arguments
+            $global:LASTEXITCODE = $script:providerHelpExit
+            'fixture help output'
+        }
+        function dotnet {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+            Invoke-ProviderHelpFixture @Arguments
+        }
+    }
+    AfterAll {
+        $global:LASTEXITCODE = $originalProviderHelpExitCode
+    }
+
+    It 'checks only help through <Path> and treats exit <ExitCode> as usable=<Expected>' -TestCases @(
+        @{ Path = 'Invoke-ProviderHelpFixture'; ExitCode = 0; Expected = $true }
+        @{ Path = 'Invoke-ProviderHelpFixture'; ExitCode = 2; Expected = $false }
+        @{ Path = 'fixture.dll'; ExitCode = 0; Expected = $true }
+        @{ Path = 'fixture.dll'; ExitCode = 2; Expected = $false }
+    ) {
+        param($Path, $ExitCode, $Expected)
+        $script:providerHelpExit = $ExitCode
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -in @('Invoke-ProviderHelpFixture', 'fixture.dll') }
+        $result = @(Test-AzArtifactsCredentialProvider -Path $Path)
+        $result.Count | Should -Be 1
+        $result[0] | Should -Be $Expected
+        $script:providerHelpArguments[-1] | Should -BeExactly '-h'
+        $script:providerHelpArguments | Should -Not -Contain '-Uri'
+    }
+}
+
+Describe 'Azure Artifacts Credential Provider installation' {
+    BeforeAll {
+        $originalProviderUserProfile = $env:USERPROFILE
+    }
+    BeforeEach {
+        $providerSandbox = Join-Path $PSScriptRoot ".sandbox\credprovider-$([guid]::NewGuid())"
+        $env:USERPROFILE = Join-Path $providerSandbox 'user'
+        $providerRoot = Join-Path $env:USERPROFILE '.nuget\plugins\netcore'
+        $providerDestination = Join-Path $providerRoot 'CredentialProvider.Microsoft'
+        $providerApphost = Join-Path $providerDestination 'CredentialProvider.Microsoft.exe'
+        $script:providerFixtureFiles = @('CredentialProvider.Microsoft.exe', 'CredentialProvider.Microsoft.dll',
+            'CredentialProvider.Microsoft.deps.json', 'CredentialProvider.Microsoft.runtimeconfig.json', 'hostfxr.dll', 'coreclr.dll')
+        $null = New-Item -Path $providerRoot -ItemType Directory -Force
+        Mock Get-AzArtifactsCredentialProviderPath { $providerApphost }
+        Mock Test-AzArtifactsCredentialProvider { Test-Path -LiteralPath $Path -PathType Leaf }
+        Mock Invoke-WebRequest { Set-Content -LiteralPath $OutFile -Value 'fictional archive' }
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'f7d3cef19621fb3a87e4b38f5fbaba429917a4ca6881422764a474667dd0c038' } }
+        Mock Expand-Archive {
+            $provider = Join-Path $DestinationPath 'plugins\netcore\CredentialProvider.Microsoft'
+            $null = New-Item -Path $provider -ItemType Directory -Force
+            foreach ($file in $script:providerFixtureFiles) { Set-Content -LiteralPath (Join-Path $provider $file) -Value 'fixture' }
+        }
+    }
+    AfterEach {
+        $env:USERPROFILE = $originalProviderUserProfile
+        Remove-Item -LiteralPath $providerSandbox -Recurse -Force
+    }
+
+    It 'reuses a usable <Location> provider without downloading or replacing it' -TestCases @(
+        @{ Location = 'default' }
+        @{ Location = 'configured' }
+    ) {
+        param($Location)
+        if ($Location -eq 'configured') {
+            $providerApphost = Join-Path $providerSandbox 'external\CredentialProvider.Microsoft.exe'
+        }
+        $null = New-Item -Path (Split-Path $providerApphost -Parent) -ItemType Directory -Force
+        Set-Content -LiteralPath $providerApphost -Value 'existing provider'
+        Install-AzArtifactsCredentialProvider
+        Get-Content -LiteralPath $providerApphost | Should -Be 'existing provider'
+        Should -Invoke Invoke-WebRequest -Times 0
+        Should -Invoke Expand-Archive -Times 0
+    }
+
+    It 'installs the verified self-contained <Architecture> asset per-user and cleans its exact stage' -TestCases @(
+        @{ Architecture = 'X64'; Rid = 'win-x64'; Digest = 'f7d3cef19621fb3a87e4b38f5fbaba429917a4ca6881422764a474667dd0c038' }
+        @{ Architecture = 'Arm64'; Rid = 'win-arm64'; Digest = '9aff3b5064ca47e37ddcabd95a85c87c92f1753f62014a7250045acc3943ef0a' }
+    ) {
+        param($Architecture, $Rid, $Digest)
+        Mock Get-FileHash { [pscustomobject]@{ Hash = $Digest } }
+        $otherPlugin = Join-Path $providerRoot 'Contoso.Plugin'
+        $null = New-Item -Path $otherPlugin -ItemType Directory
+        Set-Content -LiteralPath (Join-Path $otherPlugin 'keep') -Value 'untouched'
+        Install-AzArtifactsCredentialProvider -Architecture $Architecture
+        Test-Path -LiteralPath $providerApphost -PathType Leaf | Should -BeTrue
+        Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+            $Uri -eq "https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$Rid.NuGet.CredentialProvider.zip" -and
+            $OutFile.StartsWith($providerRoot)
+        }
+        Should -Invoke Get-FileHash -Times 1 -Exactly -ParameterFilter { $Algorithm -eq 'SHA256' }
+        Should -Invoke Test-AzArtifactsCredentialProvider -Times 1 -ParameterFilter { $Path -like '*extracted*CredentialProvider.Microsoft.exe' }
+        @(Get-ChildItem -LiteralPath $providerRoot -Filter '.altered-carbon-*').Count | Should -Be 0
+        Get-Content -LiteralPath (Join-Path $otherPlugin 'keep') | Should -Be 'untouched'
+    }
+
+    It 'preserves an existing incomplete provider without downloading or deleting it' {
+        $null = New-Item -Path $providerDestination -ItemType Directory
+        Set-Content -LiteralPath (Join-Path $providerDestination 'keep') -Value 'existing partial installation'
+        { Install-AzArtifactsCredentialProvider } | Should -Throw '*preserved*'
+        Get-Content -LiteralPath (Join-Path $providerDestination 'keep') | Should -Be 'existing partial installation'
+        Should -Invoke Invoke-WebRequest -Times 0
+    }
+
+    It 'fails closed for <Failure> without publishing a partial provider or leaving its stage' -TestCases @(
+        @{ Failure = 'download' }
+        @{ Failure = 'checksum' }
+        @{ Failure = 'extraction' }
+        @{ Failure = 'incomplete archive' }
+        @{ Failure = 'unusable apphost' }
+    ) {
+        param($Failure)
+        switch ($Failure) {
+            'download' { Mock Invoke-WebRequest { throw 'Download failed' } }
+            'checksum' { Mock Get-FileHash { [pscustomobject]@{ Hash = 'mismatch' } } }
+            'extraction' { Mock Expand-Archive { throw 'Extraction failed' } }
+            'incomplete archive' { $script:providerFixtureFiles = @('CredentialProvider.Microsoft.exe') }
+            'unusable apphost' { Mock Test-AzArtifactsCredentialProvider { $false } }
+        }
+        { Install-AzArtifactsCredentialProvider -Architecture X64 } | Should -Throw
+        Test-Path -LiteralPath $providerDestination | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $providerRoot -Filter '.altered-carbon-*').Count | Should -Be 0
+    }
+}
+
 Describe 'Module repository configuration' -Tag 'LocalAI' {
     BeforeAll {
         function Register-PSRepository { [CmdletBinding()] param($Name, $SourceLocation, $InstallationPolicy, [switch]$Default) }
         function Get-PSResourceRepository { [CmdletBinding()] param($Name) }
-        function Register-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority) }
-        function Set-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority) }
+        function Register-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority, $CredentialProvider) }
+        function Set-PSResourceRepository { [CmdletBinding()] param($Name, $Uri, [switch]$Trusted, $Priority, $CredentialProvider) }
         function Unregister-PSResourceRepository { [CmdletBinding()] param($Name) }
+        function Find-PSResource { [CmdletBinding()] param($Name, $Repository) }
+        function Save-PSResource { [CmdletBinding()] param($Name, $Repository, $Path, [switch]$AcceptLicense) }
+        function Install-PSResource { [CmdletBinding()] param($Name, $Repository, $Scope, [switch]$AcceptLicense) }
         if (-not (Get-Command Get-PSRepository -ErrorAction SilentlyContinue)) {
             function Get-PSRepository { param($Name) }
             function Set-PSRepository { param($Name, $InstallationPolicy) }
@@ -1185,7 +1317,11 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
         Mock Find-Module { [pscustomobject]@{ Version = [version]'2.0' } }
         Mock Save-Module {}
         Mock Install-Module {}
+        Mock Find-PSResource { throw 'Module discovery must remain on PowerShellGet.' }
+        Mock Save-PSResource { throw 'Module saves must remain on PowerShellGet.' }
+        Mock Install-PSResource { throw 'Module installation must remain on PowerShellGet.' }
         $env:ALTERED_CARBON_MODULE_REPOSITORY = 'PSGallery'
+        $env:ALTERED_CARBON_MODULE_MODE = 'personal'
     }
 
     It 'registers the default gallery only when missing without changing trust' {
@@ -1258,10 +1394,17 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
     }
 
     It 'configures Phase 2 before module discovery and registers PSGallery only in Personal mode' {
-        $stage = [regex]::Match($scriptContent, '(?ms)^    \$psRepository = Initialize-PSModuleRepository.*?^    Install-PSModules -ModuleDir \$psModuleDir -Repository \$psRepository\r?$')
+        $stage = [regex]::Match($scriptContent, '(?ms)^    if \(\$Work.IsPresent\) \{\r?\n        Install-AzArtifactsCredentialProvider.*?^    Install-PSModules -ModuleDir \$psModuleDir -Repository \$psRepository\r?$')
         $stage.Success | Should -BeTrue
         $phase2Modules = [scriptblock]::Create($stage.Value)
-        Mock Initialize-PSModuleRepository { if ($Work) { 'azure-powershell' } else { 'PSGallery' } }
+        $script:providerPrepared = $false
+        Mock Install-AzArtifactsCredentialProvider { $script:providerPrepared = $true }
+        Mock Initialize-PSModuleRepository {
+            if ($Work) {
+                if (-not $script:providerPrepared) { throw 'Provider must be ready before repository setup' }
+                'azure-powershell'
+            } else { 'PSGallery' }
+        }
         Mock Set-PSGalleryTrust {}
         Mock Install-PSModules {}
         $psModuleDir = 'mock-module-directory'
@@ -1269,14 +1412,21 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
         $Personal = [switch]$false
         & $phase2Modules
         Should -Invoke Set-PSGalleryTrust -Times 0
+        Should -Invoke Install-AzArtifactsCredentialProvider -Times 1 -Exactly
         Should -Invoke Install-PSModules -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
         $Work = [switch]$false
         $Personal = [switch]$true
         & $phase2Modules
+        Should -Invoke Install-AzArtifactsCredentialProvider -Times 1 -Exactly
         Should -Invoke Set-PSGalleryTrust -Times 1 -Exactly
         Should -Invoke Install-PSModules -Times 1 -Exactly -ParameterFilter { $Repository -eq 'PSGallery' }
         Mock Initialize-PSModuleRepository { throw 'Repository configuration failed' }
         { & $phase2Modules } | Should -Throw '*Repository configuration failed*'
+        Should -Invoke Install-PSModules -Times 2 -Exactly
+        $Work = [switch]$true
+        $Personal = [switch]$false
+        Mock Install-AzArtifactsCredentialProvider { throw 'Provider installation failed' }
+        { & $phase2Modules } | Should -Throw '*Provider installation failed*'
         Should -Invoke Install-PSModules -Times 2 -Exactly
     }
 
@@ -1305,29 +1455,32 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
                 $script:testRepositories += [pscustomobject]@{ Name = $Name; SourceLocation = $SourceLocation; InstallationPolicy = 'Untrusted' }
             }
             Mock Register-PSResourceRepository {
-                $script:testResourceRepositories += [pscustomobject]@{ Name = $Name; Uri = $Uri; Trusted = $false; Priority = 37 }
+                $script:testResourceRepositories += [pscustomobject]@{ Name = $Name; Uri = $Uri; Trusted = $false; Priority = 37; CredentialProvider = $CredentialProvider }
             }
         }
 
-        It 'registers missing Work sources once and passes the selected name to module operations' {
+        It 'registers missing Work sources once and retains selected-repository PowerShellGet module operations' {
             $repository = Invoke-RepositorySetup
             $repository | Should -BeExactly 'azure-powershell'
             Invoke-RepositorySetup | Should -BeExactly $repository
             if ($Platform -eq 'Windows') {
                 Install-PSModules -ModuleDir 'mock-module-directory' -Repository $repository
                 Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
-                Should -Invoke Save-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' -and $Path -eq 'mock-module-directory' }
+                Should -Invoke Save-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' -and $Path -eq 'mock-module-directory' -and $Force -and $AcceptLicense }
             } else {
                 $env:ALTERED_CARBON_MODULE_REPOSITORY = $repository
                 & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'updated'
                 Should -Invoke Find-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
-                Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+                Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' -and $Scope -eq 'CurrentUser' -and $Force -and $AllowClobber -and $AcceptLicense }
             }
+            Should -Invoke Find-PSResource -Times 0
+            Should -Invoke Save-PSResource -Times 0
+            Should -Invoke Install-PSResource -Times 0
             Should -Invoke Register-PSRepository -Times 1 -Exactly -ParameterFilter {
                 $Name -eq 'azure-powershell' -and $SourceLocation -eq 'https://packagefeedproxy.microsoft.io/powershell/v2' -and -not $InstallationPolicy -and -not $Default
             }
             Should -Invoke Register-PSResourceRepository -Times 1 -Exactly -ParameterFilter {
-                $Name -eq 'azure-powershell' -and $Uri -eq 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json' -and -not $Trusted -and -not $Priority
+                $Name -eq 'azure-powershell' -and $Uri -eq 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json' -and $CredentialProvider -eq 'AzArtifacts' -and -not $Trusted -and -not $Priority
             }
             Should -Invoke Set-PSRepository -Times 0
             Should -Invoke Set-PSResourceRepository -Times 0
@@ -1344,7 +1497,7 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
                 Name = 'PSGallery'; SourceLocation = 'https://modules.example.test/gallery'; InstallationPolicy = 'Untrusted'
             })
             $script:testResourceRepositories = @([pscustomobject]@{
-                Name = 'azure-powershell'; Uri = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'; Trusted = $false; Priority = 37
+                Name = 'azure-powershell'; Uri = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'; Trusted = $false; Priority = 37; CredentialProvider = 1
             }; [pscustomobject]@{
                 Name = 'PSGallery'; Uri = 'https://modules.example.test/gallery'; Trusted = $false; Priority = 42
             })
@@ -1360,6 +1513,80 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
             $script:testResourceRepositories[0].Trusted | Should -BeFalse
             $script:testResourceRepositories[0].Priority | Should -Be 37
             $script:testResourceRepositories[1].Priority | Should -Be 42
+        }
+
+        It 'enables a missing or None provider without changing existing URI trust or priority' -TestCases @(
+            @{ ExistingProvider = $null }
+            @{ ExistingProvider = 'None' }
+        ) {
+            param($ExistingProvider)
+            $script:testResourceRepositories = @([pscustomobject]@{
+                Name = 'azure-powershell'; Uri = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'
+                Trusted = $false; Priority = 37; CredentialProvider = $ExistingProvider
+            })
+            Invoke-RepositorySetup | Should -Be 'azure-powershell'
+            Should -Invoke Set-PSResourceRepository -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'azure-powershell' -and $CredentialProvider -eq 'AzArtifacts' -and
+                -not $PSBoundParameters.ContainsKey('Uri') -and -not $PSBoundParameters.ContainsKey('Trusted') -and -not $PSBoundParameters.ContainsKey('Priority')
+            }
+            $script:testResourceRepositories[0].Uri | Should -Be 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'
+            $script:testResourceRepositories[0].Trusted | Should -BeFalse
+            $script:testResourceRepositories[0].Priority | Should -Be 37
+        }
+
+        It 'preserves an unrecognized existing credential provider rather than replacing it' {
+            $script:testResourceRepositories = @([pscustomobject]@{
+                Name = 'azure-powershell'; Uri = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'
+                Trusted = $false; Priority = 37; CredentialProvider = 'Contoso.Provider'
+            })
+            { Invoke-RepositorySetup } | Should -Throw '*unsupported*preserved*'
+            Should -Invoke Set-PSResourceRepository -Times 0
+            Should -Invoke Register-PSRepository -Times 0
+            Should -Invoke Register-PSResourceRepository -Times 0
+        }
+
+        It 'leaves a newer installed Work module untouched' {
+            Mock Get-Module { [pscustomobject]@{ Version = [version]'3.0' } }
+            if ($Platform -eq 'Windows') {
+                Install-PSModules -ModuleDir 'mock-module-directory' -Repository 'azure-powershell'
+                Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+            } else {
+                $env:ALTERED_CARBON_MODULE_REPOSITORY = 'azure-powershell'
+                $env:ALTERED_CARBON_MODULE_MODE = 'work'
+                & ([scriptblock]::Create($script:macModuleProgram)) | Should -Be 'current'
+                Should -Invoke Find-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+            }
+            Should -Invoke Save-Module -Times 0
+            Should -Invoke Install-Module -Times 0
+            Should -Invoke Find-PSResource -Times 0
+            Should -Invoke Save-PSResource -Times 0
+            Should -Invoke Install-PSResource -Times 0
+        }
+
+        It 'retains per-module handling of Work PowerShellGet <Failure> failures without changing engines' -TestCases @(
+            @{ Failure = 'lookup' }
+            @{ Failure = 'download' }
+        ) {
+            param($Failure)
+            switch ($Failure) {
+                'lookup' { Mock Find-Module { throw 'Module lookup failed' } }
+                'download' {
+                    Mock Save-Module { throw 'Module download failed' }
+                    Mock Install-Module { throw 'Module download failed' }
+                }
+            }
+            if ($Platform -eq 'Windows') {
+                { Install-PSModules -ModuleDir 'mock-module-directory' -Repository 'azure-powershell' } | Should -Not -Throw
+                Should -Invoke Write-Warning -Times 7 -Exactly -ParameterFilter { $Message -like '*Failed to install or update*failed*' }
+                Should -Invoke Find-Module -Times 7 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+            } else {
+                $env:ALTERED_CARBON_MODULE_REPOSITORY = 'azure-powershell'
+                { & ([scriptblock]::Create($script:macModuleProgram)) } | Should -Throw '*failed*'
+                Should -Invoke Find-Module -Times 1 -Exactly -ParameterFilter { $Repository -eq 'azure-powershell' }
+            }
+            Should -Invoke Find-PSResource -Times 0
+            Should -Invoke Save-PSResource -Times 0
+            Should -Invoke Install-PSResource -Times 0
         }
 
         It 'rejects conflicting <Api> registration before any registration or module operation' -TestCases @(
@@ -1397,7 +1624,7 @@ Describe 'Module repository configuration' -Tag 'LocalAI' {
             Should -Invoke Register-PSRepository -Times 0 -ParameterFilter { $Default -or $Name -eq 'PSGallery' }
         }
 
-        It 'supports PowerShellGet without bootstrapping unavailable PSResourceGet' {
+        It 'reports unavailable PSResourceGet without bootstrapping it' {
             Mock Get-Command { $null } -ParameterFilter { $Name -eq 'Get-PSResourceRepository' }
             Invoke-RepositorySetup | Should -Be 'azure-powershell'
             Should -Invoke Register-PSRepository -Times 1 -Exactly

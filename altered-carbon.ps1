@@ -997,6 +997,98 @@ function Set-PSGalleryTrust {
 }
 
 # ── PowerShell Modules ─────────────────────────────────────────────────────────
+function Get-AzArtifactsCredentialProviderPath {
+    foreach ($target in @('User', 'Machine')) {
+        $configuredPath = [Environment]::GetEnvironmentVariable('NUGET_PLUGIN_PATHS', $target)
+        if ($configuredPath) { return $configuredPath }
+    }
+    $pluginRoot = Join-Path $env:USERPROFILE '.nuget\plugins'
+    $netcorePath = Join-Path $pluginRoot 'netcore\CredentialProvider.Microsoft'
+    $netfxPath = Join-Path $pluginRoot 'netfx\CredentialProvider.Microsoft'
+    if (-not (Test-Path -LiteralPath $netcorePath) -and (Test-Path -LiteralPath $netfxPath -PathType Container)) {
+        return (Join-Path $netfxPath 'CredentialProvider.Microsoft.exe')
+    }
+    $visualStudioPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio'
+    if (-not (Test-Path -LiteralPath $netcorePath) -and (Test-Path -LiteralPath $visualStudioPath -PathType Container)) {
+        $visualStudioProvider = [IO.Directory]::GetFiles($visualStudioPath, 'CredentialProvider.Microsoft.exe', [IO.SearchOption]::AllDirectories) |
+            Select-Object -First 1
+        if ($visualStudioProvider) { return $visualStudioProvider }
+    }
+    return (Join-Path $netcorePath 'CredentialProvider.Microsoft.exe')
+}
+
+function Test-AzArtifactsCredentialProvider {
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        if ([IO.Path]::GetExtension($Path) -eq '.dll') {
+            & dotnet $Path -h *> $null
+        } else {
+            & $Path -h *> $null
+        }
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Install-AzArtifactsCredentialProvider {
+    param([string] $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
+
+    $candidate = Get-AzArtifactsCredentialProviderPath
+    if (Test-AzArtifactsCredentialProvider -Path $candidate) { return }
+
+    $pluginRoot = Join-Path $env:USERPROFILE '.nuget\plugins\netcore'
+    $destination = Join-Path $pluginRoot 'CredentialProvider.Microsoft'
+    $apphost = Join-Path $destination 'CredentialProvider.Microsoft.exe'
+    if ($candidate -ne $apphost -or (Test-Path -LiteralPath $destination)) {
+        throw 'The existing or configured Azure Artifacts Credential Provider is unusable. Its files and settings were preserved.'
+    }
+
+    switch ($Architecture) {
+        'X64' {
+            $rid = 'win-x64'
+            $sha256 = 'f7d3cef19621fb3a87e4b38f5fbaba429917a4ca6881422764a474667dd0c038'
+        }
+        'Arm64' {
+            $rid = 'win-arm64'
+            $sha256 = '9aff3b5064ca47e37ddcabd95a85c87c92f1753f62014a7250045acc3943ef0a'
+        }
+        default { throw 'No supported self-contained Azure Artifacts Credential Provider exists for this Windows architecture.' }
+    }
+
+    $stage = Join-Path $pluginRoot ".altered-carbon-credprovider-$([guid]::NewGuid().ToString('N'))"
+    $stageCreated = $false
+    try {
+        $null = New-Item -Path $stage -ItemType Directory -ErrorAction Stop
+        $stageCreated = $true
+        $archive = Join-Path $stage 'provider.zip'
+        Invoke-WebRequest -Uri "https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$rid.NuGet.CredentialProvider.zip" -OutFile $archive -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256 -ErrorAction Stop).Hash -ne $sha256) {
+            throw 'Azure Artifacts Credential Provider archive checksum verification failed.'
+        }
+        $extracted = Join-Path $stage 'extracted'
+        Expand-Archive -LiteralPath $archive -DestinationPath $extracted -ErrorAction Stop
+        $provider = Join-Path $extracted 'plugins\netcore\CredentialProvider.Microsoft'
+        foreach ($file in @('CredentialProvider.Microsoft.exe', 'CredentialProvider.Microsoft.dll',
+            'CredentialProvider.Microsoft.deps.json', 'CredentialProvider.Microsoft.runtimeconfig.json', 'hostfxr.dll', 'coreclr.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $provider $file) -PathType Leaf)) {
+                throw 'The Azure Artifacts Credential Provider archive is incomplete.'
+            }
+        }
+        if (-not (Test-AzArtifactsCredentialProvider -Path (Join-Path $provider 'CredentialProvider.Microsoft.exe'))) {
+            throw 'The staged Azure Artifacts Credential Provider could not run.'
+        }
+        [IO.Directory]::Move($provider, $destination)
+        if (-not (Test-AzArtifactsCredentialProvider -Path (Get-AzArtifactsCredentialProviderPath))) {
+            throw 'The installed Azure Artifacts Credential Provider is not discoverable or usable.'
+        }
+    } finally {
+        if ($stageCreated) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+    }
+}
+
 function Initialize-PSModuleRepository {
     param([switch] $Work)
 
@@ -1018,6 +1110,9 @@ function Initialize-PSModuleRepository {
             ([string]$resourceRepositories[0].Uri).TrimEnd('/') -ne $resourceLocation)) {
             throw 'The existing azure-powershell PSResourceGet registration has a different source. No settings were overwritten.'
         }
+        if ($resourceRepositories.Count -eq 1 -and [string]$resourceRepositories[0].CredentialProvider -notin @('', 'None', '0', 'AzArtifacts', '1')) {
+            throw 'The existing azure-powershell credential provider is unsupported. Its settings were preserved.'
+        }
     }
 
     if ($repositories.Count -eq 0) {
@@ -1025,7 +1120,9 @@ function Initialize-PSModuleRepository {
     }
     if ($hasResourceGet) {
         if ($resourceRepositories.Count -eq 0) {
-            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -ErrorAction Stop | Out-Null
+            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
+        } elseif ([string]$resourceRepositories[0].CredentialProvider -notin @('AzArtifacts', '1')) {
+            Set-PSResourceRepository -Name $repositoryName -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
         }
     } else {
         Write-Warning 'PSResourceGet is unavailable; its repository registration is unsupported in this shell.'
@@ -1942,6 +2039,9 @@ if ($Phase -eq 'Phase1') {
     $fontFace     = $fontInfo.Face
     $fontFaceMono = $fontInfo.Mono
 
+    if ($Work.IsPresent) {
+        Install-AzArtifactsCredentialProvider
+    }
     $psRepository = Initialize-PSModuleRepository -Work:$Work.IsPresent
     if ($Personal.IsPresent) {
         Set-PSGalleryTrust

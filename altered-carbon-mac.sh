@@ -648,6 +648,72 @@ done
 
 # ── PowerShell Modules ───────────────────────────────────────────────────────
 
+test_artifacts_credential_provider() {
+    local provider="$1"
+    [[ -f "$provider/CredentialProvider.Microsoft.dll" ]] || return 1
+    command -v dotnet &>/dev/null || return 1
+    dotnet "$provider/CredentialProvider.Microsoft.dll" -h &>/dev/null
+}
+
+install_artifacts_credential_provider() (
+    local plugin_root="$HOME/.nuget/plugins/netcore"
+    local destination="$plugin_root/CredentialProvider.Microsoft"
+    local rid sha256 stage provider file digest
+    if test_artifacts_credential_provider "$destination"; then
+        return 0
+    fi
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        fail "The existing Azure Artifacts Credential Provider is unusable. Its files were preserved."
+        return 1
+    fi
+    if ! command -v dotnet &>/dev/null; then
+        fail "PSResourceGet requires an existing dotnet host to invoke its credential provider on macOS."
+        return 1
+    fi
+    case "$(uname -m)" in
+        x86_64)
+            rid="osx-x64"
+            sha256="969fc37eb8499b7488adffd791db1ed1e4d196c5b4291f066a5e262018f70bfd"
+            ;;
+        arm64)
+            rid="osx-arm64"
+            sha256="88c9e168dbe67d1683967e4d1fd79064038dcbdbc577f61805debc7ab0df3b5e"
+            ;;
+        *) fail "No supported self-contained Azure Artifacts Credential Provider exists for this macOS architecture."; return 1 ;;
+    esac
+    stage="$plugin_root/.altered-carbon-credprovider-$(uuidgen)" || return 1
+    mkdir -p "$plugin_root" && mkdir "$stage" || return 1
+    trap 'rm -rf "$stage"' EXIT
+    mkdir "$stage/extracted" || return 1
+    curl -fsSL "https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$rid.NuGet.CredentialProvider.zip" -o "$stage/provider.zip" || return 1
+    digest="$(shasum -a 256 "$stage/provider.zip")" || return 1
+    [[ "${digest%% *}" == "$sha256" ]] || {
+        fail "Azure Artifacts Credential Provider archive checksum verification failed."
+        return 1
+    }
+    unzip -q "$stage/provider.zip" -d "$stage/extracted" || return 1
+    provider="$stage/extracted/plugins/netcore/CredentialProvider.Microsoft"
+    for file in CredentialProvider.Microsoft CredentialProvider.Microsoft.dll \
+        CredentialProvider.Microsoft.deps.json CredentialProvider.Microsoft.runtimeconfig.json libhostfxr.dylib libcoreclr.dylib; do
+        if [[ ! -f "$provider/$file" ]]; then
+            fail "The Azure Artifacts Credential Provider archive is incomplete."
+            return 1
+        fi
+    done
+    chmod +x "$provider/CredentialProvider.Microsoft" || return 1
+    if ! "$provider/CredentialProvider.Microsoft" -h &>/dev/null || ! test_artifacts_credential_provider "$provider"; then
+        fail "The staged Azure Artifacts Credential Provider could not run through its apphost and dotnet."
+        return 1
+    fi
+    # Refuse an existing destination, including a concurrent or partial install.
+    [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+    mv -n "$provider" "$plugin_root/" || return 1
+    [[ ! -e "$provider" ]] && test_artifacts_credential_provider "$destination" || {
+        fail "The installed Azure Artifacts Credential Provider is not discoverable or usable."
+        return 1
+    }
+)
+
 initialize_ps_repository() {
     ALTERED_CARBON_MODULE_MODE="$MODE" pwsh -NoProfile -NonInteractive -Command '
 $ErrorActionPreference = "Stop"
@@ -669,13 +735,18 @@ if ($env:ALTERED_CARBON_MODULE_MODE -ne "work") {
             ([string]$resourceRepositories[0].Uri).TrimEnd("/") -ne $resourceLocation)) {
             throw "The existing azure-powershell PSResourceGet registration has a different source. No settings were overwritten."
         }
+        if ($resourceRepositories.Count -eq 1 -and [string]$resourceRepositories[0].CredentialProvider -notin @("", "None", "0", "AzArtifacts", "1")) {
+            throw "The existing azure-powershell credential provider is unsupported. Its settings were preserved."
+        }
     }
     if ($repositories.Count -eq 0) {
         Register-PSRepository -Name $repositoryName -SourceLocation $sourceLocation -ErrorAction Stop | Out-Null
     }
     if ($hasResourceGet) {
         if ($resourceRepositories.Count -eq 0) {
-            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -ErrorAction Stop | Out-Null
+            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
+        } elseif ([string]$resourceRepositories[0].CredentialProvider -notin @("AzArtifacts", "1")) {
+            Set-PSResourceRepository -Name $repositoryName -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
         }
     } else {
         [Console]::Error.WriteLine("PSResourceGet is unavailable; its repository registration is unsupported in this shell.")
@@ -695,6 +766,12 @@ PS_MODULES=(
 )
 
 if command -v pwsh &>/dev/null; then
+    if [[ "$MODE" == "work" ]]; then
+        install_artifacts_credential_provider || {
+            fail "Azure Artifacts Credential Provider setup failed. No module discovery or installation was attempted."
+            exit 1
+        }
+    fi
     ps_repository="$(initialize_ps_repository)" || {
         fail "PowerShell module repository selection failed. No module discovery or installation was attempted."
         exit 1
