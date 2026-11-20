@@ -737,6 +737,110 @@ Describe 'Enable-WindowsFeatures' {
     }
 }
 
+Describe 'Windows Podman WSL setup' -Tag 'PodmanWsl' {
+    BeforeAll {
+        function wsl.exe {
+            param([Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
+            $script:wslCalls += ,@($Arguments)
+            $global:LASTEXITCODE = if ($Arguments[0] -eq '--version') { $script:wslVersionExit } else { $script:wslInstallExit }
+        }
+        function podman {
+            param([Parameter(ValueFromRemainingArguments)] [string[]] $Arguments)
+            $script:podmanCalls += ,@($Arguments)
+            $global:LASTEXITCODE = 0
+            if ($Arguments[0] -eq 'machine' -and $Arguments[1] -eq 'list') { return $script:machinesJson }
+            if ($Arguments[0] -eq 'system') { return $script:connectionsJson }
+            if ($Arguments -contains $script:failCommand) {
+                $global:LASTEXITCODE = 42
+            }
+        }
+    }
+    BeforeEach {
+        $script:wslCalls = @()
+        $script:podmanCalls = @()
+        $script:wslVersionExit = 0
+        $script:wslInstallExit = 0
+        $script:machinesJson = '[]'
+        $script:connectionsJson = '[]'
+        $script:failCommand = 'none'
+        $script:podmanEngineReady = $null
+        Mock Write-Host {}
+    }
+    It 'installs WSL without a distribution only when missing' {
+        $script:wslVersionExit = 1
+        Install-PodmanWsl
+        $script:wslCalls.Count | Should -Be 2
+        $script:wslCalls[1] | Should -Be @('--install', '--no-distribution')
+    }
+    It 'skips WSL installation when available or Podman is skipped' {
+        Install-PodmanWsl
+        Install-PodmanWsl -SkipPackages @('RedHat.Podman')
+        $script:wslCalls.Count | Should -Be 1
+    }
+    It 'surfaces WSL installer failures' {
+        $script:wslVersionExit = 1
+        $script:wslInstallExit = 42
+        { Install-PodmanWsl } | Should -Throw '*WSL installation failed*42*'
+    }
+    It 'initializes and verifies a fresh WSL machine without changing provider environment' {
+        $priorProvider = $env:CONTAINERS_MACHINE_PROVIDER
+        try {
+            $env:CONTAINERS_MACHINE_PROVIDER = 'hyperv'
+            Initialize-PodmanMachine
+            $script:podmanCalls | ForEach-Object { $_ -join ' ' } | Should -Contain 'machine init'
+            $script:podmanCalls | ForEach-Object { $_ -join ' ' } | Should -Contain 'machine start podman-machine-default'
+            $script:podmanCalls | ForEach-Object { $_ -join ' ' } | Should -Contain '--connection podman-machine-default info'
+            $script:podmanEngineReady | Should -BeTrue
+            $env:CONTAINERS_MACHINE_PROVIDER | Should -Be 'hyperv'
+        } finally { $env:CONTAINERS_MACHINE_PROVIDER = $priorProvider }
+    }
+    It 'reuses a running default WSL machine' {
+        $script:machinesJson = '[{"Name":"podman-machine-default","VMType":"wsl","Running":true}]'
+        Initialize-PodmanMachine
+        $calls = @($script:podmanCalls | ForEach-Object { $_ -join ' ' })
+        $calls | Should -Not -Contain 'machine init'
+        $calls | Should -Not -Contain 'machine start podman-machine-default'
+        $calls | Should -Contain '--connection podman-machine-default info'
+    }
+    It 'starts an existing stopped default WSL machine without recreating it' {
+        $script:machinesJson = '[{"Name":"podman-machine-default","VMType":"wsl","Running":false}]'
+        Initialize-PodmanMachine
+        $calls = @($script:podmanCalls | ForEach-Object { $_ -join ' ' })
+        $calls | Should -Not -Contain 'machine init'
+        $calls | Should -Contain 'machine start podman-machine-default'
+    }
+    It 'does not modify existing non-default machines or remote connections' -TestCases @(
+        @{ Machines = '[{"Name":"other","VMType":"hyperv","Running":true}]'; Connections = '[]' }
+        @{ Machines = '[]'; Connections = '[{"Name":"remote"}]' }
+    ) {
+        param($Machines, $Connections)
+        $script:machinesJson = $Machines
+        $script:connectionsJson = $Connections
+        { Initialize-PodmanMachine } | Should -Throw '*left unchanged*'
+        $script:podmanCalls | ForEach-Object { $_ -join ' ' } | Should -Not -Contain 'machine init'
+        $script:podmanEngineReady | Should -BeFalse
+    }
+    It 'surfaces failed initialization and does not claim engine readiness' {
+        $script:failCommand = 'init'
+        { Initialize-PodmanMachine } | Should -Throw '*initialization failed*'
+        $script:podmanEngineReady | Should -BeFalse
+    }
+    It 'surfaces start and engine verification failures' -TestCases @(
+        @{ Command = 'start'; Message = '*machine start failed*' }
+        @{ Command = 'info'; Message = '*engine verification failed*' }
+    ) {
+        param($Command, $Message)
+        $script:failCommand = $Command
+        { Initialize-PodmanMachine } | Should -Throw $Message
+        $script:podmanEngineReady | Should -BeFalse
+    }
+    It 'does not invoke WSL or Podman when skipped' {
+        Initialize-PodmanMachine -SkipPackages @('RedHat.Podman')
+        $script:wslCalls.Count | Should -Be 0
+        $script:podmanCalls.Count | Should -Be 0
+    }
+}
+
 Describe 'Native Windows architecture' {
     It 'maps native processor architecture <Code> to <Expected> without runtime API dependencies' -TestCases @(
         @{ Code = 0; Expected = 'X86' }
@@ -2168,6 +2272,7 @@ Describe 'Desktop app verification identity' {
         @{ Name = 'GitHub Copilot'; Publisher = 'GitHub, Inc.' }
         @{ Name = 'Podman Desktop'; Publisher = 'Red Hat, Inc.' }
         @{ Name = 'Podman Desktop'; Publisher = 'Red Hat' }
+        @{ Name = 'Podman Desktop 1.30.7'; Publisher = 'Podman Desktop' }
     ) {
         param($Name, $Publisher)
         $script:desktopRegistration = [pscustomobject]@{ DisplayName = $Name; Publisher = $Publisher; DisplayVersion = '' }
@@ -2176,7 +2281,7 @@ Describe 'Desktop app verification identity' {
         Show-VerificationSummary
 
         Should -Invoke Write-VerificationLine -Times 1 -Exactly -ParameterFilter {
-            $Label -like "$Name*" -and $Label -in @('GitHub Copilot App (desktop)', 'Podman Desktop') -and
+            ($Label -like "$Name*" -or ($Name -like 'Podman Desktop *' -and $Label -eq 'Podman Desktop')) -and $Label -in @('GitHub Copilot App (desktop)', 'Podman Desktop') -and
             $Installed -and $Details -eq 'installed (uninstall registration)'
         }
     }

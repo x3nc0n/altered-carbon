@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-20
+
+### Changed
+- Windows installs the WSL runtime without a default distribution and initializes a WSL-backed Podman machine after reboot, while preserving existing non-default machines and connections.
+
+### Fixed
+- Windows recognizes versioned Podman Desktop uninstall registrations and reports Podman engine readiness separately from CLI presence.
+
 ## [1.6.0] - 2026-11-20
 
 ### Added
