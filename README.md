@@ -45,7 +45,7 @@ Handled orchestration failures in either phase also produce an **incomplete** re
 
 ## Release Notes
 
-- Current release: [v1.3.0](https://github.com/x3nc0n/altered-carbon/releases/tag/v1.3.0)
+- Current release: [v1.6.0](https://github.com/x3nc0n/altered-carbon/releases/tag/v1.6.0)
 - Changelog: `CHANGELOG.md`
 
 ## Examples

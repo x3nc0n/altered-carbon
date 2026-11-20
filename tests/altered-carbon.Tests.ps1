@@ -3,7 +3,7 @@
 
 BeforeAll {
     # Parse the script's AST to extract functions without executing side effects.
-    $scriptPath = Join-Path $PSScriptRoot '..' 'altered-carbon.ps1'
+    $scriptPath = Join-Path $PSScriptRoot '..\altered-carbon.ps1'
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$errors)
 
@@ -41,7 +41,7 @@ Describe 'Script Parse Validation' {
     It 'parses without syntax errors' {
         $parseErrors = $null
         [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PSScriptRoot '..' 'altered-carbon.ps1'),
+            (Join-Path $PSScriptRoot '..\altered-carbon.ps1'),
             [ref]$null,
             [ref]$parseErrors
         )
@@ -737,6 +737,37 @@ Describe 'Enable-WindowsFeatures' {
     }
 }
 
+Describe 'Native Windows architecture' {
+    It 'maps native processor architecture <Code> to <Expected> without runtime API dependencies' -TestCases @(
+        @{ Code = 0; Expected = 'X86' }
+        @{ Code = 9; Expected = 'X64' }
+        @{ Code = 12; Expected = 'Arm64' }
+        @{ Code = 99; Expected = 'Unknown' }
+        @{ Code = $null; Expected = 'Unknown' }
+    ) {
+        param($Code, $Expected)
+        Mock Get-CimInstance { [pscustomobject]@{ Architecture = $Code } } -ParameterFilter {
+            $ClassName -eq 'Win32_Processor'
+        }
+        Get-WindowsNativeArchitecture | Should -Be $Expected
+    }
+
+    It 'handles an empty processor inventory conservatively' {
+        Mock Get-CimInstance { @() }
+        Get-WindowsNativeArchitecture | Should -Be 'Unknown'
+    }
+
+    It 'accepts multiple processors with the same architecture' {
+        Mock Get-CimInstance { @([pscustomobject]@{ Architecture = 9 }, [pscustomobject]@{ Architecture = 9 }) }
+        Get-WindowsNativeArchitecture | Should -Be 'X64'
+    }
+
+    It 'does not hide processor query failures' {
+        Mock Get-CimInstance { throw 'Processor query failed' }
+        { Get-WindowsNativeArchitecture } | Should -Throw '*Processor query failed*'
+    }
+}
+
 Describe 'CUDA toolkit compatibility' -Tag 'LocalAI' {
     It 'selects CUDA <Version> and the exact target for compute <Capability>' -TestCases @(
         @('5.0', '5.2', '5.3', '6.0', '6.1', '6.2', '7.0', '7.2') | ForEach-Object {
@@ -816,6 +847,7 @@ Describe 'CUDA toolkit compatibility' -Tag 'LocalAI' {
                 Path = 'mock nvcc'; Version = [version]'13.5'; Architectures = @('compute_86')
             })
             Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+            Mock Get-WindowsNativeArchitecture { 'X64' }
             Mock Get-PnpDevice { [pscustomobject]@{ InstanceId = 'PCI\VEN_10DE&DEV_1234' } }
             Mock Get-Command { [pscustomobject]@{ Source = 'Invoke-TestNvidiaSmi' } } -ParameterFilter { $Name -eq 'nvidia-smi' }
             Mock Get-CudaCompiler {
@@ -854,6 +886,20 @@ Describe 'CUDA toolkit compatibility' -Tag 'LocalAI' {
             Install-CudaToolkit
             $script:cudaInstallArguments | Should -BeNullOrEmpty
             Should -Invoke Write-Warning -Times 1
+        }
+
+        It 'skips unsupported native architecture <Architecture> before probing CUDA devices' -TestCases @(
+            @{ Architecture = 'Arm64' }
+            @{ Architecture = 'X86' }
+            @{ Architecture = 'Unknown' }
+        ) {
+            param($Architecture)
+            Mock Get-WindowsNativeArchitecture { $Architecture }
+            { Install-CudaToolkit } | Should -Not -Throw
+            Should -Invoke Get-WindowsNativeArchitecture -Times 1 -Exactly
+            Should -Invoke Get-PnpDevice -Times 0
+            $script:cudaInstallArguments | Should -BeNullOrEmpty
+            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*native Windows x64*' }
         }
 
         It 'preserves a compatible older compiler before applying the newer toolkit driver threshold' {
@@ -1007,6 +1053,7 @@ Describe 'Foundry Local owned login supervisor' -Tag 'LocalAI' {
         $script:foundryWrapperContent = ''
         $script:foundryExistingTask = $null
         Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+        Mock Get-WindowsNativeArchitecture { 'X64' }
         Mock Get-Command {
             if ($script:foundryOnPath) { [pscustomobject]@{ Source = 'Invoke-TestFoundry' } }
         } -ParameterFilter { $Name -eq 'foundry' }
@@ -1058,6 +1105,7 @@ Describe 'Foundry Local owned login supervisor' -Tag 'LocalAI' {
     }
 
     It 'installs missing Foundry only for the current user and creates a least-privilege login task' {
+        Mock Get-WindowsNativeArchitecture { 'Arm64' }
         $script:foundryOnPath = $false
         Install-FoundryLocal
         ($script:foundryInstallArguments -join ' ') | Should -Be 'install --id Microsoft.FoundryLocal --exact --source winget --scope user --silent --accept-source-agreements --accept-package-agreements --disable-interactivity'
@@ -1192,6 +1240,7 @@ Describe 'Azure Artifacts Credential Provider installation' {
         $script:providerFixtureFiles = @('CredentialProvider.Microsoft.exe', 'CredentialProvider.Microsoft.dll',
             'CredentialProvider.Microsoft.deps.json', 'CredentialProvider.Microsoft.runtimeconfig.json', 'hostfxr.dll', 'coreclr.dll')
         $null = New-Item -Path $providerRoot -ItemType Directory -Force
+        Mock Get-WindowsNativeArchitecture { 'X64' }
         Mock Get-AzArtifactsCredentialProviderPath { $providerApphost }
         Mock Test-AzArtifactsCredentialProvider { Test-Path -LiteralPath $Path -PathType Leaf }
         Mock Invoke-WebRequest { Set-Content -LiteralPath $OutFile -Value 'fictional archive' }
@@ -1232,7 +1281,9 @@ Describe 'Azure Artifacts Credential Provider installation' {
         $otherPlugin = Join-Path $providerRoot 'Contoso.Plugin'
         $null = New-Item -Path $otherPlugin -ItemType Directory
         Set-Content -LiteralPath (Join-Path $otherPlugin 'keep') -Value 'untouched'
-        Install-AzArtifactsCredentialProvider -Architecture $Architecture
+        Mock Get-WindowsNativeArchitecture { $Architecture }
+        Install-AzArtifactsCredentialProvider
+        Should -Invoke Get-WindowsNativeArchitecture -Times 1 -Exactly
         Test-Path -LiteralPath $providerApphost -PathType Leaf | Should -BeTrue
         Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
             $Uri -eq "https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$Rid.NuGet.CredentialProvider.zip" -and
@@ -1672,6 +1723,7 @@ Describe 'Foundry Local emitted Windows artifacts' -Tag 'LocalAI' {
         Mock Start-Sleep {}
         Mock Update-PathFromRegistry {}
         Mock Get-CimInstance { [pscustomobject]@{ BuildNumber = '26100'; ProductType = 1 } }
+        Mock Get-WindowsNativeArchitecture { 'X64' }
         Mock Get-Command {
             if ($script:foundryAvailable) { [pscustomobject]@{ Source = 'Invoke-TestFoundry' } }
         } -ParameterFilter { $Name -eq 'foundry' }

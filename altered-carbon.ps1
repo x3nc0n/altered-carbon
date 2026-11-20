@@ -635,6 +635,19 @@ function Get-CudaCompiler {
     }
 }
 
+function Get-WindowsNativeArchitecture {
+    # Win32_Processor reports native hardware even when the shell is emulated.
+    $architectures = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+        Select-Object -ExpandProperty Architecture -Unique)
+    if ($architectures.Count -ne 1 -or $null -eq $architectures[0]) { return 'Unknown' }
+    switch ($architectures[0]) {
+        0 { return 'X86' }
+        9 { return 'X64' }
+        12 { return 'Arm64' }
+        default { return 'Unknown' }
+    }
+}
+
 function Install-CudaToolkit {
     param([string[]] $SkipPackages = @())
 
@@ -644,7 +657,7 @@ function Install-CudaToolkit {
     }
     try {
         $os = Get-CimInstance Win32_OperatingSystem
-        $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        $architecture = Get-WindowsNativeArchitecture
         $build = [int]$os.BuildNumber
         $supportedBuilds = if ($os.ProductType -eq 1) { @(19045, 22621, 22631, 26100, 26200) } else { @(20348, 26100) }
         if ($architecture -ne 'X64' -or -not [Environment]::Is64BitProcess -or $build -notin $supportedBuilds) {
@@ -742,7 +755,7 @@ function Install-FoundryLocal {
         return
     }
     $os = Get-CimInstance Win32_OperatingSystem
-    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $architecture = Get-WindowsNativeArchitecture
     if ($architecture -notin @('X64', 'Arm64') -or $os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 26100) {
         Write-Warning 'Foundry Local skipped: automation targets the tested Windows 11 24H2+ x64/ARM64 baseline. Other Windows versions are not validated here.'
         return
@@ -1034,7 +1047,7 @@ function Test-AzArtifactsCredentialProvider {
 }
 
 function Install-AzArtifactsCredentialProvider {
-    param([string] $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
+    param([string] $Architecture = (Get-WindowsNativeArchitecture))
 
     $candidate = Get-AzArtifactsCredentialProviderPath
     if (Test-AzArtifactsCredentialProvider -Path $candidate) { return }
