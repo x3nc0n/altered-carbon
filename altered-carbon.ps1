@@ -565,9 +565,76 @@ function Enable-WindowsFeatures {
                 Write-Warning "  Windows optional feature management is unavailable for ${feature}: $_"
             }
         }
-        Write-Host '  Run "wsl --install" after reboot to install WSL and a Linux distribution.' -ForegroundColor Cyan
     } else {
         Write-Warning '  Skipped: Hyper-V and WSL 2 require admin privileges. Re-run script as Administrator to enable.'
+    }
+}
+
+function Install-PodmanWsl {
+    param([string[]] $SkipPackages = @())
+
+    if ('RedHat.Podman' -in $SkipPackages) { return }
+    Write-Host 'Checking WSL runtime for Podman...' -ForegroundColor Cyan
+    & wsl.exe --version 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host '  WSL runtime is already installed.' -ForegroundColor Green
+        return
+    }
+
+    & wsl.exe --install --no-distribution
+    if ($LASTEXITCODE -notin @(0, 3010)) {
+        throw "WSL installation failed (exit $LASTEXITCODE). Install WSL without a distribution and retry Phase 1."
+    }
+    Write-Host '  WSL installation requested; reboot before Phase 2.' -ForegroundColor Green
+}
+
+function Initialize-PodmanMachine {
+    param([string[]] $SkipPackages = @())
+
+    if ('RedHat.Podman' -in $SkipPackages) { return }
+    $script:podmanEngineReady = $false
+    if (-not (Get-Command podman -ErrorAction SilentlyContinue)) {
+        throw 'Podman CLI is not available on PATH.'
+    }
+    & wsl.exe --version 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'WSL runtime is unavailable. Complete WSL installation and reboot before retrying Phase 2.'
+    }
+
+    $previousProvider = $env:CONTAINERS_MACHINE_PROVIDER
+    try {
+        $env:CONTAINERS_MACHINE_PROVIDER = 'wsl'
+        $machineJson = & podman machine list --all-providers --format json
+        if ($LASTEXITCODE -ne 0) { throw "Podman machine list failed (exit $LASTEXITCODE)." }
+        $machines = @($machineJson | ConvertFrom-Json)
+        if ($machines.Count -eq 0) {
+            $connectionsJson = & podman system connection list --format json
+            if ($LASTEXITCODE -ne 0) { throw "Podman connection list failed (exit $LASTEXITCODE)." }
+            $connections = @($connectionsJson | ConvertFrom-Json)
+            if ($connections.Count -gt 0) {
+                throw 'Existing Podman connections were left unchanged; configure a WSL machine manually.'
+            }
+            & podman machine init
+            if ($LASTEXITCODE -ne 0) { throw "Podman machine initialization failed (exit $LASTEXITCODE)." }
+            $machineName = 'podman-machine-default'
+        } else {
+            $machine = @($machines | Where-Object { $_.Name -eq 'podman-machine-default' -and $_.VMType -eq 'wsl' })
+            if ($machine.Count -ne 1 -or $machines.Count -ne 1) {
+                throw 'Existing Podman machines were left unchanged; select and start the desired machine manually.'
+            }
+            $machineName = $machine[0].Name
+        }
+
+        if (-not $machine -or -not $machine[0].Running) {
+            & podman machine start $machineName
+            if ($LASTEXITCODE -ne 0) { throw "Podman machine start failed (exit $LASTEXITCODE)." }
+        }
+        & podman --connection $machineName info | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Podman engine verification failed (exit $LASTEXITCODE)." }
+        $script:podmanEngineReady = $true
+        Write-Host '  Podman machine is running and the engine is reachable.' -ForegroundColor Green
+    } finally {
+        $env:CONTAINERS_MACHINE_PROVIDER = $previousProvider
     }
 }
 
@@ -1677,7 +1744,13 @@ function Get-DesktopAppVersion {
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     $app = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -eq $Name -and $_.Publisher -in $Publisher } |
+        Where-Object {
+            $_.Publisher -in $Publisher -and (
+                $_.DisplayName -eq $Name -or
+                ($Name -eq 'Podman Desktop' -and $_.Publisher -eq 'Podman Desktop' -and
+                    $_.DisplayName -match '^Podman Desktop \d+(\.\d+)+$')
+            )
+        } |
         Select-Object -First 1
     if ($app) {
         if ($app.DisplayVersion) { return $app.DisplayVersion }
@@ -1736,8 +1809,11 @@ function Show-VerificationSummary {
 
     $podmanVersion = Get-CommandVersion -Command 'podman'
     Write-VerificationLine -Label 'Podman CLI' -Installed ([bool]$podmanVersion) -Details $podmanVersion
+    if ($null -ne $script:podmanEngineReady) {
+        Write-VerificationLine -Label 'Podman engine' -Installed $script:podmanEngineReady -Details 'WSL machine and engine'
+    }
 
-    $podmanDesktopVersion = Get-DesktopAppVersion -Name 'Podman Desktop' -Publisher @('Red Hat, Inc.', 'Red Hat')
+    $podmanDesktopVersion = Get-DesktopAppVersion -Name 'Podman Desktop' -Publisher @('Red Hat, Inc.', 'Red Hat', 'Podman Desktop')
     Write-VerificationLine -Label 'Podman Desktop' -Installed ([bool]$podmanDesktopVersion) -Details $podmanDesktopVersion
 
     $workIqVersion = Get-CommandVersion -Command 'workiq' -VersionArgs @('version')
@@ -1963,6 +2039,7 @@ if ($Phase -eq 'Phase1') {
     $SkipPackages += 'Spotify.Spotify'
     Install-WingetPackages -Personal $Personal.IsPresent -SkipPackages $SkipPackages -ExtraPackages $ExtraPackages -AppInUseExitCode $WINGET_APP_IN_USE -NoApplicableUpgradeExitCode $WINGET_NO_APPLICABLE_UPGRADE -PackageNotFoundExitCode $WINGET_PACKAGE_NOT_FOUND -UpgradeVersionNotNewerExitCode $WINGET_UPGRADE_VERSION_NOT_NEWER
     Enable-WindowsFeatures -IsAdmin $isAdmin
+    Install-PodmanWsl -SkipPackages $SkipPackages
     Install-NvidiaApp -AppInUseExitCode $WINGET_APP_IN_USE
     Install-CudaToolkit -SkipPackages $SkipPackages
     Update-PathFromRegistry
@@ -2005,6 +2082,11 @@ if ($Phase -eq 'Phase1') {
         Install-Agency
     }
     Update-PathFromRegistry
+    try {
+        Initialize-PodmanMachine -SkipPackages $SkipPackages
+    } catch {
+        Write-Warning "Podman machine setup failed: $_"
+    }
     Install-FoundryLocal -SkipPackages $SkipPackages
     Install-WorkIqCli
 
