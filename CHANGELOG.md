@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-20
+
+### Added
+- Work-mode PowerShell module repository initialization and explicit repository selection, preserving matching repository settings.
+- SHA256-verified, per-user Azure Artifacts Credential Provider installation on Windows and macOS, with PSResourceGet integration for Work-mode feeds.
+
+### Fixed
+- Windows architecture detection uses native processor information instead of a null-unsafe runtime API call, preventing CUDA setup from aborting Phase 1 in affected Windows PowerShell 5.1 environments. Foundry Local and Azure Artifacts Credential Provider use the same compatible detection.
+
 ## [1.5.0] - 2026-11-19
 
 ### Added

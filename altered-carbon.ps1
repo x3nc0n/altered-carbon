@@ -635,6 +635,19 @@ function Get-CudaCompiler {
     }
 }
 
+function Get-WindowsNativeArchitecture {
+    # Win32_Processor reports native hardware even when the shell is emulated.
+    $architectures = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+        Select-Object -ExpandProperty Architecture -Unique)
+    if ($architectures.Count -ne 1 -or $null -eq $architectures[0]) { return 'Unknown' }
+    switch ($architectures[0]) {
+        0 { return 'X86' }
+        9 { return 'X64' }
+        12 { return 'Arm64' }
+        default { return 'Unknown' }
+    }
+}
+
 function Install-CudaToolkit {
     param([string[]] $SkipPackages = @())
 
@@ -644,7 +657,7 @@ function Install-CudaToolkit {
     }
     try {
         $os = Get-CimInstance Win32_OperatingSystem
-        $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        $architecture = Get-WindowsNativeArchitecture
         $build = [int]$os.BuildNumber
         $supportedBuilds = if ($os.ProductType -eq 1) { @(19045, 22621, 22631, 26100, 26200) } else { @(20348, 26100) }
         if ($architecture -ne 'X64' -or -not [Environment]::Is64BitProcess -or $build -notin $supportedBuilds) {
@@ -742,7 +755,7 @@ function Install-FoundryLocal {
         return
     }
     $os = Get-CimInstance Win32_OperatingSystem
-    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $architecture = Get-WindowsNativeArchitecture
     if ($architecture -notin @('X64', 'Arm64') -or $os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 26100) {
         Write-Warning 'Foundry Local skipped: automation targets the tested Windows 11 24H2+ x64/ARM64 baseline. Other Windows versions are not validated here.'
         return
@@ -997,9 +1010,146 @@ function Set-PSGalleryTrust {
 }
 
 # ── PowerShell Modules ─────────────────────────────────────────────────────────
+function Get-AzArtifactsCredentialProviderPath {
+    foreach ($target in @('User', 'Machine')) {
+        $configuredPath = [Environment]::GetEnvironmentVariable('NUGET_PLUGIN_PATHS', $target)
+        if ($configuredPath) { return $configuredPath }
+    }
+    $pluginRoot = Join-Path $env:USERPROFILE '.nuget\plugins'
+    $netcorePath = Join-Path $pluginRoot 'netcore\CredentialProvider.Microsoft'
+    $netfxPath = Join-Path $pluginRoot 'netfx\CredentialProvider.Microsoft'
+    if (-not (Test-Path -LiteralPath $netcorePath) -and (Test-Path -LiteralPath $netfxPath -PathType Container)) {
+        return (Join-Path $netfxPath 'CredentialProvider.Microsoft.exe')
+    }
+    $visualStudioPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio'
+    if (-not (Test-Path -LiteralPath $netcorePath) -and (Test-Path -LiteralPath $visualStudioPath -PathType Container)) {
+        $visualStudioProvider = [IO.Directory]::GetFiles($visualStudioPath, 'CredentialProvider.Microsoft.exe', [IO.SearchOption]::AllDirectories) |
+            Select-Object -First 1
+        if ($visualStudioProvider) { return $visualStudioProvider }
+    }
+    return (Join-Path $netcorePath 'CredentialProvider.Microsoft.exe')
+}
+
+function Test-AzArtifactsCredentialProvider {
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        if ([IO.Path]::GetExtension($Path) -eq '.dll') {
+            & dotnet $Path -h *> $null
+        } else {
+            & $Path -h *> $null
+        }
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Install-AzArtifactsCredentialProvider {
+    param([string] $Architecture = (Get-WindowsNativeArchitecture))
+
+    $candidate = Get-AzArtifactsCredentialProviderPath
+    if (Test-AzArtifactsCredentialProvider -Path $candidate) { return }
+
+    $pluginRoot = Join-Path $env:USERPROFILE '.nuget\plugins\netcore'
+    $destination = Join-Path $pluginRoot 'CredentialProvider.Microsoft'
+    $apphost = Join-Path $destination 'CredentialProvider.Microsoft.exe'
+    if ($candidate -ne $apphost -or (Test-Path -LiteralPath $destination)) {
+        throw 'The existing or configured Azure Artifacts Credential Provider is unusable. Its files and settings were preserved.'
+    }
+
+    switch ($Architecture) {
+        'X64' {
+            $rid = 'win-x64'
+            $sha256 = 'f7d3cef19621fb3a87e4b38f5fbaba429917a4ca6881422764a474667dd0c038'
+        }
+        'Arm64' {
+            $rid = 'win-arm64'
+            $sha256 = '9aff3b5064ca47e37ddcabd95a85c87c92f1753f62014a7250045acc3943ef0a'
+        }
+        default { throw 'No supported self-contained Azure Artifacts Credential Provider exists for this Windows architecture.' }
+    }
+
+    $stage = Join-Path $pluginRoot ".altered-carbon-credprovider-$([guid]::NewGuid().ToString('N'))"
+    $stageCreated = $false
+    try {
+        $null = New-Item -Path $stage -ItemType Directory -ErrorAction Stop
+        $stageCreated = $true
+        $archive = Join-Path $stage 'provider.zip'
+        Invoke-WebRequest -Uri "https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$rid.NuGet.CredentialProvider.zip" -OutFile $archive -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256 -ErrorAction Stop).Hash -ne $sha256) {
+            throw 'Azure Artifacts Credential Provider archive checksum verification failed.'
+        }
+        $extracted = Join-Path $stage 'extracted'
+        Expand-Archive -LiteralPath $archive -DestinationPath $extracted -ErrorAction Stop
+        $provider = Join-Path $extracted 'plugins\netcore\CredentialProvider.Microsoft'
+        foreach ($file in @('CredentialProvider.Microsoft.exe', 'CredentialProvider.Microsoft.dll',
+            'CredentialProvider.Microsoft.deps.json', 'CredentialProvider.Microsoft.runtimeconfig.json', 'hostfxr.dll', 'coreclr.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $provider $file) -PathType Leaf)) {
+                throw 'The Azure Artifacts Credential Provider archive is incomplete.'
+            }
+        }
+        if (-not (Test-AzArtifactsCredentialProvider -Path (Join-Path $provider 'CredentialProvider.Microsoft.exe'))) {
+            throw 'The staged Azure Artifacts Credential Provider could not run.'
+        }
+        [IO.Directory]::Move($provider, $destination)
+        if (-not (Test-AzArtifactsCredentialProvider -Path (Get-AzArtifactsCredentialProviderPath))) {
+            throw 'The installed Azure Artifacts Credential Provider is not discoverable or usable.'
+        }
+    } finally {
+        if ($stageCreated) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+    }
+}
+
+function Initialize-PSModuleRepository {
+    param([switch] $Work)
+
+    if (-not $Work) { return 'PSGallery' }
+
+    $repositoryName = 'azure-powershell'
+    $sourceLocation = 'https://packagefeedproxy.microsoft.io/powershell/v2'
+    $resourceLocation = 'https://packagefeedproxy.microsoft.io/powershell/v3/index.json'
+    $repositories = @(Get-PSRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+    if ($repositories.Count -gt 1 -or ($repositories.Count -eq 1 -and
+        ([string]$repositories[0].SourceLocation).TrimEnd('/') -ne $sourceLocation)) {
+        throw 'The existing azure-powershell PowerShellGet registration has a different source. No settings were overwritten.'
+    }
+
+    $hasResourceGet = [bool](Get-Command Get-PSResourceRepository -ErrorAction SilentlyContinue)
+    if ($hasResourceGet) {
+        $resourceRepositories = @(Get-PSResourceRepository -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object Name -EQ $repositoryName)
+        if ($resourceRepositories.Count -gt 1 -or ($resourceRepositories.Count -eq 1 -and
+            ([string]$resourceRepositories[0].Uri).TrimEnd('/') -ne $resourceLocation)) {
+            throw 'The existing azure-powershell PSResourceGet registration has a different source. No settings were overwritten.'
+        }
+        if ($resourceRepositories.Count -eq 1 -and [string]$resourceRepositories[0].CredentialProvider -notin @('', 'None', '0', 'AzArtifacts', '1')) {
+            throw 'The existing azure-powershell credential provider is unsupported. Its settings were preserved.'
+        }
+    }
+
+    if ($repositories.Count -eq 0) {
+        Register-PSRepository -Name $repositoryName -SourceLocation $sourceLocation -ErrorAction Stop | Out-Null
+    }
+    if ($hasResourceGet) {
+        if ($resourceRepositories.Count -eq 0) {
+            Register-PSResourceRepository -Name $repositoryName -Uri $resourceLocation -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
+        } elseif ([string]$resourceRepositories[0].CredentialProvider -notin @('AzArtifacts', '1')) {
+            Set-PSResourceRepository -Name $repositoryName -CredentialProvider AzArtifacts -ErrorAction Stop | Out-Null
+        }
+    } else {
+        Write-Warning 'PSResourceGet is unavailable; its repository registration is unsupported in this shell.'
+    }
+
+    return $repositoryName
+}
+
 # Install commonly used modules into CurrentUser scope (no admin required).
 function Install-PSModules {
-    param([string] $ModuleDir)
+    param(
+        [string] $ModuleDir,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string] $Repository
+    )
 
     $psModules = @(
         # Core
@@ -1022,14 +1172,14 @@ function Install-PSModules {
                     $installedModule = Get-Module -ListAvailable -Name $mod.Name -ErrorAction SilentlyContinue |
                         Sort-Object Version -Descending |
                         Select-Object -First 1
-                    $latestModule = Find-Module -Name $mod.Name -Repository PSGallery -ErrorAction Stop
+                    $latestModule = Find-Module -Name $mod.Name -Repository $Repository -ErrorAction Stop
 
                     if ($installedModule -and $installedModule.Version -ge $latestModule.Version) {
                         Write-Host "  Skipped: $($mod.Name) is already up to date ($($installedModule.Version))." -ForegroundColor Yellow
                         continue
                     }
 
-                    Save-Module -Name $mod.Name -Repository PSGallery -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
+                    Save-Module -Name $mod.Name -Repository $Repository -Path $ModuleDir -Force -AcceptLicense -ErrorAction Stop
                     Write-Host "  Done: $($mod.Name) $($latestModule.Version)" -ForegroundColor Green
                 }
                 catch {
@@ -1902,8 +2052,14 @@ if ($Phase -eq 'Phase1') {
     $fontFace     = $fontInfo.Face
     $fontFaceMono = $fontInfo.Mono
 
-    Set-PSGalleryTrust
-    Install-PSModules -ModuleDir $psModuleDir
+    if ($Work.IsPresent) {
+        Install-AzArtifactsCredentialProvider
+    }
+    $psRepository = Initialize-PSModuleRepository -Work:$Work.IsPresent
+    if ($Personal.IsPresent) {
+        Set-PSGalleryTrust
+    }
+    Install-PSModules -ModuleDir $psModuleDir -Repository $psRepository
     Install-VSCodeExtensions
     Set-OhMyPoshProfile -ThemeName $OmpTheme -ProfileDir $psProfileDir -ProfileFile $psProfileFile
     Set-WindowsTerminalConfig -FontFaceName $fontFace

@@ -851,6 +851,248 @@ assert not re.search(r"(?im)^\s*(?:ensure_(?:formula|cask)|brew\s+install|instal
 PY
 }
 
+load_module_stage() {
+    eval "$("$PYTHON" - "$SOURCE_SCRIPT" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index("test_artifacts_credential_provider()")
+initialize = text.index("initialize_ps_repository()", start)
+end = text.index("# ── oh-my-posh Configuration", start)
+print("MODULE_PROVIDER_HELPERS=" + shlex.quote(text[start:initialize]))
+print("MODULE_STAGE=" + shlex.quote(text[initialize:end]))
+PY
+)" || fail_test "Could not isolate PowerShell module orchestration"
+    MODULE_CALLS_FILE="$TEST_SANDBOX_ROOT/module-calls"
+    MODULE_INIT_STATUS=0
+    MODULE_INSTALL_STATUS=0
+    MODULE_PWSH_AVAILABLE=1
+    MODULE_PROVIDER_STATUS=0
+    : >"$MODULE_CALLS_FILE"
+
+    command() {
+        if [[ "$*" == "-v pwsh" ]]; then
+            [[ "$MODULE_PWSH_AVAILABLE" -eq 1 ]]
+        else
+            fail_test "Unexpected module command probe: $*"
+        fi
+    }
+    install_artifacts_credential_provider() {
+        printf 'provider\n' >>"$MODULE_CALLS_FILE"
+        return "$MODULE_PROVIDER_STATUS"
+    }
+    pwsh() {
+        if [[ "$2" == "-NonInteractive" ]]; then
+            printf 'initialize:%s\n' "$ALTERED_CARBON_MODULE_MODE" >>"$MODULE_CALLS_FILE"
+            printf '%s' "$4" >"$TEST_SANDBOX_ROOT/repository-program"
+            if [[ "$MODULE_INIT_STATUS" -ne 0 ]]; then
+                printf 'mock repository configuration failed\n' >&2
+                return "$MODULE_INIT_STATUS"
+            fi
+            if [[ "$ALTERED_CARBON_MODULE_MODE" == "work" ]]; then
+                printf 'azure-powershell\n'
+            else
+                printf 'PSGallery\n'
+            fi
+        else
+            printf 'module:%s\n' "$ALTERED_CARBON_MODULE_REPOSITORY" >>"$MODULE_CALLS_FILE"
+            printf '%s' "$3" >"$TEST_SANDBOX_ROOT/module-program"
+            if [[ "$MODULE_INSTALL_STATUS" -ne 0 ]]; then
+                printf 'mock module download failed\n' >&2
+                return "$MODULE_INSTALL_STATUS"
+            fi
+            printf 'updated\n'
+        fi
+    }
+}
+
+test_work_modules_configure_before_discovery_and_pass_selected_repository_safely() {
+    load_module_stage
+    local MODE="work" actual expected
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    actual="$(cat "$MODULE_CALLS_FILE")"
+    expected=$'provider\ninitialize:work'
+    for ((i=0; i<6; i++)); do expected+=$'\nmodule:azure-powershell'; done
+    assert_eq "$expected" "$actual" "Work must configure sources once before any module operation"
+    grep -Fq '$repository = $env:ALTERED_CARBON_MODULE_REPOSITORY' "$TEST_SANDBOX_ROOT/module-program" ||
+        fail_test "Selected repository must be read as data inside PowerShell"
+    if grep -Fq 'azure-powershell' "$TEST_SANDBOX_ROOT/module-program"; then
+        fail_test "Repository output must not be interpolated into PowerShell code"
+    fi
+}
+
+test_personal_modules_keep_public_source() {
+    load_module_stage
+    local MODE="personal" actual expected
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    actual="$(cat "$MODULE_CALLS_FILE")"
+    expected="initialize:personal"
+    for ((i=0; i<6; i++)); do expected+=$'\nmodule:PSGallery'; done
+    assert_eq "$expected" "$actual" "Personal module operations must retain PSGallery"
+}
+
+test_repository_configuration_failure_stops_module_stage_with_visible_error() {
+    load_module_stage
+    local MODE="work" status
+    MODULE_INIT_STATUS=23
+    if ( eval "$MODULE_STAGE" ) >"$TEST_SANDBOX_ROOT/module-output" 2>"$TEST_SANDBOX_ROOT/module-errors"; then status=0; else status=$?; fi
+    assert_status 1 "$status" "Repository configuration failure must stop setup"
+    assert_eq $'provider\ninitialize:work' "$(cat "$MODULE_CALLS_FILE")" "Configuration failure must prevent all module discovery and downloads"
+    grep -q 'mock repository configuration failed' "$TEST_SANDBOX_ROOT/module-errors" ||
+        fail_test "PowerShell configuration errors must remain visible"
+}
+
+test_module_download_errors_remain_visible_without_false_success() {
+    load_module_stage
+    local MODE="work" event expected
+    MODULE_INSTALL_STATUS=31
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output" 2>"$TEST_SANDBOX_ROOT/module-errors"
+    grep -q 'mock module download failed' "$TEST_SANDBOX_ROOT/module-errors" ||
+        fail_test "PowerShell module errors must remain visible"
+    assert_array_contains "warn:Failed to install or update Az." EVENTS "Module download failure must warn and continue"
+    expected=$'provider\ninitialize:work'
+    for ((i=0; i<6; i++)); do expected+=$'\nmodule:azure-powershell'; done
+    assert_eq "$expected" "$(cat "$MODULE_CALLS_FILE")" "Work module errors must retain per-module continuation on the selected source"
+    for event in "${EVENTS[@]}"; do
+        [[ "$event" != ok:* && "$event" != skip:* ]] || fail_test "Failed modules must not report success or already-current status"
+    done
+}
+
+test_module_stage_preserves_skip_when_pwsh_is_unavailable() {
+    load_module_stage
+    local MODE="work"
+    MODULE_PWSH_AVAILABLE=0
+    eval "$MODULE_STAGE" >"$TEST_SANDBOX_ROOT/module-output"
+    assert_eq "" "$(cat "$MODULE_CALLS_FILE")" "Missing pwsh must skip all module configuration and installation"
+    assert_array_contains "warn:PowerShell (pwsh) not found. Module installation skipped." EVENTS "Missing pwsh must retain the existing skip"
+}
+
+test_provider_failure_prevents_work_repository_configuration() {
+    load_module_stage
+    local MODE="work" status
+    MODULE_PROVIDER_STATUS=23
+    if ( eval "$MODULE_STAGE" ) >"$TEST_SANDBOX_ROOT/module-output"; then status=0; else status=$?; fi
+    assert_status 1 "$status" "Provider failure must stop Work setup"
+    assert_eq "provider" "$(cat "$MODULE_CALLS_FILE")" "Provider failure must prevent repository and module operations"
+}
+
+mock_provider_tools() {
+    load_module_stage
+    eval "$MODULE_PROVIDER_HELPERS"
+    PROVIDER_ARCH="x86_64"
+    PROVIDER_DOTNET_AVAILABLE=1
+    PROVIDER_FAILURE=""
+    PROVIDER_CALLS="$TEST_SANDBOX_ROOT/provider-calls"
+    : >"$PROVIDER_CALLS"
+    command() {
+        [[ "$*" == "-v dotnet" ]] || fail_test "Unexpected provider command probe: $*"
+        [[ "$PROVIDER_DOTNET_AVAILABLE" -eq 1 ]]
+    }
+    uname() { printf '%s\n' "$PROVIDER_ARCH"; }
+    uuidgen() { printf 'fixture-stage\n'; }
+    dotnet() {
+        printf 'dotnet:%s:%s\n' "$1" "$2" >>"$PROVIDER_CALLS"
+        [[ "$2" == "-h" && -f "$1" && "$PROVIDER_FAILURE" != "dotnet" ]]
+    }
+    curl() {
+        printf 'download:%s\n' "$2" >>"$PROVIDER_CALLS"
+        [[ "$PROVIDER_FAILURE" != "download" ]] || return 23
+        printf 'fictional archive\n' >"$4"
+    }
+    shasum() {
+        if [[ "$PROVIDER_FAILURE" == "checksum" ]]; then
+            printf 'mismatch\n'
+        elif [[ "$PROVIDER_ARCH" == "arm64" ]]; then
+            printf '88c9e168dbe67d1683967e4d1fd79064038dcbdbc577f61805debc7ab0df3b5e\n'
+        else
+            printf '969fc37eb8499b7488adffd791db1ed1e4d196c5b4291f066a5e262018f70bfd\n'
+        fi
+    }
+    unzip() {
+        [[ "$1" == "-q" && "$3" == "-d" ]] || fail_test "Archive extraction must explicitly use unzip"
+        [[ "$PROVIDER_FAILURE" != "extraction" ]] || return 31
+        local provider="$4/plugins/netcore/CredentialProvider.Microsoft" file
+        mkdir -p "$provider"
+        for file in CredentialProvider.Microsoft.dll CredentialProvider.Microsoft.deps.json \
+            CredentialProvider.Microsoft.runtimeconfig.json libhostfxr.dylib libcoreclr.dylib; do
+            [[ "$PROVIDER_FAILURE" != "partial" || "$file" != "libcoreclr.dylib" ]] || continue
+            printf 'fixture\n' >"$provider/$file"
+        done
+        printf '#!/usr/bin/env bash\n[[ "$*" == "-h" ]]\n' >"$provider/CredentialProvider.Microsoft"
+    }
+    chmod() {
+        printf 'chmod:%s\n' "$*" >>"$PROVIDER_CALLS"
+        builtin command chmod "$@"
+    }
+}
+
+test_mac_provider_reuses_working_default_dll_with_dotnet_without_download() {
+    mock_provider_tools
+    local HOME="$TEST_SANDBOX_ROOT/provider-home"
+    local provider="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft"
+    mkdir -p "$provider"
+    printf 'existing provider\n' >"$provider/CredentialProvider.Microsoft.dll"
+    install_artifacts_credential_provider
+    assert_eq "dotnet:$provider/CredentialProvider.Microsoft.dll:-h" "$(cat "$PROVIDER_CALLS")" "Existing provider must be checked through the PSResourceGet invocation path"
+    assert_eq "existing provider" "$(cat "$provider/CredentialProvider.Microsoft.dll")" "Usable provider must remain unchanged"
+}
+
+test_mac_provider_installs_correct_verified_self_contained_rids_per_user() {
+    mock_provider_tools
+    local HOME="$TEST_SANDBOX_ROOT/provider-home" rid provider
+    provider="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft"
+    for PROVIDER_ARCH in x86_64 arm64; do
+        rm -rf "$HOME"
+        : >"$PROVIDER_CALLS"
+        if [[ "$PROVIDER_ARCH" == "arm64" ]]; then rid="osx-arm64"; else rid="osx-x64"; fi
+        mkdir -p "$HOME/.nuget/plugins/netcore/Contoso.Plugin"
+        printf 'untouched\n' >"$HOME/.nuget/plugins/netcore/Contoso.Plugin/keep"
+        install_artifacts_credential_provider || fail_test "Provider installation failed for $rid"
+        grep -Fxq "download:https://github.com/microsoft/artifacts-credprovider/releases/download/v2.0.6/Microsoft.$rid.NuGet.CredentialProvider.zip" "$PROVIDER_CALLS" ||
+            fail_test "Provider must download the correct self-contained RID"
+        [[ -x "$provider/CredentialProvider.Microsoft" ]] || fail_test "Native apphost must be executable"
+        grep -Fq "dotnet:$provider/CredentialProvider.Microsoft.dll:-h" "$PROVIDER_CALLS" ||
+            fail_test "Published provider must work through PSResourceGet's dotnet discovery"
+        [[ ! -e "$HOME/.nuget/plugins/netcore/.altered-carbon-credprovider-fixture-stage" ]] || fail_test "Own stage must be cleaned"
+        assert_eq "untouched" "$(cat "$HOME/.nuget/plugins/netcore/Contoso.Plugin/keep")" "Unrelated plugin must remain untouched"
+    done
+}
+
+test_mac_provider_failures_leave_no_published_provider_or_stage() {
+    mock_provider_tools
+    local HOME="$TEST_SANDBOX_ROOT/provider-home" status
+    for PROVIDER_FAILURE in download checksum extraction partial dotnet; do
+        rm -rf "$HOME"
+        if install_artifacts_credential_provider; then status=0; else status=$?; fi
+        assert_status 1 "$status" "Provider $PROVIDER_FAILURE failure must fail closed"
+        [[ ! -e "$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft" ]] || fail_test "Failed archive must not become discoverable"
+        [[ ! -e "$HOME/.nuget/plugins/netcore/.altered-carbon-credprovider-fixture-stage" ]] || fail_test "Failed installation must clean only its stage"
+    done
+}
+
+test_mac_provider_preserves_incomplete_existing_directory() {
+    mock_provider_tools
+    local HOME="$TEST_SANDBOX_ROOT/provider-home" status
+    local provider="$HOME/.nuget/plugins/netcore/CredentialProvider.Microsoft"
+    mkdir -p "$provider"
+    printf 'existing incomplete provider\n' >"$provider/keep"
+    if install_artifacts_credential_provider; then status=0; else status=$?; fi
+    assert_status 1 "$status" "Incomplete existing directory must fail without replacement"
+    assert_eq "existing incomplete provider" "$(cat "$provider/keep")" "Existing provider files must never be deleted"
+    assert_eq "" "$(cat "$PROVIDER_CALLS")" "Incomplete existing provider must not trigger download"
+}
+
+test_mac_provider_requires_dotnet_host_before_downloading() {
+    mock_provider_tools
+    local HOME="$TEST_SANDBOX_ROOT/provider-home" status
+    PROVIDER_DOTNET_AVAILABLE=0
+    if install_artifacts_credential_provider; then status=0; else status=$?; fi
+    assert_status 1 "$status" "Missing dotnet must not claim PSResourceGet readiness"
+    assert_eq "" "$(cat "$PROVIDER_CALLS")" "Missing dotnet must not trigger download or new tooling installation"
+}
+
 main() {
     local tests=(
         test_app_exists_detects_system_application
@@ -887,6 +1129,17 @@ main() {
         test_agency_download_failure_is_not_masked_by_successful_installer
         test_agency_installer_failure_does_not_report_success_or_restart
         test_mac_never_attempts_cuda_installation
+        test_work_modules_configure_before_discovery_and_pass_selected_repository_safely
+        test_personal_modules_keep_public_source
+        test_repository_configuration_failure_stops_module_stage_with_visible_error
+        test_module_download_errors_remain_visible_without_false_success
+        test_module_stage_preserves_skip_when_pwsh_is_unavailable
+        test_provider_failure_prevents_work_repository_configuration
+        test_mac_provider_reuses_working_default_dll_with_dotnet_without_download
+        test_mac_provider_installs_correct_verified_self_contained_rids_per_user
+        test_mac_provider_failures_leave_no_published_provider_or_stage
+        test_mac_provider_preserves_incomplete_existing_directory
+        test_mac_provider_requires_dotnet_host_before_downloading
     )
     local test_name
 
